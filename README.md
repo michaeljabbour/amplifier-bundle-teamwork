@@ -24,6 +24,14 @@ Amplifier installs the packaged modules. No separate Python command, pip install
 
 The URI must point to the actual `.yaml` behavior file (or a repository directory containing `bundle.md`/`bundle.yaml`), not a GitHub HTML page, archive download, or module directory. An `Unknown bundle format` error occurs before module mounting; retain the reported path when diagnosing it. The nested module source uses `@main`; pinning only the outer behavior does not pin both modules.
 
+`@main` is resolved once and then served from Amplifier's bundle cache; it does not follow the branch. After this repository changes upstream, refresh the cache and start a new session:
+
+```sh
+amplifier bundle update teamwork-behavior -y
+```
+
+A session that is already running keeps the tool set it started with, so `teamwork_connect` appears only in sessions started after the update.
+
 ## Connect in Amplifier
 
 1. Start a normal new Amplifier session with your existing bundle/provider.
