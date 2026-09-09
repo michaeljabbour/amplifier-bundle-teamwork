@@ -5,6 +5,7 @@ bundle:
 hooks:
   - module: hooks-teamwork
     source: git+https://github.com/michaeljabbour/amplifier-bundle-teamwork@main#subdirectory=modules/hooks-teamwork
-    config:
-      # Enrollment creates an overlay that explicitly enables sharing.
-      share_visible_turns: false
+    # Missing opt-in is inert; preserve an enrolled overlay's explicit config.
+tools:
+  - module: tool-teamwork
+    source: git+https://github.com/michaeljabbour/amplifier-bundle-teamwork@main#subdirectory=modules/hooks-teamwork

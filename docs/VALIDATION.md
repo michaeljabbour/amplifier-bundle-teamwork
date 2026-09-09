@@ -1,5 +1,16 @@
 # Validation evidence and limits
 
+## Native enrollment PR checks (2026-09-09)
+
+- **40 tests passed** in the installed Amplifier Python environment. New focused checks cover native tool mounting and child exclusion, consent and project selection, private credential files, saved-connection reuse, enrollment failure cleanup and compensating revocation, local-browser origin checks, secret-free tool output, and no retroactive turn publication.
+- **Foundation validator passed:** actual Markdown/YAML entry files load, app behavior composition preserves explicit overlay opt-in and session configuration, and both module sources prepare locally. The primary bundle is not replaced.
+- **Wheel and mount protocol passed:** a freshly built Hatchling wheel contains both `amplifier.modules` entry points; each imports and mounts from an isolated extraction. Core's `ToolValidator` passes all eight checks for `teamwork_connect`. `mount()` returns `None`, not metadata.
+- Bundle diagrams regenerated from source.
+
+These are structural, mocked enrollment, and local loopback-form checks. No extended CLI/provider connection experiment or external-service enrollment was run for this PR. Local browser availability and complete live connection remain unverified. The user's reported `Unknown bundle format` error came without its failing command/path, so it was **not reproduced or claimed fixed**. The supplied behavior uses an accepted `.yaml` entry file; module directories are module sources, not bundle entry points. README's `@main` command describes the flow once this PR is merged; an outer branch reference alone would still resolve nested module sources from `main`.
+
+## Earlier published revision evidence
+
 **Recorded 2026-09-09.** This page separates current, local evidence from an earlier historical live attestation. It does not claim a current external Teamwork-service or provider success.
 
 ## Current independent checks

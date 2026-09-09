@@ -263,7 +263,7 @@ async def mount(coordinator, config=None):
     if getattr(coordinator, "parent_id", None):
         return None
     config = config or {}
-    if config.get("share_visible_turns") is False:
+    if config.get("share_visible_turns", False) is False:
         return None
     if config.get("share_visible_turns") is not True:
         raise ValueError("Teamwork hook requires explicit share_visible_turns: true opt-in")

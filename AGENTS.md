@@ -15,8 +15,9 @@ prove provider behavior. Record only public-safe evidence.
 
 ## Boundaries and pitfalls
 
-- Sharing is disabled by default. Enable it only through an explicit enrolled overlay;
-  never change the active/default bundle or silently enroll a user.
+- Sharing is disabled by default. Enable it only through an explicit enrolled overlay or native browser consent;
+  never replace the primary bundle/provider or silently enroll a user. Adding the
+  inert behavior with `bundle add --app` is the documented native installation.
 - Keep each enrollment project-scoped and keep connection/overlay outputs separate.
   Existing private output files are never overwritten.
 - `amplifier-core` is host-supplied; do not add it as a runtime dependency or add
