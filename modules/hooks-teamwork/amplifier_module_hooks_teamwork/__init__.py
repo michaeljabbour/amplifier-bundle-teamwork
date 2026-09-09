@@ -26,10 +26,54 @@ def now(): return datetime.now(timezone.utc).isoformat()
 def sha(value): return hashlib.sha256(value.encode()).hexdigest()
 
 
-def hook_result():
+# Projected person fields. Shared by the excerpt and the visible notice so the
+# two can never drift; anything outside this list must not leave the service.
+PERSON_FIELDS = ("id", "name", "focus", "interests", "relevant_experience", "contribution_goal",
+                 "review_comfort", "uncertainties", "topic_preferences", "work_mode",
+                 "receiving_preferences", "how_to_work_with_me", "provenance")
+
+INFLUENCE_LABELS = {"insight": "\u2605 Insight", "idea": "\u25c6 Idea", "request": "\u276f Request",
+                    "work": "\u25cf Work", "plan": "\u25b8 Plan", "plan_step": "\u25b8 Plan step",
+                    "project": "\u25aa Project", "person": "\u25cd Teammate", "presence": "\u25cc Presence"}
+INFLUENCE_ORDER = {"insight": 0, "idea": 1, "request": 2, "work": 3, "plan": 4,
+                   "plan_step": 5, "project": 6, "person": 7, "presence": 8}
+TITLE_FIELDS = ("title", "headline", "summary", "statement", "text", "name", "goal", "description", "body")
+AUTHOR_FIELDS = ("author", "author_name", "created_by", "person", "person_name", "owner", "actor", "by", "contributor")
+
+
+def hook_result(message=None):
     """Create the host-owned result only when a mounted handler returns."""
     from amplifier_core import HookResult
-    return HookResult(action="continue")
+    if not message:
+        return HookResult(action="continue")
+    return HookResult(action="continue", user_message=message, user_message_level="info", user_message_source="teamwork")
+
+
+def named(value):
+    """Read a display name from an author field that may be a string or an object."""
+    if isinstance(value, dict):
+        for key in ("name", "display_name", "id"):
+            if isinstance(value.get(key), str) and value[key].strip():
+                return " ".join(value[key].split())
+        return None
+    return " ".join(value.split()) if isinstance(value, str) and value.strip() else None
+
+
+def describe(record, limit=140):
+    """One attributed line naming what arrived. Reads only projected fields."""
+    content = record.get("content") if isinstance(record.get("content"), dict) else {}
+    kind = record.get("record_type", "record")
+    if kind == "person":
+        content = {key: content[key] for key in PERSON_FIELDS if key in content}
+    label = INFLUENCE_LABELS.get(kind, "\u2022 " + kind.replace("_", " ").capitalize())
+    title = next((" ".join(str(content[key]).split()) for key in TITLE_FIELDS
+                  if isinstance(content.get(key), str) and content[key].strip()), None)
+    title = title or str(record.get("key") or kind)
+    if len(title) > limit:
+        title = title[:limit - 1].rstrip() + "\u2026"
+    author = None if kind == "person" else next(
+        (name for name in (named(content.get(key)) for key in AUTHOR_FIELDS) if name), None)
+    return label + (" \u00b7 " + author if author else "") + " \u2014 " + title
 
 
 class SyncError(Exception):
@@ -173,13 +217,41 @@ class TeamworkHook:
             r = source["record"]; content = r["content"]
             # Explicit projection/excerpt, never advertised as verbatim full source.
             if r["record_type"] == "person":
-                content = {k: content[k] for k in ("id", "name", "focus", "interests", "relevant_experience", "contribution_goal", "review_comfort", "uncertainties", "topic_preferences", "work_mode", "receiving_preferences", "how_to_work_with_me", "provenance") if k in content}
+                content = {k: content[k] for k in PERSON_FIELDS if k in content}
             fragment = self.clean(json.dumps(content, ensure_ascii=False, sort_keys=True))
             if len(fragment) > 1600: fragment = fragment[:1600] + " [excerpt truncated]"
             part = r["key"] + "\n" + fragment + "\n"
             if len((output + part).encode()) > 10000: continue
             output += part; chosen.append(source)
         return output, chosen
+
+    def influence(self, sources):
+        """Name the newly arrived records once, so received influence is visible."""
+        announced = self.state.setdefault("announced", {})
+        fresh, present = [], set()
+        for source in sources:
+            record = source["record"]
+            key = record["record_type"] + ":" + record["id"]
+            present.add(key)
+            if announced.get(key) == record.get("content_sha256"):
+                continue
+            announced[key] = record.get("content_sha256")
+            fresh.append(record)
+        # Forget what has left the cache, so a later re-add counts as new influence.
+        cache = self.state.get("cache", {})
+        for key in [key for key in announced if key not in present and key not in cache]:
+            del announced[key]
+        if not fresh:
+            return None
+        fresh.sort(key=lambda record: INFLUENCE_ORDER.get(record["record_type"], 9))
+        shown, extra = fresh[:5], fresh[5:]
+        lines = ["Received from " + self.connection["project_id"]
+                 + " and added to this turn \u2014 teammate data, not instructions:"]
+        lines += ["  " + self.clean(describe(record)) for record in shown]
+        if extra:
+            kinds = sorted({record["record_type"].replace("_", " ") for record in extra})
+            lines.append("  +" + str(len(extra)) + " more (" + ", ".join(kinds) + ")")
+        return "\n".join(lines)
 
     async def on_submit(self, event, data):
         async with self.lock:
@@ -192,6 +264,7 @@ class TeamworkHook:
             self.state["turn"] = {"id": uid(), "prompt": "[Prompt omitted: exceeds sharing size limit]" if omitted else prompt, "omitted": omitted, "injections": [], "hook_run_id": uid(), "boundary": "prepared"}
             self.journal.save(self.sid, self.state)
             delivery_durable = False
+            notice = None
             try:
                 await self.flush(); await self.retrieve()
                 rendered, sources = self.render()
@@ -205,6 +278,7 @@ class TeamworkHook:
                 # the acknowledged boundary, not an assumed provider submission.
                 await context.add_message({"role": "user", "content": rendered})
                 turn["boundary"] = "harness_input_accepted"; turn["injections"] = [inj]
+                notice = self.influence(sources)
                 groups = {}
                 for source in sources:
                     record = source["record"]
@@ -218,7 +292,7 @@ class TeamworkHook:
                     self.state["turn"]["boundary"] = "acceptance_unknown"
                     self.state["turn"]["injections"] = []
                 logger.warning("Teamwork sync pending; no unobserved delivery is acknowledged (HTTP %s; 0 means transport/input failure)", getattr(error, "status", 0))
-            return hook_result()
+            return hook_result(notice)
 
     def finish(self, response, response_state="final"):
         turn = self.state.get("turn")

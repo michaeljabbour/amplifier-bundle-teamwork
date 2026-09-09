@@ -9,7 +9,8 @@ import urllib.error
 import subprocess
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "modules/hooks-teamwork"))
-from amplifier_module_hooks_teamwork import HTTPClient, Journal, TeamworkHook, SyncError, sha, NoRedirect, mount
+from amplifier_module_hooks_teamwork import (HTTPClient, Journal, TeamworkHook, SyncError, sha,
+                                             NoRedirect, mount, describe, PERSON_FIELDS)
 
 
 class Context:
@@ -131,6 +132,104 @@ class HookTests(unittest.IsolatedAsyncioTestCase):
             "original-source-hash",
         )
 
+
+
+class InfluenceTests(unittest.IsolatedAsyncioTestCase):
+    """Received teammate context is named to the user, once, and never over-shares."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        self.events = []; self.client = Client(self.events)
+        self.connection = {"base_url": "https://team.example.invalid", "project_id": "teamwork", "token": "test-credential-no-real-secret"}
+        self.hook = TeamworkHook(Coordinator(Context(self.events)), self.connection,
+                                 Journal(Path(self.tmp.name) / "queue.db"), self.client)
+
+    def source(self, kind, rid, content, digest=None):
+        return {"record": {"key": kind + ":" + rid + ":1", "id": rid, "record_type": kind,
+                           "content": content, "content_sha256": digest or (kind + rid)},
+                "delivery_id": "manifest"}
+
+    def test_new_records_are_named_with_their_author(self):
+        notice = self.hook.influence([
+            self.source("insight", "i1", {"author": {"name": "Dana Cole"}, "summary": "Run the server yourself"}),
+            self.source("work", "t1", {"title": "Connect a session", "status": "accepted"}),
+        ])
+        self.assertIn("teamwork", notice)
+        self.assertIn("not instructions", notice)
+        self.assertIn("Insight", notice)
+        self.assertIn("Dana Cole", notice)
+        self.assertIn("Run the server yourself", notice)
+        self.assertIn("Connect a session", notice)
+        # Insights lead; incidental records follow.
+        self.assertLess(notice.index("Insight"), notice.index("Work"))
+
+    def test_unchanged_records_are_not_re_announced_but_edits_are(self):
+        first = self.source("insight", "i1", {"summary": "Original"}, "hash-1")
+        self.assertIsNotNone(self.hook.influence([first]))
+        self.assertIsNone(self.hook.influence([first]))
+        edited = self.source("insight", "i1", {"summary": "Revised"}, "hash-2")
+        notice = self.hook.influence([edited])
+        self.assertIn("Revised", notice)
+
+    def test_a_record_dropped_from_cache_is_announced_again_when_it_returns(self):
+        record = self.source("idea", "d1", {"text": "Try a local host"})
+        self.assertIn("Try a local host", self.hook.influence([record]))
+        # A later turn no longer carries it: the service evicted it.
+        self.hook.state["cache"] = {}
+        self.assertIsNone(self.hook.influence([]))
+        self.assertFalse(self.hook.state["announced"])
+        # It comes back, so it is influence the user has not been told about.
+        self.assertIn("Try a local host", self.hook.influence([record]))
+
+    def test_a_record_still_cached_is_not_forgotten_between_turns(self):
+        record = self.source("idea", "d1", {"text": "Try a local host"})
+        self.hook.state["cache"] = {"idea:d1": {"record": record["record"], "delivery_id": "manifest"}}
+        self.assertIsNotNone(self.hook.influence([record]))
+        self.assertIsNone(self.hook.influence([]))
+        self.assertIsNone(self.hook.influence([record]))
+
+    def test_long_notices_are_bounded_and_summarised(self):
+        many = [self.source("work", "t%d" % index, {"title": "Item %d" % index}) for index in range(9)]
+        notice = self.hook.influence(many)
+        self.assertEqual(len(notice.splitlines()), 7)          # header + 5 shown + the remainder
+        self.assertIn("+4 more (work)", notice)
+
+    def test_notice_never_exposes_unprojected_person_fields_or_credentials(self):
+        secret = self.connection["token"]
+        notice = self.hook.influence([
+            self.source("person", "p1", {"name": "Fixture Person", "summary": "UNPROJECTED", "private_note": "LEAK"}),
+            self.source("insight", "i1", {"summary": "Token is " + secret}),
+        ])
+        self.assertIn("Fixture Person", notice)
+        for hidden in ("UNPROJECTED", "LEAK", secret):
+            self.assertNotIn(hidden, notice)
+        self.assertIn("[REDACTED CREDENTIAL]", notice)
+        # The projection the notice uses is the one the excerpt uses.
+        self.assertNotIn("summary", PERSON_FIELDS)
+
+    def test_titles_are_truncated_and_unknown_types_still_render(self):
+        line = describe({"record_type": "insight", "id": "i", "key": "insight:i:1",
+                         "content": {"summary": "x" * 500}})
+        self.assertLessEqual(len(line), 170)
+        self.assertTrue(line.endswith("\u2026"))
+        unknown = describe({"record_type": "brand_new", "id": "n", "key": "brand_new:n:1", "content": {}})
+        self.assertIn("Brand new", unknown)
+        self.assertIn("brand_new:n:1", unknown)
+
+    async def test_the_notice_reaches_the_user_through_the_hook_result(self):
+        result = await self.hook.on_submit("prompt:submit", {"prompt": "My prompt"})
+        self.assertEqual(result.user_message_source, "teamwork")
+        self.assertEqual(result.user_message_level, "info")
+        self.assertIn("Fixture goal", result.user_message)
+        # The same context on the next turn is not re-announced as new influence.
+        again = await self.hook.on_submit("prompt:submit", {"prompt": "Another prompt"})
+        self.assertIsNone(again.user_message)
+
+    async def test_no_notice_when_nothing_was_accepted(self):
+        self.hook.coordinator = Coordinator(Context(self.events, fail=True))
+        result = await self.hook.on_submit("prompt:submit", {"prompt": "My prompt"})
+        self.assertIsNone(result.user_message)
+        self.assertFalse(self.hook.state.get("announced"))
 
 
 class RedirectTests(unittest.TestCase):
