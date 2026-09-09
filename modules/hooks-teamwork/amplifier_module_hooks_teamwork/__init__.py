@@ -103,6 +103,22 @@ class TeamworkHook:
         self.lock = asyncio.Lock()
         self.entered = False
 
+    def rebind(self, project_id):
+        """Point this mounted hook at another project without re-registering handlers.
+
+        A different project is a different shared session, so the correlation id
+        and its journal state are recomputed. Queued work for the previous
+        project keeps its own session id and is not re-attributed.
+        """
+        if not project_id or not str(project_id).strip():
+            raise ValueError("Teamwork project required")
+        self.connection = dict(self.connection, project_id=str(project_id).strip())
+        self.client = HTTPClient(self.connection)
+        self.sid = str(uuid.uuid5(uuid.NAMESPACE_URL, self.connection["base_url"] + "/" + self.connection["project_id"] + "/" + sha(self.connection["token"]) + "/" + self.native))
+        self.state = self.journal.load(self.sid)
+        self.entered = False
+        return self.sid
+
     def clean(self, value):
         value = str(value).replace(self.connection["token"], "[REDACTED CREDENTIAL]")
         return re.sub(r"(?i)(?:sk-[a-z0-9_-]{16,}|bearer\s+[a-z0-9._~-]{16,})", "[REDACTED CREDENTIAL]", value)
@@ -258,6 +274,45 @@ class TeamworkHook:
         return hook_result()
 
 
+CONNECTION_FIELDS = ("base_url", "project_id", "token", "harness_id")
+
+
+def resolve_connection(config):
+    """Assemble the connection from module config, else from a private file.
+
+    Host configuration (settings.yaml plus keys.env through ${VAR}) is the
+    ordinary Amplifier surface; the private file remains the enrolled default.
+    Config values override file values so one enrollment can serve a session
+    bound to a different project.
+    """
+    supplied = {key: config[key] for key in CONNECTION_FIELDS if config.get(key) is not None}
+    # An unset ${VAR} expands to an empty string, so blank is a misconfiguration
+    # rather than an omission; refuse it instead of failing later as a 401.
+    blank = sorted(key for key, value in supplied.items() if isinstance(value, str) and not value.strip())
+    if blank:
+        raise ValueError(
+            "Teamwork configuration supplied empty " + ", ".join(blank)
+            + "; an unset ${VAR} expands to an empty string"
+        )
+    if supplied.get("token"):
+        # A configured credential is authoritative; no private file is read.
+        connection = dict(supplied)
+        home = Path("~/.config/amplifier-teamwork").expanduser()
+    else:
+        path = Path(config.get("connection_file") or os.environ.get("TEAMWORK_CONNECTION_FILE", "~/.config/amplifier-teamwork/connection.json")).expanduser()
+        if os.name != "nt" and path.stat().st_mode & 0o077:
+            raise ValueError("Teamwork connection file must be private (chmod 600)")
+        connection = json.loads(path.read_text(encoding="utf-8"))
+        connection.update(supplied)
+        home = path.parent
+    if not connection.get("base_url"):
+        raise ValueError("Teamwork service URL required")
+    connection["base_url"] = validate_service_url(connection["base_url"])
+    if not connection.get("token"):
+        raise ValueError("Teamwork enrolled harness credential required")
+    return connection, home
+
+
 async def mount(coordinator, config=None):
     # Delegated prompts are internal work, not the opted-in human conversation.
     if getattr(coordinator, "parent_id", None):
@@ -267,16 +322,15 @@ async def mount(coordinator, config=None):
         return None
     if config.get("share_visible_turns") is not True:
         raise ValueError("Teamwork hook requires explicit share_visible_turns: true opt-in")
-    path = Path(config.get("connection_file") or os.environ.get("TEAMWORK_CONNECTION_FILE", "~/.config/amplifier-teamwork/connection.json")).expanduser()
-    if os.name != "nt" and path.stat().st_mode & 0o077:
-        raise ValueError("Teamwork connection file must be private (chmod 600)")
-    connection = json.loads(path.read_text(encoding="utf-8"))
-    connection["base_url"] = validate_service_url(connection["base_url"])
-    if not connection.get("project_id") or not connection.get("token"):
-        raise ValueError("Teamwork project and enrolled harness credential required")
-    journal_path = Path(config.get("journal_path") or path.parent / ("outbox-" + sha(connection["token"])[:16] + ".sqlite3")).expanduser()
+    connection, home = resolve_connection(config)
+    if not connection.get("project_id"):
+        # Persisted settings carry the service and the credential; the project is
+        # chosen per session. Stay inert until a tool binds one.
+        return None
+    journal_path = Path(config.get("journal_path") or home / ("outbox-" + sha(connection["token"])[:16] + ".sqlite3")).expanduser()
     hook = TeamworkHook(coordinator, connection, Journal(journal_path))
     for name, handler in (("session:start", hook.on_start), ("prompt:submit", hook.on_submit), ("prompt:complete", hook.on_complete), ("session:end", hook.on_end)):
         coordinator.hooks.register(name, handler, priority=50, name="teamwork-" + name.replace(":", "-"))
     coordinator.register_capability("teamwork.session_id", hook.sid)
+    coordinator.register_capability("teamwork.rebind", hook.rebind)
     return None

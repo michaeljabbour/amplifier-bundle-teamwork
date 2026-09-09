@@ -9,7 +9,7 @@ import urllib.error
 import subprocess
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "modules/hooks-teamwork"))
-from amplifier_module_hooks_teamwork import HTTPClient, Journal, TeamworkHook, SyncError, sha, NoRedirect, mount
+from amplifier_module_hooks_teamwork import HTTPClient, Journal, TeamworkHook, SyncError, sha, NoRedirect, mount, resolve_connection
 
 
 class Context:
@@ -179,6 +179,61 @@ class MountTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result)
         self.assertEqual(len(root.hooks.handlers), 4)
         self.assertIn("teamwork.session_id", root.capabilities)
+
+    async def test_host_configuration_supplies_the_connection_without_a_private_file(self):
+        class Hooks:
+            def __init__(self): self.handlers = []
+            def register(self, *args, **kwargs): self.handlers.append((args, kwargs))
+
+        class Root:
+            parent_id = None
+            session_id = "configured-session"
+            def __init__(self): self.hooks = Hooks(); self.capabilities = {}
+            def register_capability(self, name, value): self.capabilities[name] = value
+
+        root = Root()
+        with tempfile.TemporaryDirectory() as directory:
+            result = await mount(root, {
+                "share_visible_turns": True,
+                "base_url": "https://team.example.invalid",
+                "project_id": "configured-project",
+                "token": "[REDACTED:SECRET]",
+                "journal_path": str(Path(directory) / "queue.sqlite3"),
+            })
+        self.assertIsNone(result)
+        self.assertEqual(len(root.hooks.handlers), 4)
+        self.assertIn("teamwork.session_id", root.capabilities)
+
+    def test_configured_project_overrides_the_enrolled_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            connection = Path(directory) / "connection.json"
+            connection.write_text(
+                json.dumps({"base_url": "https://team.example.invalid", "project_id": "enrolled", "token": "file-token"}),
+                encoding="utf-8",
+            )
+            connection.chmod(0o600)
+            resolved, home = resolve_connection({"connection_file": str(connection), "project_id": "session-bound"})
+        self.assertEqual(resolved["project_id"], "session-bound")
+        self.assertEqual(resolved["token"], "file-token")
+        self.assertEqual(home, connection.parent)
+
+    def test_blank_configuration_value_is_refused_rather_than_sent(self):
+        # An unset ${VAR} expands to an empty string; that must not reach the service.
+        with self.assertRaisesRegex(ValueError, "empty"):
+            resolve_connection({
+                "base_url": "https://team.example.invalid",
+                "project_id": "project",
+                "token": "   ",
+            })
+
+    def test_configuration_without_a_credential_still_requires_one(self):
+        with self.assertRaises((ValueError, OSError, FileNotFoundError)):
+            resolve_connection({"base_url": "https://team.example.invalid", "project_id": "project",
+                                "connection_file": "/nonexistent/fixture.json"})
+
+    def test_configured_recipient_is_validated(self):
+        with self.assertRaises(ValueError):
+            resolve_connection({"base_url": "http://team.example.invalid", "project_id": "p", "token": "t"})
 
     def test_http_client_validates_recipient_before_reading_token(self):
         class TokenTrap(dict):

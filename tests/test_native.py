@@ -13,7 +13,7 @@ import urllib.parse
 import urllib.request
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "modules/hooks-teamwork"))
-from amplifier_module_tool_teamwork import connect, private_browser_connect, TeamworkConnect, mount
+from amplifier_module_tool_teamwork import connect, private_browser_connect, TeamworkConnect, TeamworkBind, mount
 from amplifier_module_hooks_teamwork import sha
 
 BASE = "https://team.example.invalid"
@@ -132,7 +132,7 @@ class NativeToolTests(unittest.IsolatedAsyncioTestCase):
     async def test_mount_is_native_and_inert_and_children_excluded(self):
         root = Coordinator()
         self.assertIsNone(await mount(root))
-        self.assertEqual(list(root.tools), ['teamwork_connect'])
+        self.assertEqual(sorted(root.tools), ['teamwork_bind', 'teamwork_connect'])
         self.assertFalse(root.handlers)
         root.parent_id = 'parent'; root.tools.clear()
         await mount(root)
@@ -156,9 +156,41 @@ class NativeToolTests(unittest.IsolatedAsyncioTestCase):
                 with patch.object(hook, 'flush'):
                     await hook.on_complete('prompt:complete', {'response': 'previous turn'})
                 self.assertIsNone(hook.state.get('turn'))
-                await tool.execute({})
-                self.assertEqual(browser.call_count, 1)
+                # Re-triggering is allowed so a running session can change project,
+                # and it rebinds the mounted hook rather than registering again.
+                bound = hook.sid
+                browser.return_value = (path, 'second-project')
+                again = await tool.execute({})
+                self.assertTrue(again.success)
+                self.assertEqual(browser.call_count, 2)
                 self.assertEqual(len(root.handlers), 4)
+                self.assertNotEqual(hook.sid, bound)
+                self.assertEqual(hook.connection['project_id'], 'second-project')
+
+    async def test_bind_selects_a_project_from_configured_settings(self):
+        root = Coordinator()
+        tool = TeamworkBind(root, {'base_url': BASE, 'token': 'configured-fixture'})
+        rejected = await tool.execute({'project_id': '  '})
+        self.assertFalse(rejected.success)
+        self.assertFalse(root.handlers)
+        result = await tool.execute({'project_id': 'chosen'})
+        self.assertTrue(result.success)
+        self.assertEqual(len(root.handlers), 4)
+        hook = root.handlers[0][1].__self__
+        self.assertEqual(hook.connection['project_id'], 'chosen')
+        first = hook.sid
+        moved = await tool.execute({'project_id': 'another'})
+        self.assertTrue(moved.success)
+        self.assertEqual(len(root.handlers), 4)
+        self.assertEqual(hook.connection['project_id'], 'another')
+        self.assertNotEqual(hook.sid, first)
+
+    async def test_bind_without_a_configured_credential_refuses(self):
+        root = Coordinator()
+        result = await TeamworkBind(root, {'base_url': BASE}).execute({'project_id': 'chosen'})
+        self.assertFalse(result.success)
+        self.assertIn('teamwork_connect', str(result))
+        self.assertFalse(root.handlers)
 
     async def test_arguments_and_browser_failure_do_not_enable_sharing(self):
         root = Coordinator(); tool = TeamworkConnect(root, {})

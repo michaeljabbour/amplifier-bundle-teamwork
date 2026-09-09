@@ -35,6 +35,62 @@ The tool takes no arguments and never returns credentials. It stores project-spe
 
 Stop the session to stop sharing. Revoke the harness in Teamwork's harness controls before deleting its saved connection; deleting a file alone does not revoke a credential. A new session requires fresh browser consent even when a credential is saved.
 
+## Host configuration (settings.yaml and keys.env)
+
+**Only two things are persisted on a machine: the service URL and the harness
+credential.** The project is chosen while a session runs, because the project is what a
+given session works on -- a persisted `project_id` would bind every Amplifier session on
+the machine, including work unrelated to Teamwork.
+
+```yaml
+# ~/.amplifier/settings.yaml
+overrides:
+  hooks-teamwork:
+    config:
+      share_visible_turns: true
+      base_url: https://team.amplifier.run
+      token: ${TEAMWORK_HARNESS_TOKEN}
+  tool-teamwork:
+    config:
+      base_url: https://team.amplifier.run
+      token: ${TEAMWORK_HARNESS_TOKEN}
+```
+
+```sh
+printf 'TEAMWORK_HARNESS_TOKEN=<enrolled harness credential>\n' >> ~/.amplifier/keys.env
+chmod 600 ~/.amplifier/keys.env
+```
+
+`base_url` is read from both module configs: the hook uses it to reach the project API and
+the tool uses it for enrollment, so a non-default service must be set in both or the two
+halves address different services.
+
+With no project configured the hook mounts **inert** -- it registers nothing and sends
+nothing -- until a session binds one.
+
+### Choosing and changing the project while running
+
+Two tools bind the running session. Neither accepts a credential.
+
+| Ask | Tool | What happens |
+| --- | --- | --- |
+| "Bind this session to project X" | `teamwork_bind` | Uses the configured URL and credential. Sharing begins with the next prompt. |
+| "Move this session to project Y" | `teamwork_bind` | Rebinds in place. A different project is a different shared session, so a new correlation id is used; queued work for the previous project keeps its own and is never re-attributed. |
+| "Connect this session to Teamwork" | `teamwork_connect` | Opens the private local browser form. Use it when no credential is configured yet, or to enroll another project. It can be re-triggered on an already-sharing session to move it. |
+
+`project_id` is not a secret, which is why `teamwork_bind` accepts it as an ordinary
+argument while `teamwork_connect` still takes none -- a member code must never reach a
+tool call or the transcript.
+
+A binding lives for as long as the session process. An interactive session keeps it for
+the whole conversation. `amplifier run --resume` starts a fresh process, so a resumed
+session mounts inert again and must be bound again.
+
+Configured values take precedence over an enrolled connection file, and a configured
+credential means no file is read. A blank value is refused rather than sent: an unset
+`${VAR}` expands to an empty string, which would otherwise reach the service as an empty
+bearer token.
+
 ## Advanced: legacy local overlay setup
 
 The native flow above replaces this manual enrollment path for local-browser users. The following compatibility helper remains available for existing overlays and development; it requires Python 3.11+ and Git.
