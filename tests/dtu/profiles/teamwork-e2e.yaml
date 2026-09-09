@@ -1,0 +1,78 @@
+# Digital Twin Universe profile for the Teamwork bundle end-to-end check.
+#
+# The bundle and its hook module are installed BY URL from a local Gitea mirror,
+# the same way a participant installs them from GitHub. `url_rewrites` redirects
+# the GitHub origin to Gitea, so a branch or an unmerged change can be exercised
+# through the real remote-source path instead of a local checkout.
+#
+# The service side is a loopback stub started inside the container by
+# tests/dtu/run_e2e.py. Nothing in this environment contacts the hosted
+# Teamwork service, and no member code or harness credential is involved.
+#
+# Prerequisites on the host:
+#   - amplifier-digital-twin and amplifier-gitea on PATH
+#   - ANTHROPIC_API_KEY exported (the run makes one real provider call)
+#   - a Gitea instance holding a mirror of this repository
+#
+# Usage:
+#   amplifier-gitea create --port 10160 --name teamwork-gitea
+#   amplifier-gitea mirror-from-github <gitea-id> \
+#     --github-repo https://github.com/michaeljabbour/amplifier-bundle-teamwork
+#   amplifier-digital-twin launch tests/dtu/profiles/teamwork-e2e.yaml \
+#     --name teamwork-e2e \
+#     --var GITEA_URL=http://localhost:10160 \
+#     --var GITEA_TOKEN=<token>
+#
+# Variables:
+#   GITEA_URL   -- Gitea base URL
+#   GITEA_TOKEN -- Gitea API token
+name: teamwork-e2e
+description: >
+  Amplifier CLI with the Teamwork bundle installed from a local Gitea mirror,
+  exercised against a loopback stub of the harness plane.
+base:
+  image: ubuntu:24.04
+
+url_rewrites:
+  auth:
+    username: admin
+    token_var: GITEA_TOKEN
+  rules:
+    - match: github.com/michaeljabbour/amplifier-bundle-teamwork
+      target: ${GITEA_URL}/admin/amplifier-bundle-teamwork
+
+passthrough:
+  allow_external: true
+  services:
+    - name: anthropic
+      key_env: ANTHROPIC_API_KEY
+
+provision:
+  setup_cmds:
+    - apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates python3 && rm -rf /var/lib/apt/lists/*
+    - curl -LsSf https://astral.sh/uv/install.sh | sh
+    - uv tool install git+https://github.com/microsoft/amplifier
+    - |
+      mkdir -p /root/.amplifier
+      cat > /root/.amplifier/settings.yaml << EOF
+      config:
+        providers:
+          - module: provider-anthropic
+            source: git+https://github.com/microsoft/amplifier-module-provider-anthropic@main
+            config:
+              api_key: ${ANTHROPIC_API_KEY}
+              default_model: claude-opus-4-7
+      routing:
+        overrides:
+          general:
+            - provider: anthropic
+              model: claude-opus-*
+      EOF
+    - mkdir -p /root/teamwork-e2e
+    - amplifier --version
+
+readiness:
+  - name: amplifier-installed
+    command: "amplifier --version"
+  - name: python-available
+    command: "python3 --version"
