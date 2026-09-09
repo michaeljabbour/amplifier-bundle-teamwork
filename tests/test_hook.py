@@ -6,9 +6,10 @@ import tempfile
 import unittest
 import urllib.request
 import urllib.error
+import subprocess
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "modules/hooks-teamwork"))
-from amplifier_module_hooks_teamwork import Journal, TeamworkHook, SyncError, sha, NoRedirect, mount
+from amplifier_module_hooks_teamwork import HTTPClient, Journal, TeamworkHook, SyncError, sha, NoRedirect, mount
 
 
 class Context:
@@ -84,6 +85,52 @@ class HookTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("abcdefghijklmnopqrstuvwxyz", published)
         self.assertIn("REDACTED CREDENTIAL", published)
 
+    async def test_nested_context_content_is_redacted_before_cache_persistence(self):
+        secret = self.connection["token"]
+        self.client.request = lambda endpoint, body, key=None: {
+            "next_cursor": "cursor",
+            "delivery_id": "manifest",
+            "has_more": False,
+            "truncated": False,
+            "items": [{
+                "key": "secret-" + secret,
+                "id": "teamwork",
+                "record_type": "project",
+                "change": "upsert",
+                "content": {"nested-" + secret: {"credential": secret}},
+                "content_sha256": "source-hash-must-remain",
+            }],
+        }
+        await self.hook.retrieve()
+        saved = self.journal.load(self.hook.sid)["cache"]
+        payload = json.dumps(saved)
+        self.assertNotIn(secret, payload)
+        record = next(iter(saved.values()))["record"]
+        self.assertEqual(record["content_sha256"], "source-hash-must-remain")
+
+    async def test_legacy_cache_is_scrubbed_when_a_session_reopens(self):
+        secret = self.connection["token"]
+        self.hook.state["cache"] = {
+            "project:secret-" + secret: {
+                "record": {
+                    "key": "secret-" + secret,
+                    "id": "item",
+                    "record_type": "project",
+                    "content": {"credential": secret},
+                    "content_sha256": "original-source-hash",
+                },
+                "delivery_id": "delivery",
+            }
+        }
+        self.journal.save(self.hook.sid, self.hook.state)
+        reopened = TeamworkHook(Coordinator(self.context), self.connection, self.journal, self.client)
+        saved = reopened.journal.load(reopened.sid)["cache"]
+        self.assertNotIn(secret, json.dumps(saved))
+        self.assertEqual(
+            next(iter(saved.values()))["record"]["content_sha256"],
+            "original-source-hash",
+        )
+
 
 
 class RedirectTests(unittest.TestCase):
@@ -105,6 +152,43 @@ class MountTests(unittest.IsolatedAsyncioTestCase):
     async def test_root_requires_explicit_sharing_opt_in(self):
         with self.assertRaisesRegex(ValueError, 'explicit'):
             await mount(object(), {})
+
+    async def test_enabled_mount_returns_no_cleanup_metadata(self):
+        class Hooks:
+            def __init__(self): self.handlers = []
+            def register(self, *args, **kwargs): self.handlers.append((args, kwargs))
+
+        class Root:
+            parent_id = None
+            session_id = "root-session"
+            def __init__(self): self.hooks = Hooks(); self.capabilities = {}
+            def register_capability(self, name, value): self.capabilities[name] = value
+
+        with tempfile.TemporaryDirectory() as directory:
+            connection = Path(directory) / "connection.json"
+            connection.write_text(
+                json.dumps({"base_url": "https://team.example.invalid", "project_id": "project", "token": "token"}),
+                encoding="utf-8",
+            )
+            connection.chmod(0o600)
+            root = Root()
+            result = await mount(root, {"share_visible_turns": True, "connection_file": str(connection)})
+        self.assertIsNone(result)
+        self.assertEqual(len(root.hooks.handlers), 4)
+        self.assertIn("teamwork.session_id", root.capabilities)
+
+    def test_http_client_validates_recipient_before_reading_token(self):
+        class TokenTrap(dict):
+            def __getitem__(self, key):
+                if key == "token":
+                    raise AssertionError("token was read before recipient validation")
+                return super().__getitem__(key)
+
+        with self.assertRaises(ValueError):
+            HTTPClient(TokenTrap({
+                "base_url": "https://team.example.invalid@evil.example",
+                "token": "must-not-be-read",
+            }))
 
 
 class RecoveryTests(unittest.IsolatedAsyncioTestCase):
@@ -131,6 +215,19 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(endpoint == 'acknowledgements' for endpoint, _, _ in self.client.requests))
         turns = [op for endpoint, body, _ in self.client.requests if endpoint == 'publish' for op in body['operations'] if op['op'] == 'turn.upsert']
         self.assertEqual(turns[0]['data']['hook_injections'], [])
+
+
+class StandaloneRecoveryTests(unittest.TestCase):
+    def test_replay_help_does_not_require_amplifier_core(self):
+        replay = Path(__file__).resolve().parents[1] / "replay_pending.py"
+        result = subprocess.run(
+            [sys.executable, "-I", "-S", str(replay), "--help"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Replay this connection", result.stdout)
 
 
 if __name__ == '__main__':

@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "modules/hooks-teamwork"))
 from amplifier_module_hooks_teamwork import HTTPClient, Journal, SyncError, sha
+from amplifier_module_hooks_teamwork.service_url import validate_service_url
 
 
 def unresolved_inputs(state):
@@ -15,10 +16,11 @@ def unresolved_inputs(state):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--connection-file", default="~/.config/amplifier-teamwork/connection.json")
+    parser.add_argument("--connection-file", required=True)
     args = parser.parse_args()
     path = Path(args.connection_file).expanduser()
-    connection = json.loads(path.read_text())
+    connection = json.loads(path.read_text(encoding="utf-8"))
+    connection["base_url"] = validate_service_url(connection["base_url"])
     journal = Journal(path.parent / ("outbox-" + sha(connection["token"])[:16] + ".sqlite3"))
     with journal.connect() as conn:
         sessions = [r[0] for r in conn.execute("SELECT DISTINCT session FROM outbox")]

@@ -1,13 +1,18 @@
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
 import unittest
 import urllib.request
 import urllib.error
+import subprocess
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from setup_teamwork import build_overlay, bundle_reference, NoRedirect
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "modules/hooks-teamwork"))
+from setup_teamwork import build_overlay, bundle_reference, NoRedirect, project_paths
+from amplifier_module_hooks_teamwork.service_url import service_origin, validate_service_url
 
 
 class SetupTests(unittest.TestCase):
@@ -28,6 +33,93 @@ class SetupTests(unittest.TestCase):
     def test_registry_and_git_references_preserved(self):
         for value in ('existing-bundle', 'git+https://example.invalid/bundle@main'):
             self.assertEqual(bundle_reference(value), value)
+
+    def test_project_paths_are_separate_and_collision_resistant(self):
+        first_connection, first_overlay = project_paths("design/review")
+        second_connection, second_overlay = project_paths("design:review")
+        self.assertNotEqual(first_connection.parent, second_connection.parent)
+        self.assertEqual(first_connection.name, "connection.json")
+        self.assertEqual(first_overlay.name, "teamwork-overlay.yaml")
+
+    def test_main_uses_project_private_defaults_without_output_flags(self):
+        import setup_teamwork
+
+        with tempfile.TemporaryDirectory() as directory:
+            captured = {}
+            expected_connection, expected_overlay = (
+                Path(directory)
+                / ".config"
+                / "amplifier-teamwork"
+                / "design-review-32c5473fa4db"
+                / "connection.json",
+                Path(directory)
+                / ".config"
+                / "amplifier-teamwork"
+                / "design-review-32c5473fa4db"
+                / "teamwork-overlay.yaml",
+            )
+
+            def enroll(*args):
+                captured["connection"] = args[-2]
+                captured["overlay"] = args[-1]
+                return args[-2], args[-1]
+
+            with patch.dict(os.environ, {"HOME": directory}, clear=False), patch.object(
+                sys, "argv", [
+                    "setup_teamwork.py",
+                    "--base-url", "https://team.example.invalid",
+                    "--project", "design/review",
+                    "--bundle", "existing-bundle",
+                ],
+            ), patch("builtins.input", return_value="Fixture member"), patch(
+                "setup_teamwork.getpass.getpass", return_value="fixture-member-code"
+            ), patch.object(setup_teamwork, "enroll_and_save", side_effect=enroll):
+                setup_teamwork.main()
+
+            self.assertEqual(captured["connection"], expected_connection.resolve())
+            self.assertEqual(captured["overlay"], expected_overlay.resolve())
+
+
+class ServiceURLTests(unittest.TestCase):
+    def test_service_url_accepts_https_base_paths_and_loopback_http(self):
+        self.assertEqual(
+            validate_service_url("https://team.example.invalid/teamwork/"),
+            "https://team.example.invalid/teamwork",
+        )
+        self.assertEqual(
+            service_origin("https://team.example.invalid/teamwork"),
+            "https://team.example.invalid",
+        )
+        self.assertEqual(validate_service_url("http://[::1]:8765/api"), "http://[::1]:8765/api")
+
+    def test_service_url_rejects_ambiguous_or_nonloopback_recipients(self):
+        for value in (
+            "https://team.example.invalid@evil.example",
+            "https://user:password@example.invalid",
+            "https://team.example.invalid/path?recipient=evil",
+            "https://team.example.invalid/#fragment",
+            "https://team.example.invalid:bad",
+            "http://team.example.invalid",
+            " https://team.example.invalid",
+            "https://team.example.invalid\n",
+            "https://team.example.invalid\x7f",
+            "https://team.example.invalid:0",
+        ):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    validate_service_url(value)
+
+    def test_invalid_service_url_stops_before_credentials_are_requested(self):
+        import setup_teamwork
+
+        with patch.object(sys, "argv", [
+            "setup_teamwork.py", "--bundle", "existing-bundle",
+            "--base-url", "https://team.example.invalid@evil.example",
+        ]), patch("builtins.input", side_effect=AssertionError("prompted")), patch(
+            "setup_teamwork.getpass.getpass", side_effect=AssertionError("prompted")
+        ):
+            with self.assertRaises(SystemExit):
+                setup_teamwork.main()
 
 
 class RedirectTests(unittest.TestCase):
@@ -92,3 +184,32 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(unresolved_inputs({'turn': {'prepared_injection': {'id': 'synthetic'}, 'boundary': 'prepared'}}), 1)
         self.assertEqual(unresolved_inputs({'turn': {'prepared_injection': {'id': 'synthetic'}, 'boundary': 'harness_input_accepted'}}), 0)
         self.assertEqual(unresolved_inputs({'turn': None, 'acceptance_unknown': {'synthetic-turn': {}}}), 1)
+
+    def test_invalid_recipient_is_rejected_before_an_empty_journal_is_opened(self):
+        with tempfile.TemporaryDirectory() as directory:
+            connection = Path(directory) / "connection.json"
+            connection.write_text(
+                json.dumps({"base_url": "https://team.example.invalid@evil.example", "token": "fixture"}),
+                encoding="utf-8",
+            )
+            replay = Path(__file__).resolve().parents[1] / "replay_pending.py"
+            result = subprocess.run(
+                [sys.executable, "-I", "-S", str(replay), "--connection-file", str(connection)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(any(Path(directory).glob("outbox-*.sqlite3")))
+
+    def test_connection_file_is_required_before_any_file_is_read(self):
+        replay = Path(__file__).resolve().parents[1] / "replay_pending.py"
+        result = subprocess.run(
+            [sys.executable, "-I", "-S", str(replay)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("the following arguments are required: --connection-file", result.stderr)
+        self.assertNotIn("FileNotFoundError", result.stderr)

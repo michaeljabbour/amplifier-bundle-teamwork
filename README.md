@@ -1,82 +1,165 @@
 # Teamwork for Amplifier
 
-This composable Amplifier bundle shares one explicitly selected project's visible user prompts, final responses, session IDs, and actual shared-context injections. It retrieves project context and records the observed Amplifier context-input acceptance boundary. It never runs a central agent or publishes tool/internal-loop dumps. It does not accept tasks or publish insights automatically. Delegated child sessions are excluded so internal agent instructions are not treated as human-visible conversation.
+Teamwork is an **explicit, per-session opt-in** Amplifier bundle for sharing one selected project's visible conversation and bounded project context. It does not install a central agent, publish tool/internal-loop output, claim tasks, or change Amplifier's defaults.
 
-**Verified on one real local Amplifier CLI session on 2026-09-09:** the configured provider returned the shared project's exact goal; the service stored a prompt/response pair with correct harness origin and a delivery receipt, and the local outbox drained. The temporary test credential was revoked. Other participants' machines have not been verified by this test.
+## Before you enroll
 
-## Connect your own installation
+When you run an enabled Teamwork overlay, the selected project can receive:
 
-1. Sign in at **https://team.amplifier.run** using your name/email and private member code. Choose the project you were added to. New projects do not inherit your other interviews or profile context.
-2. Clone the bundle (`git clone https://github.com/michaeljabbour/amplifier-bundle-teamwork.git`) and `cd amplifier-bundle-teamwork`, or download/extract the Teamwork adapter archive. Ensure your existing Amplifier installation works. Run `amplifier bundle current` and `amplifier bundle show <your-bundle>` to find the bundle you already use; do not guess a bundle name.
-3. From this bundle directory run:
+- visible prompts and final responses;
+- session metadata and stable correlation IDs; and
+- receipts for bounded, derived project-context excerpts that Amplifier's context manager accepted before a turn.
 
-   ```sh
-   python3 setup_teamwork.py --project teamwork --bundle /absolute/path/to/your/existing/bundle
-   ```
+Credential-shaped strings are redacted with patterns before they are stored or sent. Pattern redaction is **not** a guarantee that arbitrary secrets or sensitive prose will be detected. Do not opt in a session that contains secrets or content you do not intend to share.
 
-   The script prompts for name/email and a hidden member code, then enrolls a **separate project-scoped harness credential** with only context-read/session-write scopes. It stores that credential in a private mode-600 connection file and creates `teamwork-overlay.yaml`. The member code is not stored. The default harness label is generic; use `--label` for a label you choose. Setup reserves both private output files before enrollment and revokes the new harness if a later write fails. If revocation also fails, it reports the harness ID for recovery in the portal. The overlay includes only the connection file path, not a credential.
-4. Start a **new** session explicitly using the generated overlay:
+## Prerequisites
 
-   ```sh
-   amplifier run --bundle file:///absolute/path/to/teamwork-overlay.yaml
-   ```
+Use macOS, Linux, or WSL with Python 3.11+, Git, and [uv](https://docs.astral.sh/uv/). You also need an existing, configured Amplifier installation and a provider you can already use.
 
-   Use the exact file URI printed by setup; the inspected CLI treats a bare filesystem path as a registry name. This opts that new session into sharing visible turns with the selected project. It changes neither the active/default bundle nor existing sessions. If you use another project, enroll a separate connection using `--project`, `--connection-file`, and `--output` to keep the credentials and overlay separate.
-5. Ask a short non-sensitive prompt about the project. Confirm the actual session and prompt/response appear in the shared room. Other participants must each perform their own run; one local proof cannot establish five-machine acceptance.
-
-Revoke the harness in the website's harness controls when finished. Existing connection/overlay files are never overwritten by setup. The credential expires after 30 days. For a new credential, enroll again to a new connection file; old queued work belongs to the old credential and needs reconciliation rather than blindly relabeling ownership.
-
-## What the hook does
-
-- Source-verified lifecycle events: `session:start`, `prompt:submit`, `prompt:complete`, `session:end`.
-- On prompt submission, flushes durable pending requests and fetches project-scoped snapshot/delta context. It selects a bounded **derived excerpt** (up to 10,000 UTF-8 bytes) and calls the mounted context manager's async `add_message` method.
-- Only after that await succeeds does it enqueue `harness_input_accepted` receipts. This is an observable harness boundary, not proof of provider submission, comprehension, or agreement. A failed input attachment produces no receipt.
-- The excerpt is a persistent user-context message, not ephemeral provider-only injection. This deliberate choice provides a directly observable acceptance boundary. The context manager may later compact its provider view; repeated turns add bounded messages to history. Receipts do not claim immunity from compaction.
-- A `prompt:complete` event links the original prompt, visible response, and exact injection under stable IDs. If a host never emits that event, final-response capture is unsupported for that host: an interrupted/incomplete turn remains explicit. The inspected CLI emits it after `session.execute` returns.
-- A private local SQLite journal stores selected turn content and request keys before transmission. After interruption/restart, stable keys are reused. The hook uses only the enrolled project API, no global directory endpoints. One process should own a given native session at a time.
-- Known credential-shaped strings and this connection's exact token are redacted before journal storage. This is not a comprehensive content classifier. Only opt in sessions whose visible prompts/responses you intend to share; never put secrets in project conversations.
-
-To retry queued work from older closed sessions, run the replay helper using the Amplifier Python environment (where `amplifier_core` is installed):
+If Amplifier is not installed yet, its normal first-time setup is:
 
 ```sh
-python3 replay_pending.py --connection-file /path/to/private/connection.json
+uv tool install git+https://github.com/microsoft/amplifier
+amplifier init
+amplifier --version
 ```
 
-If your ordinary Python lacks `amplifier_core`, use the Python executable from your Amplifier environment. The helper prints pending counts and HTTP status, not content or credentials. It also reports `acceptance_unknown` inputs after an interrupted attachment/receipt commit; their exact candidate excerpts remain in the private journal for reconciliation, and are never converted into fabricated receipts. A 409/410 remains blocked for explicit reconciliation; it never fabricates an acknowledged delivery or silently overwrites a conflict.
+`amplifier init` configures providers and routing. If Amplifier is already working, do not reinstall or reconfigure it for Teamwork.
 
-## Evidence and limits
+## Connect one project
 
-Focused adapter tests cover accepted-input-before-receipt ordering, input failure without receipt, durable retry-key reuse across hook restart, and credential redaction. Tests import the real installed `HookResult` type but use a fake context/client for deterministic boundary failures. The original extracted adapter passed a separate real Amplifier CLI acceptance run. See `docs/VALIDATION.md` for the standalone bundle validation and its limits; unit tests alone are not provider proof.
+### 1. Keep a persistent local checkout
 
-Source inspection used the installed `loop-streaming` implementation's `prompt:submit` event, `context-simple.add_message`, the CLI's `prompt:complete` emission, and the hook module entrypoint/mount convention. The adapter is a small candidate for those interfaces, not a claim of compatibility with every custom orchestrator. No user bundle name, provider/model, or remote participant installation is assumed.
-
-## Bundle structure and development
-
-- `bundle.md` is a thin Foundation-based entry point.
-- `behaviors/teamwork.yaml` adds only the hook; it does not select a provider, replace an orchestrator, or add agent authority.
-- `modules/hooks-teamwork/` is the independently packaged hook. Python 3.11+ is required. `amplifier-core` is a peer supplied by the Amplifier host; the hook has no third-party runtime dependencies of its own. Hatchling builds its wheel.
-- `setup_teamwork.py` composes the behavior onto your chosen existing bundle and supplies an absolute local module path, so a checkout/archive works without publishing first.
-- The behavior defaults to sharing disabled. Enrollment is the supported way to create an explicit opt-in overlay. Loading the bare root bundle does not enroll you or enable sharing.
-
-Run deterministic tests with the Python executable from your working Amplifier environment:
+Clone the public, canonical repository to a location that will remain present while you use its generated overlays:
 
 ```sh
-/path/to/amplifier-environment/bin/python -m unittest discover -s tests -v
-/path/to/amplifier-environment/bin/python scripts/validate_bundle.py
+TEAMWORK_CHECKOUT="$HOME/.local/share/amplifier/teamwork"
+git clone https://github.com/michaeljabbour/amplifier-bundle-teamwork "$TEAMWORK_CHECKOUT"
+cd "$TEAMWORK_CHECKOUT"
 ```
 
-No service database, transcripts, login codes, provider keys, or operator artifacts belong in this repository. Connection files and SQLite journals live outside it by default. See `docs/PROTOCOL.md` for the API and delivery boundary and `docs/PUBLISHING.md` for publication checks.
+The generated overlay uses this checkout as a local hook source. Do not move or delete the checkout while an overlay made from it is in use.
 
-To compose into an existing bundle manually after enrollment:
+### 2. Identify the base bundle you actually use
+
+These commands are read-only source-discovery aids:
+
+```sh
+amplifier bundle current
+amplifier bundle show <name>
+```
+
+Use their output to preserve your actual base bundle. Do not guess a registry alias or substitute a generic bundle name. For portable local setup, supply an **existing absolute filesystem path** to that bundle (for example, `/absolute/path/to/my-bundle.yaml`); an explicit Git URI is also valid only when you intentionally want the remote source resolved.
+
+### 3. Enroll and create project-private files
+
+Sign in at [team.amplifier.run](https://team.amplifier.run) with your name/email and private member code, and select the project you were added to. Then choose a project-specific private directory outside the checkout. The explicit paths below avoid relying on any installer default:
+
+```sh
+BASE_BUNDLE="/absolute/path/to/your/existing/bundle.yaml"
+TEAMWORK_HOME="$HOME/.config/amplifier-teamwork/teamwork"
+mkdir -p "$TEAMWORK_HOME"
+
+python3 setup_teamwork.py \
+  --project teamwork \
+  --bundle "$BASE_BUNDLE" \
+  --connection-file "$TEAMWORK_HOME/connection.json" \
+  --output "$TEAMWORK_HOME/teamwork-overlay.yaml"
+```
+
+The script asks for the member code without saving it, enrolls a separate project-scoped harness credential, writes a private connection file, and writes the overlay. Existing output files are not overwritten. Keep the connection file, SQLite journal, and overlay outside the repository and out of source control.
+
+By default enrollment uses `https://team.amplifier.run`. You may explicitly select a trusted custom HTTPS service URL, but that does **not** establish that the service is Teamwork-compatible. Deceptive URLs containing userinfo, a query, or a fragment are rejected. HTTP is for literal loopback test hosts only (`localhost`, `127.0.0.1`, or `::1`), never a production service.
+
+### 4. Start a new opted-in session
+
+Setup prints the exact file URI to use. Copy that URI into a **new** session, for example:
+
+```sh
+amplifier run --bundle file:///absolute/path/to/teamwork-overlay.yaml
+```
+
+Use the URI setup printed rather than a bare path: the CLI may interpret a bare path as a bundle name. This command does not run `amplifier bundle add`, `amplifier bundle use`, change an app setting, or change a default bundle. A normal future run that omits this overlay does not itself enable Teamwork; Teamwork makes no claim about unrelated pre-existing defaults.
+
+Ask a short, non-sensitive project prompt and confirm the expected project activity. Each participant must enroll and opt in on their own machine.
+
+## What is shared and retained
+
+The hook responds only to visible lifecycle events: `session:start`, `prompt:submit`, `prompt:complete`, and `session:end`. Child/delegated sessions are excluded.
+
+Before a visible prompt, it flushes durable pending work, retrieves selected project context, derives a bounded excerpt, and awaits Amplifier context acceptance. Only that successful acceptance can produce a `harness_input_accepted` receipt. A receipt proves the context manager accepted a message; it does not prove provider submission, model attention, comprehension, agreement, or completion.
+
+A private SQLite journal records selected shared turn data, synchronization state, and its durable outbox before requests are sent. The context cache is sanitized before it is persisted: recognized credential strings are redacted while the source-content hash is retained for correlation. This is a logical scrub of the current cache, not an assertion that backups, exported copies, or old SQLite pages have been erased.
+
+Requests use stable idempotency keys. Delivery order is retained; a conflict blocks later work until you reconcile it. A visible prompt or response over the sharing limit is omitted. See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the exact delivery and acceptance boundary.
+
+## Recovery, updates, and removal
+
+### Replay queued work
+
+The replay helper is a standalone standard-library Python path. Give it the specific private connection file:
+
+```sh
+python3 replay_pending.py \
+  --connection-file "$TEAMWORK_HOME/connection.json"
+```
+
+It reports pending requests, blocked HTTP statuses, and `acceptance_unknown` outcomes without printing content or credentials. `acceptance_unknown` means interruption left uncertainty between input attachment and durable receipt recording. Reconcile it from the private journal; replay never turns it into an invented receipt. Conflicts and revoked or expired credentials likewise require explicit reconciliation.
+
+### Update the local checkout
+
+Overlays point at the local checkout, so update a reviewed revision deliberately:
+
+1. Stop sessions launched with the overlay.
+2. Replay and reconcile pending work before changing the checkout.
+3. Update this checkout to the reviewed revision, then start a new overlay session using the printed file URI.
+
+A Git URL alone does not pin the nested hook module. If remote composition is necessary, pin both the behavior include and the hook source to the **same reviewed full commit SHA**. The local-checkout setup above is the recommended route.
 
 ```yaml
+# Template only — replace both placeholders with one reviewed full commit SHA.
 includes:
-  - bundle: git+https://github.com/michaeljabbour/amplifier-bundle-teamwork@main#subdirectory=behaviors/teamwork.yaml
+  - bundle: git+https://github.com/michaeljabbour/amplifier-bundle-teamwork@<REVIEWED_FULL_COMMIT_SHA>#subdirectory=behaviors/teamwork.yaml
 hooks:
   - module: hooks-teamwork
+    source: git+https://github.com/michaeljabbour/amplifier-bundle-teamwork@<REVIEWED_FULL_COMMIT_SHA>#subdirectory=modules/hooks-teamwork
     config:
-      connection_file: ~/.config/amplifier-teamwork/connection.json
+      connection_file: /absolute/path/outside/the-checkout/connection.json
       share_visible_turns: true
 ```
 
-The hook source is independent of your bundle's directory. The setup-generated overlay uses the local checkout instead, which is useful for development and offline packaging. Use a reviewed commit SHA instead of `main` when you need a fixed revision.
+This template is not copy-ready: replace both placeholders only with the same published, reviewed revision that contains the required fixes. No current reviewed revision is implied here.
+
+### Retire an enrollment
+
+Stop overlay sessions, then replay and reconcile their queued work. Revoke the harness in the Teamwork service portal, and **only then** remove the connection file, overlay, journal, and checkout if no longer needed. Deleting local files does not revoke a harness credential.
+
+## Local validation and limits
+
+For the `uv tool install` route, use uv's tool environment rather than deriving a Python executable from a wrapper shebang:
+
+```sh
+AMP_PY="$(uv tool dir)/amplifier/bin/python"
+"$AMP_PY" -m unittest discover -s tests -v
+"$AMP_PY" scripts/validate_bundle.py
+```
+
+For another installation method, set `AMPLIFIER_PY` to the known Python executable from that installation's Amplifier environment:
+
+```sh
+AMPLIFIER_PY="/path/to/amplifier-environment/bin/python"
+AMP_PY="$AMPLIFIER_PY"
+"$AMP_PY" -m unittest discover -s tests -v
+"$AMP_PY" scripts/validate_bundle.py
+```
+
+Current and historical validation evidence is in [`docs/VALIDATION.md`](docs/VALIDATION.md). A clean current CLI smoke and an external-service smoke remain unverified. The current local-fixture checks do not prove a live Teamwork service, an external provider, another participant's machine, or every custom orchestrator. The bundle is intentionally narrow and is not a compatibility promise for every custom orchestrator.
+
+## Bundle structure
+
+- `bundle.md` is the Foundation-based entry point.
+- `behaviors/teamwork.yaml` adds an explicitly disabled hook behavior.
+- `modules/hooks-teamwork/` is the independently packaged hook; it requires Python 3.11+ and uses host-supplied `amplifier-core` for lifecycle integration.
+- `setup_teamwork.py` composes the selected base bundle with an enrolled, enabled local overlay.
+
+No service databases, transcripts, member codes, provider keys, private connection files, journals, or local validation artifacts belong in this repository. See [`docs/PUBLISHING.md`](docs/PUBLISHING.md) for release checks.

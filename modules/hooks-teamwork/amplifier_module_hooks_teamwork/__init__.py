@@ -8,16 +8,14 @@ import logging
 import os
 import re
 import sqlite3
-import time
 import uuid
 import urllib.error
-import urllib.parse
 import urllib.request
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
-from amplifier_core import HookResult
+from .service_url import validate_service_url
 
 __amplifier_module_type__ = "hook"
 logger = logging.getLogger(__name__)
@@ -26,6 +24,12 @@ logger = logging.getLogger(__name__)
 def uid(): return str(uuid.uuid4())
 def now(): return datetime.now(timezone.utc).isoformat()
 def sha(value): return hashlib.sha256(value.encode()).hexdigest()
+
+
+def hook_result():
+    """Create the host-owned result only when a mounted handler returns."""
+    from amplifier_core import HookResult
+    return HookResult(action="continue")
 
 
 class SyncError(Exception):
@@ -39,8 +43,9 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 class HTTPClient:
     def __init__(self, connection):
+        base_url = validate_service_url(connection["base_url"])
         self.token = connection["token"]
-        self.base = connection["base_url"].rstrip("/") + "/api/v1/projects/" + connection["project_id"]
+        self.base = base_url + "/api/v1/projects/" + connection["project_id"]
 
     def request(self, endpoint, body, key=None):
         headers = {"Authorization": "Bearer " + self.token, "Content-Type": "application/json"}
@@ -93,12 +98,31 @@ class TeamworkHook:
         self.sid = str(uuid.uuid5(uuid.NAMESPACE_URL, connection["base_url"] + "/" + connection["project_id"] + "/" + sha(connection["token"]) + "/" + native))
         self.native = native
         self.state = journal.load(self.sid)
+        if self._scrub_cache():
+            self.journal.save(self.sid, self.state)
         self.lock = asyncio.Lock()
         self.entered = False
 
     def clean(self, value):
         value = str(value).replace(self.connection["token"], "[REDACTED CREDENTIAL]")
         return re.sub(r"(?i)(?:sk-[a-z0-9_-]{16,}|bearer\s+[a-z0-9._~-]{16,})", "[REDACTED CREDENTIAL]", value)
+
+    def clean_json(self, value):
+        if isinstance(value, dict):
+            return {self.clean(key): self.clean_json(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self.clean_json(item) for item in value]
+        if isinstance(value, str):
+            return self.clean(value)
+        return value
+
+    def _scrub_cache(self):
+        cache = self.state.get("cache", {})
+        cleaned = self.clean_json(cache)
+        if cleaned == cache:
+            return False
+        self.state["cache"] = cleaned
+        return True
 
     def queue(self, operations):
         self.journal.save(self.sid, self.state, [("publish", {"operations": operations}, uid())])
@@ -118,7 +142,7 @@ class TeamworkHook:
             self.ensure_session()
             try: await self.flush()
             except SyncError as error: logger.warning("Teamwork session queued locally; synchronization pending (HTTP %s; 0 means transport failure)", error.status)
-        return HookResult(action="continue")
+        return hook_result()
 
     async def retrieve(self):
         for _ in range(5):
@@ -129,6 +153,7 @@ class TeamworkHook:
                     self.state["cursor"] = None; self.state["cache"] = {}; self.journal.save(self.sid, self.state)
                 raise
             for record in page["items"]:
+                record = self.clean_json(record)
                 key = record["record_type"] + ":" + record["id"]
                 if record["change"] in ("delete", "evict"): self.state["cache"].pop(key, None)
                 elif "content" in record:
@@ -170,7 +195,7 @@ class TeamworkHook:
             try:
                 await self.flush(); await self.retrieve()
                 rendered, sources = self.render()
-                if not sources: return HookResult(action="continue")
+                if not sources: return hook_result()
                 inj = {"id": uid(), "rendered_text": rendered, "content_sha256": sha(rendered)}
                 turn = self.state["turn"]; turn["prepared_injection"] = inj
                 self.journal.save(self.sid, self.state)
@@ -193,7 +218,7 @@ class TeamworkHook:
                     self.state["turn"]["boundary"] = "acceptance_unknown"
                     self.state["turn"]["injections"] = []
                 logger.warning("Teamwork sync pending; no unobserved delivery is acknowledged (HTTP %s; 0 means transport/input failure)", getattr(error, "status", 0))
-            return HookResult(action="continue")
+            return hook_result()
 
     def finish(self, response, response_state="final"):
         turn = self.state.get("turn")
@@ -219,7 +244,7 @@ class TeamworkHook:
             self.finish(data.get("response", ""))
             try: await self.flush()
             except SyncError: logger.warning("Teamwork visible response queued locally")
-        return HookResult(action="continue")
+        return hook_result()
 
     async def on_end(self, event, data):
         async with self.lock:
@@ -230,7 +255,7 @@ class TeamworkHook:
             self.queue([{"op": "session.upsert", "id": self.sid, "expected_version": version, "data": {"status": status, "ended_at": now()}}])
             try: await self.flush()
             except SyncError: logger.warning("Teamwork final session state queued locally")
-        return HookResult(action="continue")
+        return hook_result()
 
 
 async def mount(coordinator, config=None):
@@ -245,10 +270,8 @@ async def mount(coordinator, config=None):
     path = Path(config.get("connection_file") or os.environ.get("TEAMWORK_CONNECTION_FILE", "~/.config/amplifier-teamwork/connection.json")).expanduser()
     if os.name != "nt" and path.stat().st_mode & 0o077:
         raise ValueError("Teamwork connection file must be private (chmod 600)")
-    connection = json.loads(path.read_text())
-    parsed = urllib.parse.urlsplit(connection["base_url"])
-    if parsed.scheme != "https" and not (parsed.scheme == "http" and parsed.hostname in ("localhost", "127.0.0.1")):
-        raise ValueError("Teamwork requires HTTPS except explicit loopback tests")
+    connection = json.loads(path.read_text(encoding="utf-8"))
+    connection["base_url"] = validate_service_url(connection["base_url"])
     if not connection.get("project_id") or not connection.get("token"):
         raise ValueError("Teamwork project and enrolled harness credential required")
     journal_path = Path(config.get("journal_path") or path.parent / ("outbox-" + sha(connection["token"])[:16] + ".sqlite3")).expanduser()
@@ -256,4 +279,4 @@ async def mount(coordinator, config=None):
     for name, handler in (("session:start", hook.on_start), ("prompt:submit", hook.on_submit), ("prompt:complete", hook.on_complete), ("session:end", hook.on_end)):
         coordinator.hooks.register(name, handler, priority=50, name="teamwork-" + name.replace(":", "-"))
     coordinator.register_capability("teamwork.session_id", hook.sid)
-    return {"name": "hooks-teamwork", "version": "0.1.0", "description": "Opt-in project sharing; persistent bounded context with observed input receipts"}
+    return None
