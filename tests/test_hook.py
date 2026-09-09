@@ -9,7 +9,8 @@ import urllib.error
 import subprocess
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "modules/hooks-teamwork"))
-from amplifier_module_hooks_teamwork import HTTPClient, Journal, TeamworkHook, SyncError, sha, NoRedirect, mount
+from amplifier_module_hooks_teamwork import (HTTPClient, Journal, TeamworkHook, SyncError, sha, NoRedirect,
+                                             mount, resolve_connection, describe, PERSON_FIELDS)
 
 
 class Context:
@@ -133,6 +134,167 @@ class HookTests(unittest.IsolatedAsyncioTestCase):
 
 
 
+class RebindTests(unittest.IsolatedAsyncioTestCase):
+    """Moving a session between projects must not carry credentials or turns across."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        self.events = []; self.client = Client(self.events)
+        self.connection = {"base_url": "https://team.example.invalid", "project_id": "alpha",
+                           "token": "alpha-credential-no-real-secret", "harness_id": "harness-alpha"}
+        self.hook = TeamworkHook(Coordinator(Context(self.events)), self.connection,
+                                 Journal(Path(self.tmp.name) / "queue.db"), self.client)
+
+    def test_a_fresh_enrollment_replaces_the_previous_project_credential(self):
+        minted = {"base_url": "https://team.example.invalid", "project_id": "beta",
+                  "token": "beta-credential-no-real-secret", "harness_id": "harness-beta"}
+        before = self.hook.sid
+        self.hook.rebind("beta", minted)
+        self.assertEqual(self.hook.connection["token"], minted["token"])
+        self.assertEqual(self.hook.connection["harness_id"], "harness-beta")
+        self.assertNotEqual(self.hook.sid, before)
+        # The credential the client will actually present is the new one.
+        self.assertEqual(self.hook.client.token, minted["token"])
+        # The superseded credential is no longer what redaction protects.
+        self.assertIn("[REDACTED CREDENTIAL]", self.hook.clean("x " + minted["token"]))
+
+    def test_binding_without_a_credential_keeps_the_configured_one(self):
+        self.hook.rebind("beta")
+        self.assertEqual(self.hook.connection["token"], "alpha-credential-no-real-secret")
+        self.assertEqual(self.hook.connection["project_id"], "beta")
+
+    async def test_an_open_turn_is_closed_under_the_project_it_started_in(self):
+        await self.hook.on_submit("prompt:submit", {"prompt": "Asked while on alpha"})
+        alpha = self.hook.sid
+        self.hook.rebind("beta", {"token": "beta-credential-no-real-secret"})
+        self.assertIsNone(self.hook.state.get("turn"))
+        # Known limit: flushing is session-scoped, so the closed turn stays queued
+        # under alpha for the replay helper rather than following the session to beta.
+        await self.hook.flush()
+        sent = [op for endpoint, body, _ in self.client.requests
+                if endpoint == "publish" for op in body["operations"] if op["op"] == "turn.upsert"]
+        self.assertFalse(sent, "the previous project's turn must not be sent by the rebound session")
+        with self.hook.journal.connect() as conn:
+            queued = [json.loads(row[0]) for row in
+                      conn.execute("SELECT body FROM outbox WHERE session=?", (alpha,)).fetchall()]
+        turns = [op for body in queued for op in body["operations"] if op["op"] == "turn.upsert"]
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0]["data"]["session_id"], alpha)
+        self.assertEqual(turns[0]["data"]["user_prompt"], "Asked while on alpha")
+        # No response was produced before the move, so none is claimed.
+        self.assertEqual(turns[0]["data"]["agent_responses"], [])
+        # And nothing about that turn is attributed to beta.
+        with self.hook.journal.connect() as conn:
+            self.assertEqual(conn.execute("SELECT count(*) FROM outbox WHERE session=?",
+                                          (self.hook.sid,)).fetchone()[0], 0)
+
+    def test_a_blank_project_is_refused(self):
+        for bad in ("", "   ", None):
+            with self.assertRaises(ValueError): self.hook.rebind(bad)
+
+    def test_a_rebind_service_url_is_validated(self):
+        with self.assertRaises(ValueError):
+            self.hook.rebind("beta", {"base_url": "http://not-loopback.invalid", "token": "t"})
+
+
+class InfluenceTests(unittest.IsolatedAsyncioTestCase):
+    """Received teammate context is named to the user, once, and never over-shares."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        self.events = []; self.client = Client(self.events)
+        self.connection = {"base_url": "https://team.example.invalid", "project_id": "teamwork", "token": "test-credential-no-real-secret"}
+        self.hook = TeamworkHook(Coordinator(Context(self.events)), self.connection,
+                                 Journal(Path(self.tmp.name) / "queue.db"), self.client)
+
+    def source(self, kind, rid, content, digest=None):
+        return {"record": {"key": kind + ":" + rid + ":1", "id": rid, "record_type": kind,
+                           "content": content, "content_sha256": digest or (kind + rid)},
+                "delivery_id": "manifest"}
+
+    def test_new_records_are_named_with_their_author(self):
+        notice = self.hook.influence([
+            self.source("insight", "i1", {"author": {"name": "Dana Cole"}, "summary": "Run the server yourself"}),
+            self.source("work", "t1", {"title": "Connect a session", "status": "accepted"}),
+        ])
+        self.assertIn("teamwork", notice)
+        self.assertIn("not instructions", notice)
+        self.assertIn("Insight", notice)
+        self.assertIn("Dana Cole", notice)
+        self.assertIn("Run the server yourself", notice)
+        self.assertIn("Connect a session", notice)
+        # Insights lead; incidental records follow.
+        self.assertLess(notice.index("Insight"), notice.index("Work"))
+
+    def test_unchanged_records_are_not_re_announced_but_edits_are(self):
+        first = self.source("insight", "i1", {"summary": "Original"}, "hash-1")
+        self.assertIsNotNone(self.hook.influence([first]))
+        self.assertIsNone(self.hook.influence([first]))
+        edited = self.source("insight", "i1", {"summary": "Revised"}, "hash-2")
+        notice = self.hook.influence([edited])
+        self.assertIn("Revised", notice)
+
+    def test_a_record_dropped_from_cache_is_announced_again_when_it_returns(self):
+        record = self.source("idea", "d1", {"text": "Try a local host"})
+        self.assertIn("Try a local host", self.hook.influence([record]))
+        # A later turn no longer carries it: the service evicted it.
+        self.hook.state["cache"] = {}
+        self.assertIsNone(self.hook.influence([]))
+        self.assertFalse(self.hook.state["announced"])
+        # It comes back, so it is influence the user has not been told about.
+        self.assertIn("Try a local host", self.hook.influence([record]))
+
+    def test_a_record_still_cached_is_not_forgotten_between_turns(self):
+        record = self.source("idea", "d1", {"text": "Try a local host"})
+        self.hook.state["cache"] = {"idea:d1": {"record": record["record"], "delivery_id": "manifest"}}
+        self.assertIsNotNone(self.hook.influence([record]))
+        self.assertIsNone(self.hook.influence([]))
+        self.assertIsNone(self.hook.influence([record]))
+
+    def test_long_notices_are_bounded_and_summarised(self):
+        many = [self.source("work", "t%d" % index, {"title": "Item %d" % index}) for index in range(9)]
+        notice = self.hook.influence(many)
+        self.assertEqual(len(notice.splitlines()), 7)          # header + 5 shown + the remainder
+        self.assertIn("+4 more (work)", notice)
+
+    def test_notice_never_exposes_unprojected_person_fields_or_credentials(self):
+        secret = self.connection["token"]
+        notice = self.hook.influence([
+            self.source("person", "p1", {"name": "Fixture Person", "summary": "UNPROJECTED", "private_note": "LEAK"}),
+            self.source("insight", "i1", {"summary": "Token is " + secret}),
+        ])
+        self.assertIn("Fixture Person", notice)
+        for hidden in ("UNPROJECTED", "LEAK", secret):
+            self.assertNotIn(hidden, notice)
+        self.assertIn("[REDACTED CREDENTIAL]", notice)
+        # The projection the notice uses is the one the excerpt uses.
+        self.assertNotIn("summary", PERSON_FIELDS)
+
+    def test_titles_are_truncated_and_unknown_types_still_render(self):
+        line = describe({"record_type": "insight", "id": "i", "key": "insight:i:1",
+                         "content": {"summary": "x" * 500}})
+        self.assertLessEqual(len(line), 170)
+        self.assertTrue(line.endswith("\u2026"))
+        unknown = describe({"record_type": "brand_new", "id": "n", "key": "brand_new:n:1", "content": {}})
+        self.assertIn("Brand new", unknown)
+        self.assertIn("brand_new:n:1", unknown)
+
+    async def test_the_notice_reaches_the_user_through_the_hook_result(self):
+        result = await self.hook.on_submit("prompt:submit", {"prompt": "My prompt"})
+        self.assertEqual(result.user_message_source, "teamwork")
+        self.assertEqual(result.user_message_level, "info")
+        self.assertIn("Fixture goal", result.user_message)
+        # The same context on the next turn is not re-announced as new influence.
+        again = await self.hook.on_submit("prompt:submit", {"prompt": "Another prompt"})
+        self.assertIsNone(again.user_message)
+
+    async def test_no_notice_when_nothing_was_accepted(self):
+        self.hook.coordinator = Coordinator(Context(self.events, fail=True))
+        result = await self.hook.on_submit("prompt:submit", {"prompt": "My prompt"})
+        self.assertIsNone(result.user_message)
+        self.assertFalse(self.hook.state.get("announced"))
+
+
 class RedirectTests(unittest.TestCase):
     def test_harness_bearer_redirect_is_refused(self):
         request = urllib.request.Request('https://team.example.invalid/api/v1/projects/test/context', headers={'Authorization': 'Bearer fixture'})
@@ -179,6 +341,61 @@ class MountTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result)
         self.assertEqual(len(root.hooks.handlers), 4)
         self.assertIn("teamwork.session_id", root.capabilities)
+
+    async def test_host_configuration_supplies_the_connection_without_a_private_file(self):
+        class Hooks:
+            def __init__(self): self.handlers = []
+            def register(self, *args, **kwargs): self.handlers.append((args, kwargs))
+
+        class Root:
+            parent_id = None
+            session_id = "configured-session"
+            def __init__(self): self.hooks = Hooks(); self.capabilities = {}
+            def register_capability(self, name, value): self.capabilities[name] = value
+
+        root = Root()
+        with tempfile.TemporaryDirectory() as directory:
+            result = await mount(root, {
+                "share_visible_turns": True,
+                "base_url": "https://team.example.invalid",
+                "project_id": "configured-project",
+                "token": "[REDACTED:SECRET]",
+                "journal_path": str(Path(directory) / "queue.sqlite3"),
+            })
+        self.assertIsNone(result)
+        self.assertEqual(len(root.hooks.handlers), 4)
+        self.assertIn("teamwork.session_id", root.capabilities)
+
+    def test_configured_project_overrides_the_enrolled_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            connection = Path(directory) / "connection.json"
+            connection.write_text(
+                json.dumps({"base_url": "https://team.example.invalid", "project_id": "enrolled", "token": "file-token"}),
+                encoding="utf-8",
+            )
+            connection.chmod(0o600)
+            resolved, home = resolve_connection({"connection_file": str(connection), "project_id": "session-bound"})
+        self.assertEqual(resolved["project_id"], "session-bound")
+        self.assertEqual(resolved["token"], "file-token")
+        self.assertEqual(home, connection.parent)
+
+    def test_blank_configuration_value_is_refused_rather_than_sent(self):
+        # An unset ${VAR} expands to an empty string; that must not reach the service.
+        with self.assertRaisesRegex(ValueError, "empty"):
+            resolve_connection({
+                "base_url": "https://team.example.invalid",
+                "project_id": "project",
+                "token": "   ",
+            })
+
+    def test_configuration_without_a_credential_still_requires_one(self):
+        with self.assertRaises((ValueError, OSError, FileNotFoundError)):
+            resolve_connection({"base_url": "https://team.example.invalid", "project_id": "project",
+                                "connection_file": "/nonexistent/fixture.json"})
+
+    def test_configured_recipient_is_validated(self):
+        with self.assertRaises(ValueError):
+            resolve_connection({"base_url": "http://team.example.invalid", "project_id": "p", "token": "t"})
 
     def test_http_client_validates_recipient_before_reading_token(self):
         class TokenTrap(dict):

@@ -1,11 +1,14 @@
 """Focused native tool/enrollment tests; no provider or external service calls."""
 import asyncio
+import io
 import json
+import re
 import os
 from pathlib import Path
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 import urllib.error
@@ -13,7 +16,8 @@ import urllib.parse
 import urllib.request
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "modules/hooks-teamwork"))
-from amplifier_module_tool_teamwork import connect, private_browser_connect, TeamworkConnect, mount
+from amplifier_module_tool_teamwork import (announce, connect, ConsentAborted, ConsentError, POINTER_NAME,
+                                            private_browser_connect, TeamworkConnect, TeamworkBind, mount)
 from amplifier_module_hooks_teamwork import sha
 
 BASE = "https://team.example.invalid"
@@ -80,39 +84,200 @@ class EnrollmentTests(unittest.TestCase):
 
 
 class BrowserTests(unittest.TestCase):
-    def test_private_form_origin_guard_and_no_credential_echo(self):
-        seen = []; errors = []; workers = []
+    def drive(self, act, timeout=5, home='/unused'):
+        """Run the private form and let `act(url, origin)` play the browser's part."""
+        errors = []; workers = []
         def browser(url):
-            def submit():
-                try:
-                    origin = 'http://' + urllib.parse.urlsplit(url).netloc
-                    with urllib.request.urlopen(url) as response:
-                        page = response.read().decode()
-                        self.assertIn('type="password"', page)
-                        self.assertEqual(response.headers['Cache-Control'], 'no-store')
-                    data = urllib.parse.urlencode(FORM).encode()
-                    bad = urllib.request.Request(url, data, {'Origin': 'https://evil.invalid'})
-                    with self.assertRaises(urllib.error.HTTPError) as error: urllib.request.urlopen(bad)
-                    self.assertEqual(error.exception.code, 403)
-                    request = urllib.request.Request(url, data, {'Origin': origin})
-                    with urllib.request.urlopen(request) as response:
-                        self.assertNotIn(FORM['code'], response.read().decode())
+            def run():
+                try: act(url, 'http://' + urllib.parse.urlsplit(url).netloc)
                 except BaseException as error: errors.append(error)
-            worker = threading.Thread(target=submit); workers.append(worker); worker.start()
+            worker = threading.Thread(target=run); workers.append(worker); worker.start()
             return True
-        def enroll(form, base, home):
-            seen.append(form)
-            return Path('/private/fixture.json'), 'selected'
-        with patch('webbrowser.open', side_effect=browser), patch('amplifier_module_tool_teamwork.connect', side_effect=enroll):
-            result = private_browser_connect(BASE, Path('/unused'), threading.Event(), timeout=5)
-        for worker in workers: worker.join(5)
+        with patch('webbrowser.open', side_effect=browser):
+            try:
+                result = private_browser_connect(BASE, Path(home), threading.Event(), timeout=timeout, notify=None)
+            except Exception as error:
+                result = error
+        for worker in workers: worker.join(10)
         if errors: raise errors[0]
+        return result
+
+    def token(self, page):
+        found = re.search(r'name="csrf" value="([^"]+)"', page)
+        self.assertIsNotNone(found, 'form must carry a csrf field')
+        return found.group(1)
+
+    def post(self, url, fields, headers):
+        request = urllib.request.Request(url, urllib.parse.urlencode(fields).encode(), headers)
+        try:
+            with urllib.request.urlopen(request) as response: return response.status, response.read().decode()
+        except urllib.error.HTTPError as error: return error.code, error.read().decode()
+
+    def test_private_form_origin_guard_and_no_credential_echo(self):
+        seen = []
+        def act(url, origin):
+            with urllib.request.urlopen(url) as response:
+                page = response.read().decode()
+                self.assertIn('type="password"', page)
+                self.assertEqual(response.headers['Cache-Control'], 'no-store')
+                self.assertIn("style-src 'nonce-", response.headers['Content-Security-Policy'])
+            csrf = self.token(page)
+            good = dict(FORM, csrf=csrf)
+            # A cross-site submission is refused even holding a stolen token.
+            status, _ = self.post(url, good, {'Origin': 'https://evil.invalid'})
+            self.assertEqual(status, 403)
+            status, _ = self.post(url, good, {'Origin': origin, 'Sec-Fetch-Site': 'cross-site'})
+            self.assertEqual(status, 403)
+            # Right origin, wrong/absent token is refused too.
+            status, _ = self.post(url, dict(FORM, csrf='wrong'), {'Origin': origin})
+            self.assertEqual(status, 403)
+            status, _ = self.post(url, FORM, {'Origin': origin})
+            self.assertEqual(status, 403)
+            status, body = self.post(url, good, {'Origin': origin})
+            self.assertEqual(status, 200)
+            self.assertNotIn(FORM['code'], body)
+        def enroll(form, base, home):
+            seen.append(form); return Path('/private/fixture.json'), 'selected'
+        with patch('amplifier_module_tool_teamwork.connect', side_effect=enroll):
+            result = self.drive(act)
         self.assertEqual(len(seen), 1)
+        self.assertNotIn('csrf', seen[0])
         self.assertEqual(result[1], 'selected')
 
-    def test_missing_browser_and_cancellation_do_not_enroll(self):
+    def test_browser_omitting_origin_under_no_referrer_still_enrolls(self):
+        """Chrome sends `Origin: null` for a same-origin POST under Referrer-Policy: no-referrer."""
+        seen = []
+        def act(url, origin):
+            with urllib.request.urlopen(url) as response: page = response.read().decode()
+            status, _ = self.post(url, dict(FORM, csrf=self.token(page)),
+                                  {'Origin': 'null', 'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'navigate'})
+            self.assertEqual(status, 200)
+        def enroll(form, base, home):
+            seen.append(form); return Path('/private/fixture.json'), 'selected'
+        with patch('amplifier_module_tool_teamwork.connect', side_effect=enroll):
+            self.drive(act)
+        self.assertEqual(len(seen), 1)
+
+    def test_failed_submission_re_renders_a_retryable_form(self):
+        attempts = []
+        def act(url, origin):
+            with urllib.request.urlopen(url) as response: page = response.read().decode()
+            csrf = self.token(page)
+            status, body = self.post(url, dict(FORM, project='rejected', csrf=csrf), {'Origin': origin})
+            self.assertEqual(status, 400)
+            # The user can fix and resubmit in place; typed values survive, the code never does.
+            self.assertIn('Fixture reason', body)
+            self.assertIn('value="rejected"', body)
+            self.assertNotIn(FORM['code'], body)
+            self.assertIn('type="password"', body)
+            status, body = self.post(url, dict(FORM, csrf=self.token(body)), {'Origin': origin})
+            self.assertEqual(status, 200)
+        def enroll(form, base, home):
+            attempts.append(form['project'])
+            if form['project'] == 'rejected':
+                raise ConsentError('Fixture reason', 'project', 'Fixture hint')
+            return Path('/private/fixture.json'), 'selected'
+        with patch('amplifier_module_tool_teamwork.connect', side_effect=enroll):
+            result = self.drive(act)
+        self.assertEqual(attempts, ['rejected', 'selected'])
+        self.assertEqual(result[1], 'selected')
+
+    def test_service_failure_is_retryable_and_never_echoed(self):
+        def act(url, origin):
+            with urllib.request.urlopen(url) as response: page = response.read().decode()
+            status, body = self.post(url, dict(FORM, csrf=self.token(page)), {'Origin': origin})
+            self.assertEqual(status, 502)
+            for secret in ('service-detail-leak', 'session=cookievalue', FORM['code']):
+                self.assertNotIn(secret, body)
+            self.assertIn('type="password"', body)
+        def enroll(form, base, home):
+            raise RuntimeError('service-detail-leak session=cookievalue')
+        with patch('amplifier_module_tool_teamwork.connect', side_effect=enroll):
+            result = self.drive(act, timeout=1)
+        self.assertIsInstance(result, ConsentAborted)
+
+    def test_cancel_button_aborts_without_enrolling(self):
+        def act(url, origin):
+            with urllib.request.urlopen(url) as response: page = response.read().decode()
+            status, body = self.post(url, {'csrf': self.token(page), 'action': 'cancel'}, {'Origin': origin})
+            self.assertEqual(status, 200)
+            self.assertIn('Cancelled', body)
+        with patch('amplifier_module_tool_teamwork.connect') as enroll:
+            result = self.drive(act, timeout=30)
+        enroll.assert_not_called()
+        self.assertIsInstance(result, ConsentAborted)
+        self.assertIn('cancelled', str(result).lower())
+
+    def test_activity_extends_the_idle_window(self):
+        """The window measures inactivity, so filling the form cannot time it out."""
+        def act(url, origin):
+            for _ in range(4):
+                time.sleep(.35)
+                with urllib.request.urlopen(url) as response: page = response.read().decode()
+            self.post(url, dict(FORM, csrf=self.token(page)), {'Origin': origin})
+        started = time.monotonic()
+        with patch('amplifier_module_tool_teamwork.connect', return_value=(Path('/private/fixture.json'), 'selected')):
+            result = self.drive(act, timeout=.6)
+        self.assertGreater(time.monotonic() - started, .6)
+        self.assertEqual(result[1], 'selected')
+
+    def test_expired_window_explains_itself_instead_of_refusing_the_connection(self):
+        late = {}
+        def act(url, origin):
+            # Land inside the grace period that follows expiry, not after it.
+            time.sleep(1.4)
+            try:
+                with urllib.request.urlopen(url) as response: late['status'] = response.status
+            except urllib.error.HTTPError as error:
+                late['status'] = error.code; late['body'] = error.read().decode()
+        with patch('amplifier_module_tool_teamwork.connect') as enroll:
+            result = self.drive(act, timeout=1)
+        enroll.assert_not_called()
+        self.assertEqual(late.get('status'), 410)
+        self.assertIn('expired', late.get('body', '').lower())
+        self.assertIsInstance(result, ConsentAborted)
+
+    def test_wrong_path_is_told_where_the_real_address_is(self):
+        page = {}
+        def act(url, origin):
+            try: urllib.request.urlopen(url.rsplit('/', 1)[0] + '/')
+            except urllib.error.HTTPError as error: page['body'] = error.read().decode(); page['code'] = error.code
+        with patch('amplifier_module_tool_teamwork.connect'):
+            self.drive(act, timeout=.4)
+        self.assertEqual(page['code'], 404)
+        self.assertIn(POINTER_NAME, page['body'])
+
+    def test_form_address_is_printed_and_saved_privately_then_removed(self):
+        printed = io.StringIO()
+        with tempfile.TemporaryDirectory() as home:
+            pointer = Path(home) / 'native' / POINTER_NAME
+            seen = {}
+            def act(url, origin):
+                seen['url'] = url
+                seen['saved'] = pointer.read_text().strip()
+                seen['mode'] = pointer.stat().st_mode & 0o777
+            def notify(url, path, opened, minutes):
+                announce(url, path, opened, minutes, stream=printed)
+            with patch('webbrowser.open', side_effect=lambda url: (act(url, None), True)[1]):
+                with self.assertRaises(ConsentAborted):
+                    private_browser_connect(BASE, Path(home) / 'native', threading.Event(), timeout=.2, notify=notify)
+            self.assertEqual(seen['saved'], seen['url'])
+            self.assertEqual(seen['mode'], 0o600)
+            self.assertIn(seen['url'], printed.getvalue())
+            self.assertFalse(pointer.exists(), 'the one-time address must not outlive the window')
+
+    def test_missing_browser_still_serves_the_printed_address(self):
         with patch('webbrowser.open', return_value=False), patch('amplifier_module_tool_teamwork.connect') as enroll:
-            with self.assertRaises(RuntimeError): private_browser_connect(BASE, Path('/unused'), threading.Event(), timeout=.1)
+            with self.assertRaises(ConsentAborted) as error:
+                private_browser_connect(BASE, Path('/unused'), threading.Event(), timeout=.1, notify=None)
+            enroll.assert_not_called()
+        self.assertIn('browser could not be opened', str(error.exception))
+
+    def test_cancellation_event_stops_the_window(self):
+        stop = threading.Event(); stop.set()
+        with patch('webbrowser.open', return_value=True), patch('amplifier_module_tool_teamwork.connect') as enroll:
+            with self.assertRaises(ConsentAborted):
+                private_browser_connect(BASE, Path('/unused'), stop, timeout=30, notify=None)
             enroll.assert_not_called()
 
 
@@ -132,7 +297,7 @@ class NativeToolTests(unittest.IsolatedAsyncioTestCase):
     async def test_mount_is_native_and_inert_and_children_excluded(self):
         root = Coordinator()
         self.assertIsNone(await mount(root))
-        self.assertEqual(list(root.tools), ['teamwork_connect'])
+        self.assertEqual(sorted(root.tools), ['teamwork_bind', 'teamwork_connect'])
         self.assertFalse(root.handlers)
         root.parent_id = 'parent'; root.tools.clear()
         await mount(root)
@@ -156,9 +321,41 @@ class NativeToolTests(unittest.IsolatedAsyncioTestCase):
                 with patch.object(hook, 'flush'):
                     await hook.on_complete('prompt:complete', {'response': 'previous turn'})
                 self.assertIsNone(hook.state.get('turn'))
-                await tool.execute({})
-                self.assertEqual(browser.call_count, 1)
+                # Re-triggering is allowed so a running session can change project,
+                # and it rebinds the mounted hook rather than registering again.
+                bound = hook.sid
+                browser.return_value = (path, 'second-project')
+                again = await tool.execute({})
+                self.assertTrue(again.success)
+                self.assertEqual(browser.call_count, 2)
                 self.assertEqual(len(root.handlers), 4)
+                self.assertNotEqual(hook.sid, bound)
+                self.assertEqual(hook.connection['project_id'], 'second-project')
+
+    async def test_bind_selects_a_project_from_configured_settings(self):
+        root = Coordinator()
+        tool = TeamworkBind(root, {'base_url': BASE, 'token': 'configured-fixture'})
+        rejected = await tool.execute({'project_id': '  '})
+        self.assertFalse(rejected.success)
+        self.assertFalse(root.handlers)
+        result = await tool.execute({'project_id': 'chosen'})
+        self.assertTrue(result.success)
+        self.assertEqual(len(root.handlers), 4)
+        hook = root.handlers[0][1].__self__
+        self.assertEqual(hook.connection['project_id'], 'chosen')
+        first = hook.sid
+        moved = await tool.execute({'project_id': 'another'})
+        self.assertTrue(moved.success)
+        self.assertEqual(len(root.handlers), 4)
+        self.assertEqual(hook.connection['project_id'], 'another')
+        self.assertNotEqual(hook.sid, first)
+
+    async def test_bind_without_a_configured_credential_refuses(self):
+        root = Coordinator()
+        result = await TeamworkBind(root, {'base_url': BASE}).execute({'project_id': 'chosen'})
+        self.assertFalse(result.success)
+        self.assertIn('teamwork_connect', str(result))
+        self.assertFalse(root.handlers)
 
     async def test_arguments_and_browser_failure_do_not_enable_sharing(self):
         root = Coordinator(); tool = TeamworkConnect(root, {})

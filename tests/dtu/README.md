@@ -75,6 +75,40 @@ For a deployed service, pass `--member-name`, `--member-code`, `--prompt` and `-
 enrollment then mints a real credential, which must be revoked afterwards in the service's
 own harness controls.
 
+## Host-configuration mode (settings.yaml + keys.env)
+
+The hook can take its connection from ordinary Amplifier host configuration
+instead of a private file. Verified in the twin, with no connection file on disk:
+
+```yaml
+# ~/.amplifier/settings.yaml
+overrides:
+  hooks-teamwork:
+    # A behavior pins its module source to @main, so testing a branch needs
+    # the source override too -- config alone would exercise main's code.
+    source: git+https://github.com/michaeljabbour/amplifier-bundle-teamwork@<ref>#subdirectory=modules/hooks-teamwork
+    config:
+      share_visible_turns: true
+      base_url: http://127.0.0.1:8901
+      project_id: teamwork
+      token: ${TEAMWORK_HARNESS_TOKEN}
+```
+
+```sh
+printf 'TEAMWORK_HARNESS_TOKEN=...\n' > ~/.amplifier/keys.env && chmod 600 ~/.amplifier/keys.env
+```
+
+Observed: the session returned the fixture canary and the stub logged
+`session.upsert -> context -> acknowledgements -> turn.upsert -> session.upsert`,
+with `ls ~/.config/amplifier-teamwork/connection.json` reporting nothing.
+
+Only the URL and the credential are persisted. With no project configured the hook
+mounts inert and `teamwork_bind` binds the running session; verified in the twin, a bind
+turn mounted the hook and queued its session records without a project ever appearing in
+settings. `amplifier run --resume` starts a fresh process, so a resumed session mounts
+inert again -- the harness therefore cannot assert cross-resume sharing, and does not
+pretend to.
+
 ## What a PASS establishes
 
 - Enrollment signs in before minting, presents the session cookie, requests only

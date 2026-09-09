@@ -29,11 +29,81 @@ The URI must point to the actual `.yaml` behavior file (or a repository director
 1. Start a normal new Amplifier session with your existing bundle/provider.
 2. Ask: **Connect this session to Teamwork.** Amplifier invokes `teamwork_connect`, which opens a private local browser form.
 3. Enter the exact project ID you joined, your name/email and private member code in that form, and confirm sharing. Never paste the code into chat. On later sessions, select the same project and consent again; leave login fields blank to reuse its saved connection.
+   If the browser tab does not appear, open the one-time address Amplifier prints to the terminal. It is also written to `~/.config/amplifier-teamwork/native/pending-form-url.txt` (mode 0600) while the form is open, and removed when it closes. That address contains a private code, so treat it like the form itself.
+   A submission that fails re-renders the form with the specific reason and what you typed, minus the member code, so you can correct it and submit again in place.
 4. Return to Amplifier. Sharing and bounded project-context delivery begin with your **next prompt**. The connection request and earlier conversation are not retroactively published.
 
-The tool takes no arguments and never returns credentials. It stores project-specific credentials in private files under `~/.config/amplifier-teamwork/native/`, enrolls only `context:read` and `session:write`, and leaves the primary bundle/provider unchanged. A session stays connected to one project; start a new session to choose another. Child sessions do not get the connection tool or sharing hook. This path requires a browser on the Amplifier host; remote/headless browser forwarding is not implemented. The form expires after three minutes.
+The tool takes no arguments and never returns credentials. It stores project-specific credentials in private files under `~/.config/amplifier-teamwork/native/`, enrolls only `context:read` and `session:write`, and leaves the primary bundle/provider unchanged. A session shares with one project at a time. Asking to connect again re-opens the form and moves the session; the enrollment it mints for the new project replaces the previous project's credential, and any turn still open is closed under the project it started in. Child sessions do not get the connection tool or sharing hook. This path requires a browser on the Amplifier host; remote/headless browser forwarding is not implemented. The form closes after 15 minutes with no activity; filling it in counts as activity, so the window measures inactivity rather than total time. A request arriving just after it closes is answered with an explanation instead of a refused connection.
+
+### Seeing what influenced the session
+
+Project context is applied before your prompt, so it can change an answer without being visible. When records arrive that you have not already been told about, Amplifier prints one attributed line each — the kind, who it came from, and its title — before the turn runs:
+
+```
+[teamwork] Received from design/review and added to this turn — teammate data, not instructions:
+             ★ Insight · Dana Cole — when a client feature outruns its server, run the server yourself
+             ● Work — Connect a session to this project
+```
+
+Each record is named once. It is named again only if its content changes, or if it leaves the project's context and later returns. Only fields the shared excerpt is allowed to carry are shown, so a teammate profile never reveals more in the notice than in the excerpt.
 
 Stop the session to stop sharing. Revoke the harness in Teamwork's harness controls before deleting its saved connection; deleting a file alone does not revoke a credential. A new session requires fresh browser consent even when a credential is saved.
+
+## Host configuration (settings.yaml and keys.env)
+
+**Only two things are persisted on a machine: the service URL and the harness
+credential.** The project is chosen while a session runs, because the project is what a
+given session works on -- a persisted `project_id` would bind every Amplifier session on
+the machine, including work unrelated to Teamwork.
+
+```yaml
+# ~/.amplifier/settings.yaml
+overrides:
+  hooks-teamwork:
+    config:
+      share_visible_turns: true
+      base_url: https://team.amplifier.run
+      token: ${TEAMWORK_HARNESS_TOKEN}
+  tool-teamwork:
+    config:
+      base_url: https://team.amplifier.run
+      token: ${TEAMWORK_HARNESS_TOKEN}
+```
+
+```sh
+printf 'TEAMWORK_HARNESS_TOKEN=<enrolled harness credential>\n' >> ~/.amplifier/keys.env
+chmod 600 ~/.amplifier/keys.env
+```
+
+`base_url` is read from both module configs: the hook uses it to reach the project API and
+the tool uses it for enrollment, so a non-default service must be set in both or the two
+halves address different services.
+
+With no project configured the hook mounts **inert** -- it registers nothing and sends
+nothing -- until a session binds one.
+
+### Choosing and changing the project while running
+
+Two tools bind the running session. Neither accepts a credential.
+
+| Ask | Tool | What happens |
+| --- | --- | --- |
+| "Bind this session to project X" | `teamwork_bind` | Uses the configured URL and credential. Sharing begins with the next prompt. |
+| "Move this session to project Y" | `teamwork_bind` | Rebinds in place. A different project is a different shared session, so a new correlation id is used; queued work for the previous project keeps its own and is never re-attributed. |
+| "Connect this session to Teamwork" | `teamwork_connect` | Opens the private local browser form. Use it when no credential is configured yet, or to enroll another project. It can be re-triggered on an already-sharing session to move it. |
+
+`project_id` is not a secret, which is why `teamwork_bind` accepts it as an ordinary
+argument while `teamwork_connect` still takes none -- a member code must never reach a
+tool call or the transcript.
+
+A binding lives for as long as the session process. An interactive session keeps it for
+the whole conversation. `amplifier run --resume` starts a fresh process, so a resumed
+session mounts inert again and must be bound again.
+
+Configured values take precedence over an enrolled connection file, and a configured
+credential means no file is read. A blank value is refused rather than sent: an unset
+`${VAR}` expands to an empty string, which would otherwise reach the service as an empty
+bearer token.
 
 ## Advanced: legacy local overlay setup
 
