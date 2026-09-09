@@ -324,12 +324,16 @@ class TeamworkConnect:
         if input:
             return ToolResult(success=False, error={"message": "This tool accepts no arguments. Enter information only in the private browser form."})
         async with self.lock:
-            if self.coordinator.get_capability("teamwork.session_id"):
-                return ToolResult(success=True, output="This session is already connected. Start a new session to choose another project.")
+            rebind = self.coordinator.get_capability("teamwork.rebind")
             stop = threading.Event()
             try:
                 path, project = await asyncio.to_thread(private_browser_connect, self.base, self.home, stop, self.timeout)
-                await mount_hook(self.coordinator, {"connection_file": str(path), "share_visible_turns": True})
+                if rebind is not None:
+                    # Already sharing: move this session rather than mounting twice,
+                    # handing over the project-scoped credential the form just minted.
+                    rebind(project, json.loads(Path(path).read_text(encoding="utf-8")))
+                else:
+                    await mount_hook(self.coordinator, {"connection_file": str(path), "share_visible_turns": True})
                 return ToolResult(success=True, output={"project": project, "sharing": "enabled for subsequent prompts in this session"})
             except ConsentAborted as reason:
                 return ToolResult(success=False, error={"message": str(reason) + " Ask to connect again to reopen the form."})
@@ -339,9 +343,58 @@ class TeamworkConnect:
                 stop.set()
 
 
+class TeamworkBind:
+    name = "teamwork_bind"
+    description = (
+        "Bind this Amplifier session to a Teamwork project, or move it to a different one. "
+        "Uses the service URL and harness credential already configured on this machine; "
+        "never ask for or pass credentials. Sharing begins with the next prompt. "
+        "Use teamwork_connect instead when no credential is configured yet."
+    )
+    input_schema = {
+        "type": "object",
+        "properties": {"project_id": {"type": "string", "description": "Exact project id to bind this session to."}},
+        "required": ["project_id"],
+        "additionalProperties": False,
+    }
+
+    def __init__(self, coordinator, config):
+        self.coordinator = coordinator
+        self.config = config
+        self.lock = asyncio.Lock()
+
+    async def execute(self, input):
+        from amplifier_core import ToolResult
+        project = str((input or {}).get("project_id", "")).strip()
+        if not project:
+            return ToolResult(success=False, error={"message": "A project id is required."})
+        async with self.lock:
+            rebind = self.coordinator.get_capability("teamwork.rebind")
+            if rebind is not None:
+                # Already sharing: move this session without re-registering handlers.
+                try:
+                    rebind(project)
+                except Exception:
+                    return ToolResult(success=False, error={"message": "Could not bind that project."})
+                return ToolResult(success=True, output={"project": project, "sharing": "rebound; effective from the next prompt"})
+            settings = {key: self.config[key] for key in ("base_url", "token", "connection_file") if self.config.get(key)}
+            if not settings.get("token") and not settings.get("connection_file"):
+                return ToolResult(success=False, error={"message": "No Teamwork credential is configured. Use teamwork_connect to enroll first."})
+            try:
+                await mount_hook(self.coordinator, dict(settings, project_id=project, share_visible_turns=True))
+            except Exception:
+                return ToolResult(success=False, error={"message": "Could not bind that project with the configured credential."})
+            if self.coordinator.get_capability("teamwork.session_id") is None:
+                return ToolResult(success=False, error={"message": "Binding did not take effect; nothing is being shared."})
+            return ToolResult(success=True, output={"project": project, "sharing": "enabled for subsequent prompts in this session"})
+
+
 async def mount(coordinator, config=None):
     if getattr(coordinator, "parent_id", None):
         return None
-    tool = TeamworkConnect(coordinator, config or {})
+    config = config or {}
+    tool = TeamworkConnect(coordinator, config)
     await coordinator.mount("tools", tool, name=tool.name)
+    binder = TeamworkBind(coordinator, config)
+    await coordinator.mount("tools", binder, name=binder.name)
     return None
