@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+!.env.example
+.amplifier/
+artifacts/
+dist/
+*.egg-info/
+*.sqlite3*
+*connection*.json
+teamwork-overlay*
+.DS_Store

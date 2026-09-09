@@ -1,0 +1,10 @@
+bundle:
+  name: teamwork-behavior
+  version: 0.1.0
+  description: Share opted-in visible turns and consume attributed project context with durable delivery receipts.
+hooks:
+  - module: hooks-teamwork
+    source: git+https://github.com/michaeljabbour/amplifier-bundle-teamwork@main#subdirectory=modules/hooks-teamwork
+    config:
+      # Enrollment creates an overlay that explicitly enables sharing.
+      share_visible_turns: false
