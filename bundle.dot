@@ -8,7 +8,7 @@ digraph teamwork {
     nodesep=0.6
     ranksep=0.7
     bgcolor="white"
-    source_hash="c5e3ea84bac73f1e598b9ebb26d3bbcd1a93748690a7d282d0f23355f9aa5b17"
+    source_hash="51169b22ac1fe97c55b69b47255d440c6acda57c9e66b39774fb69001cb86418"
 
     node [fontname="Helvetica", fontsize=11, style="filled,rounded"]
     edge [fontname="Helvetica", fontsize=9]
@@ -21,7 +21,7 @@ digraph teamwork {
         fillcolor="#f9f9f9"
         color="#999999"
 
-        beh_teamwork_behavior [label="teamwork-behavior\n1 tools\n~108 tok", shape=box, fillcolor="#e0f2f1", style="filled,rounded"]
+        beh_teamwork_behavior [label="teamwork-behavior\n2 tools\n~136 tok", shape=box, fillcolor="#e0f2f1", style="filled,rounded"]
     }
 
     subgraph cluster_modules {

@@ -149,9 +149,12 @@ class MountTests(unittest.IsolatedAsyncioTestCase):
     async def test_explicitly_disabled_hook_is_a_successful_noop(self):
         self.assertIsNone(await mount(object(), {"share_visible_turns": False}))
 
-    async def test_root_requires_explicit_sharing_opt_in(self):
+    async def test_missing_opt_in_is_inert(self):
+        self.assertIsNone(await mount(object(), {}))
+
+    async def test_invalid_opt_in_is_rejected(self):
         with self.assertRaisesRegex(ValueError, 'explicit'):
-            await mount(object(), {})
+            await mount(object(), {'share_visible_turns': 'true'})
 
     async def test_enabled_mount_returns_no_cleanup_metadata(self):
         class Hooks:

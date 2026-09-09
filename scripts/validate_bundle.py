@@ -6,7 +6,7 @@ import subprocess
 import sys
 import tempfile
 
-from amplifier_foundation import BundleRegistry, load_bundle, validate_bundle
+from amplifier_foundation import Bundle, BundleRegistry, load_bundle, validate_bundle
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "modules/hooks-teamwork"))
 from setup_teamwork import build_overlay
@@ -24,6 +24,8 @@ async def main():
         result = validate_bundle(bundle)
         if not result.valid:
             raise RuntimeError(result.errors)
+    provider_base = Bundle(name="provider-fixture", providers=[{"module": "provider-fixture", "config": {"model": "fixture"}}])
+    assert provider_base.compose(behavior).providers == provider_base.providers
     with tempfile.TemporaryDirectory() as directory:
         directory = Path(directory)
         base = directory / "local-base.yaml"
@@ -69,6 +71,19 @@ async def main():
         hook = hooks[0]
         assert Path(hook["source"]) == root / "modules/hooks-teamwork"
         assert hook["config"]["share_visible_turns"] is True
+        # CLI app behaviors compose AFTER the primary bundle. Keep explicit opt-in
+        # and session/provider choices even when the behavior is added again.
+        app_composed = composed.compose(behavior)
+        assert app_composed.session == composed.session
+        assert app_composed.providers == composed.providers
+        app_hooks = [h for h in app_composed.hooks if h["module"] == "hooks-teamwork"]
+        assert len(app_hooks) == 1 and app_hooks[0]["config"] == hook["config"]
+        assert len([t for t in app_composed.tools if t["module"] == "tool-teamwork"]) == 1
+        assert not behavior.hooks[0].get("config", {}).get("share_visible_turns", False)
+        # Keep preparation local for BOTH entry points; no remote module fetch.
+        for tool in composed.tools:
+            if tool["module"] == "tool-teamwork":
+                tool["source"] = str(root / "modules/hooks-teamwork")
         prepared = await composed.prepare(install_deps=False, strict=True)
         assert prepared is not None
         Journal(connection.parent / ("outbox-" + sha("validator-token")[:16] + ".sqlite3"))
@@ -81,7 +96,7 @@ async def main():
         assert replay.returncode == 0, replay.stderr
         assert '"pending_requests": 0' in replay.stdout
     print("PASS: root schema without includes, behavior schema, isolated local composition preserving "
-          "nonempty session/context, one enabled local hook, bounded local prepare, and standalone "
+          "nonempty session/context and provider settings, app behavior opt-in composition, both local module sources, bounded local prepare, and standalone "
           "empty replay. No provider call, enrollment, remote Foundation include, or cache reuse.")
 
 

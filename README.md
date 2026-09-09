@@ -1,10 +1,10 @@
 # Teamwork for Amplifier
 
-Teamwork is an **explicit, per-session opt-in** Amplifier bundle for sharing one selected project's visible conversation and bounded project context. It does not install a central agent, publish tool/internal-loop output, claim tasks, or change Amplifier's defaults.
+Teamwork is an **explicit, per-session opt-in** Amplifier bundle for sharing one selected project's visible conversation and bounded project context. It does not install a central agent, publish tool/internal-loop output, claim tasks, or replace your primary bundle or provider.
 
 ## Before you enroll
 
-When you run an enabled Teamwork overlay, the selected project can receive:
+After native connection consent, or when you run an enabled Teamwork overlay, the selected project can receive:
 
 - visible prompts and final responses;
 - session metadata and stable correlation IDs; and
@@ -12,21 +12,32 @@ When you run an enabled Teamwork overlay, the selected project can receive:
 
 Credential-shaped strings are redacted with patterns before they are stored or sent. Pattern redaction is **not** a guarantee that arbitrary secrets or sensitive prose will be detected. Do not opt in a session that contains secrets or content you do not intend to share.
 
-## Prerequisites
+## Install natively
 
-Use macOS, Linux, or WSL with Python 3.11+, Git, and [uv](https://docs.astral.sh/uv/). You also need an existing, configured Amplifier installation and a provider you can already use.
-
-If Amplifier is not installed yet, its normal first-time setup is:
+With an existing configured Amplifier installation, add the reusable behavior using the [Foundation bundle convention](https://github.com/microsoft/amplifier-foundation/blob/main/docs/BUNDLE_GUIDE.md):
 
 ```sh
-uv tool install git+https://github.com/microsoft/amplifier
-amplifier init
-amplifier --version
+amplifier bundle add "git+https://github.com/michaeljabbour/amplifier-bundle-teamwork@main#subdirectory=behaviors/teamwork.yaml" --app
 ```
 
-`amplifier init` configures providers and routing. If Amplifier is already working, do not reinstall or reconfigure it for Teamwork.
+Amplifier installs the packaged modules. No separate Python command, pip install, clone, or project selection is required. `--app` adds the behavior to new sessions while preserving your primary bundle and provider. Installation alone does not read project context or enable sharing.
 
-## Connect one project
+The URI must point to the actual `.yaml` behavior file (or a repository directory containing `bundle.md`/`bundle.yaml`), not a GitHub HTML page, archive download, or module directory. An `Unknown bundle format` error occurs before module mounting; retain the reported path when diagnosing it. The nested module source uses `@main`; pinning only the outer behavior does not pin both modules.
+
+## Connect in Amplifier
+
+1. Start a normal new Amplifier session with your existing bundle/provider.
+2. Ask: **Connect this session to Teamwork.** Amplifier invokes `teamwork_connect`, which opens a private local browser form.
+3. Enter the exact project ID you joined, your name/email and private member code in that form, and confirm sharing. Never paste the code into chat. On later sessions, select the same project and consent again; leave login fields blank to reuse its saved connection.
+4. Return to Amplifier. Sharing and bounded project-context delivery begin with your **next prompt**. The connection request and earlier conversation are not retroactively published.
+
+The tool takes no arguments and never returns credentials. It stores project-specific credentials in private files under `~/.config/amplifier-teamwork/native/`, enrolls only `context:read` and `session:write`, and leaves the primary bundle/provider unchanged. A session stays connected to one project; start a new session to choose another. Child sessions do not get the connection tool or sharing hook. This path requires a browser on the Amplifier host; remote/headless browser forwarding is not implemented. The form expires after three minutes.
+
+Stop the session to stop sharing. Revoke the harness in Teamwork's harness controls before deleting its saved connection; deleting a file alone does not revoke a credential. A new session requires fresh browser consent even when a credential is saved.
+
+## Advanced: legacy local overlay setup
+
+The native flow above replaces this manual enrollment path for local-browser users. The following compatibility helper remains available for existing overlays and development; it requires Python 3.11+ and Git.
 
 ### 1. Keep a persistent local checkout
 
@@ -114,7 +125,7 @@ Overlays point at the local checkout, so update a reviewed revision deliberately
 2. Replay and reconcile pending work before changing the checkout.
 3. Update this checkout to the reviewed revision, then start a new overlay session using the printed file URI.
 
-A Git URL alone does not pin the nested hook module. If remote composition is necessary, pin both the behavior include and the hook source to the **same reviewed full commit SHA**. The local-checkout setup above is the recommended route.
+A Git URL alone does not pin the nested hook module. If remote composition is necessary, pin both the behavior include and the hook source to the **same reviewed full commit SHA**. The legacy local-checkout setup keeps those sources local. When pinning the native behavior, override both `hooks-teamwork` and `tool-teamwork` sources to that same revision.
 
 ```yaml
 # Template only — replace both placeholders with one reviewed full commit SHA.
@@ -158,8 +169,8 @@ Current and historical validation evidence is in [`docs/VALIDATION.md`](docs/VAL
 ## Bundle structure
 
 - `bundle.md` is the Foundation-based entry point.
-- `behaviors/teamwork.yaml` adds an explicitly disabled hook behavior.
-- `modules/hooks-teamwork/` is the independently packaged hook; it requires Python 3.11+ and uses host-supplied `amplifier-core` for lifecycle integration.
+- `behaviors/teamwork.yaml` adds the native connection tool and an inert-until-opted-in hook.
+- `modules/hooks-teamwork/` packages the hook and native tool with separate `amplifier.modules` entry points; it requires Python 3.11+ and uses host-supplied `amplifier-core` for lifecycle integration.
 - `setup_teamwork.py` composes the selected base bundle with an enrolled, enabled local overlay.
 
 No service databases, transcripts, member codes, provider keys, private connection files, journals, or local validation artifacts belong in this repository. See [`docs/PUBLISHING.md`](docs/PUBLISHING.md) for release checks.
