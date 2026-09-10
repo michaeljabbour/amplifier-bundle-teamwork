@@ -1,5 +1,18 @@
 # Validation evidence and limits
 
+## Live service and provider run (2026-09-09)
+
+An authorized operator run against the default hosted service (`https://team.amplifier.run`) with a real LLM provider, from a fresh `amplifier bundle update` of the `@main` behavior at merge commit `882f6b9`, observed:
+
+- **Native connection completed.** In a new interactive session, "Connect this session to Teamwork" invoked `teamwork_connect`; the private browser form accepted the member login and project selection; the tool returned the selected project name and `sharing: enabled for subsequent prompts in this session`. No credential appeared in tool output, chat, or terminal.
+- **Context delivery reached the model.** The next visible prompt carried the `[Teamwork shared project context …]` excerpt (project record plus work items) as an attached message. This is the injection contract described in `docs/PROTOCOL.md`, observed end to end for the first time against the hosted service.
+- **Round trip is clean.** After that turn, the replay helper reported `{"pending_requests": 0, "blocked_sessions": [], "acceptance_unknown": 0}`; the journal held one active shared session at version 1, one open turn, an empty outbox, and a populated context cache with a cursor.
+- **Composition resolved the reviewed revision.** A fresh session started after the cache refresh listed both `tool-teamwork` and `hooks-teamwork` in its configuration and exposed `teamwork_connect` and `teamwork_bind` to the model, with no module load errors.
+
+Two earlier findings from the same day, fixed before this run: the cached `@main` behavior had been frozen at a pre-native-onboarding revision until `amplifier bundle update` was run (README now documents the refresh), and the consent form refused its own submission because `Referrer-Policy: no-referrer` makes browsers send `Origin: null` on a same-origin POST (fixed in the enrollment-form change; the origin check now relies on the unguessable csrf field).
+
+This closes the "real Teamwork service and provider" item of the release gate below. It remains a single-operator, single-project observation: it does not establish another participant's installation, a custom orchestrator, or an arbitrary custom HTTPS service. No session, project, harness, or person identifiers, local paths, or journal contents are published here.
+
 ## Native enrollment PR checks (2026-09-09)
 
 - **40 tests passed** in the installed Amplifier Python environment. New focused checks cover native tool mounting and child exclusion, consent and project selection, private credential files, saved-connection reuse, enrollment failure cleanup and compensating revocation, local-browser origin checks, secret-free tool output, and no retroactive turn publication.
@@ -34,6 +47,6 @@ An earlier isolated live Amplifier CLI run on the same date, documented before t
 
 ## Remaining release gate
 
-Before release, run an authorized fresh test against a real Teamwork service and provider, and record only public-safe outcome evidence. Also verify a fresh remote composition resolves the exact reviewed behavior include and nested hook source at the intended pinned revision. The current local checks cannot establish another participant's installation, a custom orchestrator, an arbitrary custom HTTPS service, or a live external provider/service. A Digital Twin Universe attempt was blocked by host capacity before launch; no container source verification occurred in this task. The temporary Gitea environment was torn down and supplies no release evidence.
+The authorized fresh test against a real Teamwork service and provider is recorded above, together with a fresh remote composition of the reviewed behavior include and nested module sources at `@main`; a composition pinned to an exact commit SHA has not been separately exercised. The current local checks cannot establish another participant's installation, a custom orchestrator, an arbitrary custom HTTPS service, or a live external provider/service. A Digital Twin Universe attempt was blocked by host capacity before launch; no container source verification occurred in this task. The temporary Gitea environment was torn down and supplies no release evidence.
 
 The private operator evidence remains outside this public repository. No session or project IDs, local paths, usernames, credentials, fixture payloads, raw logs, participant profiles, or interview transcripts are published here.
