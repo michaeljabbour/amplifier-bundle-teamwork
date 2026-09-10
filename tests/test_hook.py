@@ -212,6 +212,56 @@ class InfluenceTests(unittest.IsolatedAsyncioTestCase):
                            "content": content, "content_sha256": digest or (kind + rid)},
                 "delivery_id": "manifest"}
 
+    def cache(self, sources):
+        self.hook.state["cache"] = {s["record"]["record_type"] + ":" + s["record"]["id"]: s for s in sources}
+
+    def test_a_numerous_kind_no_longer_starves_the_others(self):
+        # One person record is worth more to a reader than a twentieth task.
+        crowd = [self.source("work", "t%d" % i, {"title": "Task %d" % i, "detail": "x" * 700}) for i in range(19)]
+        self.cache(crowd + [
+            self.source("person", "p1", {"name": "Fixture", "focus": "Routing work to the right human"}),
+            self.source("insight", "i1", {"summary": "Only one insight exists"}),
+            self.source("plan_step", "s1", {"text": "Agree the goal"}),
+        ])
+        rendered, chosen = self.hook.render()
+        kinds = {source["record"]["record_type"] for source in chosen}
+        self.assertEqual(kinds, {"work", "person", "insight", "plan_step"})
+        self.assertLessEqual(len(rendered.encode()), 10000)
+        self.assertIn("Routing work to the right human", rendered)
+        self.assertIn("Only one insight exists", rendered)
+
+    def test_the_excerpt_reads_in_type_order_not_seating_order(self):
+        self.cache([
+            self.source("work", "t1", {"title": "A task"}),
+            self.source("person", "p1", {"name": "Fixture"}),
+            self.source("work", "t2", {"title": "Another task"}),
+        ])
+        rendered, chosen = self.hook.render()
+        self.assertEqual([s["record"]["record_type"] for s in chosen], ["work", "work", "person"])
+        self.assertLess(rendered.index("work:t1"), rendered.index("person:p1"))
+
+    def test_everything_that_fits_is_still_included_unchanged(self):
+        sources = [self.source("work", "t1", {"title": "A task"}),
+                   self.source("person", "p1", {"name": "Fixture"}),
+                   self.source("insight", "i1", {"summary": "Small"})]
+        self.cache(sources)
+        rendered, chosen = self.hook.render()
+        self.assertEqual(len(chosen), 3)
+        for source in sources:
+            self.assertIn(source["record"]["key"], rendered)
+
+    def test_a_long_record_is_truncated_rather_than_dropped(self):
+        # The 1600-character fragment cap means no single record can overflow the
+        # budget by itself; skipping only happens once the budget is nearly spent.
+        self.cache([
+            self.source("work", "t1", {"title": "Long", "detail": "x" * 40000}),
+            self.source("person", "p1", {"name": "Fixture"}),
+        ])
+        rendered, chosen = self.hook.render()
+        self.assertEqual([s["record"]["record_type"] for s in chosen], ["work", "person"])
+        self.assertIn("[excerpt truncated]", rendered)
+        self.assertLessEqual(len(rendered.encode()), 10000)
+
     def test_new_records_are_named_with_their_author(self):
         notice = self.hook.influence([
             self.source("insight", "i1", {"author": {"name": "Dana Cole"}, "summary": "Run the server yourself"}),

@@ -56,6 +56,22 @@ def record(record_type: str, rid: str, content: dict) -> dict:
     }
 
 
+def crowd_items(count: int = 19) -> list:
+    """Enough of ONE kind to spend the whole excerpt budget on its own.
+
+    A byte budget applied down a type-ordered list would seat these and starve
+    every kind ranked below work, which is what a real project payload did.
+    """
+    return [
+        record("work", "crowd-%d" % index, {
+            "id": "crowd-%d" % index,
+            "title": "Crowding task %d" % index,
+            "detail": "d" * 700,
+        })
+        for index in range(count)
+    ]
+
+
 def fixture_items() -> list:
     """One record per projected type, plus a field that must never be projected."""
     return [
@@ -93,7 +109,8 @@ def fixture_items() -> list:
 
 
 class StubState:
-    def __init__(self, token: str, log_path: str):
+    def __init__(self, token: str, log_path: str, crowded: bool = False):
+        self.crowded = crowded
         self.log_path = log_path
         self.seq = 0
         self.issued = {token} if token else set()
@@ -206,7 +223,7 @@ def make_handler(state: StubState):
                 return self._send(
                     200,
                     {
-                        "items": fixture_items(),
+                        "items": fixture_items() + (crowd_items() if state.crowded else []),
                         "next_cursor": "cursor-1",
                         "delivery_id": "delivery-1",
                         "has_more": False,
@@ -229,10 +246,15 @@ def main() -> None:
         help="Extra bearer value to accept. Omit to accept only credentials this stub issued.",
     )
     parser.add_argument("--log", required=True, help="JSONL request log path")
+    parser.add_argument(
+        "--crowded",
+        action="store_true",
+        help="Also serve many records of one kind, so budget starvation is observable.",
+    )
     args = parser.parse_args()
 
     open(args.log, "a", encoding="utf-8").close()
-    state = StubState(args.token, args.log)
+    state = StubState(args.token, args.log, crowded=args.crowded)
     HTTPServer(("127.0.0.1", args.port), make_handler(state)).serve_forever()
 
 
