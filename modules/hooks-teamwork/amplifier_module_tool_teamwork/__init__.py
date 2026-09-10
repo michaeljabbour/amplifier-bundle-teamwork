@@ -315,6 +315,8 @@ class TeamworkConnect:
     def __init__(self, coordinator, config):
         self.coordinator = coordinator
         self.base = validate_service_url(config.get("base_url", "https://team.amplifier.run"))
+        # Forwarded so a session connected through this tool honours the same level.
+        self.notice = {"verbosity": config["verbosity"]} if "verbosity" in config else {}
         self.home = Path(config.get("connection_directory", "~/.config/amplifier-teamwork/native")).expanduser()
         self.timeout = config.get("form_timeout", IDLE_TIMEOUT)
         self.lock = asyncio.Lock()
@@ -333,7 +335,7 @@ class TeamworkConnect:
                     # handing over the project-scoped credential the form just minted.
                     rebind(project, json.loads(Path(path).read_text(encoding="utf-8")))
                 else:
-                    await mount_hook(self.coordinator, {"connection_file": str(path), "share_visible_turns": True})
+                    await mount_hook(self.coordinator, dict(self.notice, connection_file=str(path), share_visible_turns=True))
                 return ToolResult(success=True, output={"project": project, "sharing": "enabled for subsequent prompts in this session"})
             except ConsentAborted as reason:
                 return ToolResult(success=False, error={"message": str(reason) + " Ask to connect again to reopen the form."})
@@ -361,6 +363,7 @@ class TeamworkBind:
     def __init__(self, coordinator, config):
         self.coordinator = coordinator
         self.config = config
+        self.notice = {"verbosity": config["verbosity"]} if "verbosity" in config else {}
         self.lock = asyncio.Lock()
 
     async def execute(self, input):
@@ -381,7 +384,7 @@ class TeamworkBind:
             if not settings.get("token") and not settings.get("connection_file"):
                 return ToolResult(success=False, error={"message": "No Teamwork credential is configured. Use teamwork_connect to enroll first."})
             try:
-                await mount_hook(self.coordinator, dict(settings, project_id=project, share_visible_turns=True))
+                await mount_hook(self.coordinator, dict(settings, **self.notice, project_id=project, share_visible_turns=True))
             except Exception:
                 return ToolResult(success=False, error={"message": "Could not bind that project with the configured credential."})
             if self.coordinator.get_capability("teamwork.session_id") is None:
