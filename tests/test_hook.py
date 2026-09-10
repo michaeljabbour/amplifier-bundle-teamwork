@@ -22,8 +22,9 @@ class Context:
 
 class Coordinator:
     session_id = "native-session-fixture"
-    def __init__(self, context): self.context = context
+    def __init__(self, context): self.context = context; self.tools = {}
     def get(self, name): return self.context if name == "context" else None
+    async def mount(self, point, value, name): self.tools[name] = value
 
 
 class Client:
@@ -540,8 +541,9 @@ class MountTests(unittest.IsolatedAsyncioTestCase):
         class Root:
             parent_id = None
             session_id = "root-session"
-            def __init__(self): self.hooks = Hooks(); self.capabilities = {}
+            def __init__(self): self.hooks = Hooks(); self.capabilities = {}; self.tools = {}
             def register_capability(self, name, value): self.capabilities[name] = value
+            async def mount(self, point, value, name): self.tools[name] = value
 
         with tempfile.TemporaryDirectory() as directory:
             connection = Path(directory) / "connection.json"
@@ -564,8 +566,9 @@ class MountTests(unittest.IsolatedAsyncioTestCase):
         class Root:
             parent_id = None
             session_id = "configured-session"
-            def __init__(self): self.hooks = Hooks(); self.capabilities = {}
+            def __init__(self): self.hooks = Hooks(); self.capabilities = {}; self.tools = {}
             def register_capability(self, name, value): self.capabilities[name] = value
+            async def mount(self, point, value, name): self.tools[name] = value
 
         root = Root()
         with tempfile.TemporaryDirectory() as directory:
@@ -627,8 +630,9 @@ class MountTests(unittest.IsolatedAsyncioTestCase):
         class Root:
             parent_id = None
             session_id = "verbosity-session"
-            def __init__(self): self.hooks = Hooks(); self.capabilities = {}
+            def __init__(self): self.hooks = Hooks(); self.capabilities = {}; self.tools = {}
             def register_capability(self, name, value): self.capabilities[name] = value
+            async def mount(self, point, value, name): self.tools[name] = value
 
         root = Root()
         with tempfile.TemporaryDirectory() as directory:

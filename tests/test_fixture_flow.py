@@ -115,6 +115,9 @@ class Coordinator:
 
     def get(self, name):
         return self.context if name == "context" else None
+    async def mount(self, point, value, name):
+        self.tools = getattr(self, 'tools', {}) | {name: value}
+
 
     def register_capability(self, name, value):
         self.capabilities[name] = value

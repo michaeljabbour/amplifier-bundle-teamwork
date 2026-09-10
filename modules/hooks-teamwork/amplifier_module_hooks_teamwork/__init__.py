@@ -48,17 +48,18 @@ def without_audit_trail(value):
     return value
 
 
-INFLUENCE_LABELS = {"insight": "\u2605 Insight", "idea": "\u25c6 Idea", "request": "\u276f Request",
+INFLUENCE_LABELS = {"message": "\u2709 Message", "insight": "\u2605 Insight", "idea": "\u25c6 Idea",
+                    "request": "\u276f Request",
                     "work": "\u25cf Work", "plan": "\u25b8 Plan", "plan_step": "\u25b8 Plan step",
                     "project": "\u25aa Project", "person": "\u25cd Teammate", "presence": "\u25cc Presence"}
-INFLUENCE_ORDER = {"insight": 0, "idea": 1, "request": 2, "work": 3, "plan": 4,
-                   "plan_step": 5, "project": 6, "person": 7, "presence": 8}
+INFLUENCE_ORDER = {"message": 0, "insight": 1, "idea": 2, "request": 3, "work": 4, "plan": 5,
+                   "plan_step": 6, "project": 7, "person": 8, "presence": 9}
 TITLE_FIELDS = ("title", "headline", "summary", "statement", "text", "name", "goal", "description", "body")
 AUTHOR_FIELDS = ("author", "author_name", "created_by", "person", "person_name", "owner", "actor", "by", "contributor")
 
 
-RENDER_ORDER = {"project": 0, "plan": 1, "work": 2, "request": 3, "person": 4,
-                "insight": 5, "idea": 6, "plan_step": 7, "presence": 8}
+RENDER_ORDER = {"message": 0, "project": 1, "plan": 2, "work": 3, "request": 4, "person": 5,
+                "insight": 6, "idea": 7, "plan_step": 8, "presence": 9}
 
 # Named rather than numeric: a number invites guessing at what it selects.
 VERBOSITY_LEVELS = ("silent", "summary", "detail")
@@ -304,7 +305,7 @@ class TeamworkHook:
 
     async def retrieve(self):
         for _ in range(5):
-            body = {"session_id": self.sid, "cursor": self.state["cursor"], "selection": {"include": ["direction", "plans", "work", "ideas", "insights", "people", "presence"]}, "page_size": 100, "max_text_bytes": 262144}
+            body = {"session_id": self.sid, "cursor": self.state["cursor"], "selection": {"include": ["direction", "plans", "work", "ideas", "insights", "people", "presence", "messages", "agents"]}, "page_size": 100, "max_text_bytes": 262144}
             try: page = await asyncio.to_thread(self.client.request, "context", body)
             except SyncError as error:
                 if error.status == 410:
@@ -525,6 +526,56 @@ def resolve_connection(config):
     return connection, home
 
 
+class SendTool:
+    """Send one message to one other agent in this project.
+
+    Deliberately addressed, never broadcast: a room where every agent hears every
+    message is noise. The server refuses an unknown recipient rather than
+    disclosing whether it exists.
+    """
+
+    def __init__(self, hook):
+        self.hook = hook
+
+    @property
+    def name(self):
+        return "teamwork_send"
+
+    @property
+    def description(self):
+        return ("Send a message to another agent in this shared project. Address one agent by its "
+                "agent id, which appears in the shared project excerpt. The message is delivered when "
+                "that agent next runs -- it may be a teammate's laptop that is currently asleep, so do "
+                "not wait on a reply. Delivery is not agreement and not action.")
+
+    @property
+    def input_schema(self):
+        return {"type": "object",
+                "properties": {"to_agent_id": {"type": "string", "description": "The agent to address."},
+                               "body": {"type": "string", "description": "What to say. Plain text, 4000 characters."}},
+                "required": ["to_agent_id", "body"]}
+
+    async def execute(self, input):
+        from amplifier_core.models import ToolResult
+        to_agent, body = input.get("to_agent_id"), input.get("body")
+        if not to_agent or not body:
+            return ToolResult(success=False, error={"message": "to_agent_id and body are both required"})
+        try:
+            await asyncio.to_thread(
+                self.hook.client.request, "publish",
+                {"operations": [{"op": "message.upsert", "id": uid(), "expected_version": 0,
+                                 "data": {"to_agent_id": to_agent, "body": body}}]}, uid())
+        except SyncError as error:
+            # Named plainly rather than retried: the model asked to send now.
+            reason = ("that agent is not in this project" if error.status == 404
+                      else "the project service refused the message (HTTP %s)" % error.status
+                      if error.status else "the project service could not be reached")
+            return ToolResult(success=False, error={"message": "Not sent: " + reason})
+        return ToolResult(success=True, output={
+            "queued_for": to_agent,
+            "note": "Delivered to the project. It reaches that agent when it next runs, which may not be soon."})
+
+
 async def mount(coordinator, config=None):
     # Delegated prompts are internal work, not the opted-in human conversation.
     if getattr(coordinator, "parent_id", None):
@@ -545,6 +596,8 @@ async def mount(coordinator, config=None):
                         node_label=config.get("node_label"))
     for name, handler in (("session:start", hook.on_start), ("prompt:submit", hook.on_submit), ("prompt:complete", hook.on_complete), ("session:end", hook.on_end)):
         coordinator.hooks.register(name, handler, priority=50, name="teamwork-" + name.replace(":", "-"))
+    send = SendTool(hook)
+    await coordinator.mount("tools", send, name=send.name)
     coordinator.register_capability("teamwork.session_id", hook.sid)
     coordinator.register_capability("teamwork.rebind", hook.rebind)
     return None
