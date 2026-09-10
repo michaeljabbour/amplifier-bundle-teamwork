@@ -182,12 +182,17 @@ class Journal:
 
 class TeamworkHook:
     def __init__(self, coordinator, connection, journal, client=None, level=VERBOSITY_DEFAULT, complaint=None,
-                 node_label=None):
+                 node_label=None, responsibility=None, skills=None):
         self.coordinator, self.connection, self.journal = coordinator, connection, journal
         self.level = level
         # Supplied, never discovered: a hostname can carry an employer, a project
         # codename, or a person's name. Absent means the server applies its default.
         self.node_label = node_label
+        # DECLARED. A harness cannot observe intent, so what this session is FOR is
+        # supplied or it is absent. Absent stays absent: an invented purpose reads
+        # exactly like a declared one, and no reader could tell them apart.
+        self.responsibility = responsibility
+        self.skills = [v for v in (skills or []) if isinstance(v, str)]
         self.agent_version = 0
         self.agent_status = "unregistered"
         self.presence_version = 0
@@ -263,6 +268,27 @@ class TeamworkHook:
     async def flush(self):
         await asyncio.to_thread(self.journal.flush, self.sid, self.client)
 
+    def observed_capabilities(self):
+        """The tools this session actually has mounted.
+
+        HARNESS_OBSERVED, not verified: the server cannot tell an observed list
+        from a typed one, so this is still our word -- but it is our word about
+        something checkable, which a self-description never is. Read at
+        registration rather than at mount, because other modules are still
+        mounting when this one loads.
+
+        Defensive on purpose. If the coordinator does not expose mount points in
+        the shape expected, report nothing: an empty list is honest, a guessed one
+        is not.
+        """
+        try:
+            points = self.coordinator.mount_points
+            tools = points.get("tools") if hasattr(points, "get") else None
+            names = sorted(tools) if isinstance(tools, dict) else []
+        except Exception:
+            return []
+        return [n for n in names if isinstance(n, str)][:60]
+
     def register_agent(self):
         """Announce this session as an addressable agent. Best effort, never queued.
 
@@ -278,6 +304,13 @@ class TeamworkHook:
         data = {"session_id": self.sid}
         if self.node_label:
             data["node_label"] = self.node_label
+        if self.responsibility:
+            data["responsibility"] = self.responsibility
+        if self.skills:
+            data["skills"] = self.skills
+        capabilities = self.observed_capabilities()
+        if capabilities:
+            data["capabilities"] = capabilities
         try:
             self.client.request("publish", {"operations": [
                 {"op": "agent.upsert", "id": self.sid, "expected_version": self.agent_version,
@@ -642,7 +675,9 @@ async def mount(coordinator, config=None):
     journal_path = Path(config.get("journal_path") or home / ("outbox-" + sha(connection["token"])[:16] + ".sqlite3")).expanduser()
     level, complaint = verbosity(config)
     hook = TeamworkHook(coordinator, connection, Journal(journal_path), level=level, complaint=complaint,
-                        node_label=config.get("node_label"))
+                        node_label=config.get("node_label"),
+                        responsibility=config.get("responsibility"),
+                        skills=config.get("skills"))
     for name, handler in (("session:start", hook.on_start), ("prompt:submit", hook.on_submit), ("prompt:complete", hook.on_complete), ("session:end", hook.on_end)):
         coordinator.hooks.register(name, handler, priority=50, name="teamwork-" + name.replace(":", "-"))
     send = SendTool(hook)

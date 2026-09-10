@@ -75,6 +75,46 @@ class HookTests(unittest.IsolatedAsyncioTestCase):
         return [r for r in self.client.requests
                 if r[0] == "publish" and any(o["op"] == op for o in r[1]["operations"])]
 
+    async def test_a_declared_card_is_carried_and_marked_by_its_field(self):
+        hook = TeamworkHook(Coordinator(self.context), self.connection, self.journal, self.client,
+                            responsibility="Reviews deploy failures for the billing service",
+                            skills=["read logs", "explain a rollback"])
+        await hook.on_start("session:start", {})
+        data = [r for r in self.client.requests
+                if r[0] == "publish" and any(o["op"] == "agent.upsert" for o in r[1]["operations"])
+                ][0][1]["operations"][0]["data"]
+        self.assertEqual(data["responsibility"], "Reviews deploy failures for the billing service")
+        self.assertEqual(data["skills"], ["read logs", "explain a rollback"])
+
+    async def test_an_undeclared_purpose_stays_absent_rather_than_invented(self):
+        # An invented purpose reads exactly like a declared one, and no reader
+        # could tell them apart -- so absence must survive to the server.
+        await self.hook.on_start("session:start", {})
+        data = [r for r in self.client.requests
+                if r[0] == "publish" and any(o["op"] == "agent.upsert" for o in r[1]["operations"])
+                ][0][1]["operations"][0]["data"]
+        self.assertNotIn("responsibility", data)
+        self.assertNotIn("skills", data)
+
+    async def test_capabilities_are_read_from_what_is_actually_mounted(self):
+        class Mounted(Coordinator):
+            mount_points = {"tools": {"teamwork_send": object(), "bash": object()}}
+
+        hook = TeamworkHook(Mounted(self.context), self.connection, self.journal, self.client)
+        self.assertEqual(hook.observed_capabilities(), ["bash", "teamwork_send"])
+
+    async def test_an_unreadable_coordinator_reports_nothing_rather_than_guessing(self):
+        class Odd(Coordinator):
+            @property
+            def mount_points(self):
+                raise RuntimeError("no mount points here")
+
+        hook = TeamworkHook(Odd(self.context), self.connection, self.journal, self.client)
+        self.assertEqual(hook.observed_capabilities(), [])
+        # And registration still happens -- the card is poorer, the session is fine.
+        await hook.on_start("session:start", {})
+        self.assertEqual(hook.agent_status, "registered")
+
     def presences(self):
         return [r for r in self.client.requests
                 if r[0] == "publish" and any(o["op"] == "presence.upsert" for o in r[1]["operations"])]
