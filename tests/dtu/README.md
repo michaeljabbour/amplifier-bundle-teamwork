@@ -61,15 +61,9 @@ log when it produces one.
 | Mode | Command | Coverage |
 | --- | --- | --- |
 | Built-in stub (default) | `run_e2e.py` | every check |
+| Crowded fixture | `run_e2e.py --crowded` | adds many records of one kind and asserts no kind is starved out of the excerpt |
 | External service, log available | `run_e2e.py --service-url URL --request-log PATH` | every check |
 | Opaque service | `run_e2e.py --service-url URL --no-canary` | client-side checks; traffic-derived ones report `SKIP`, never `PASS` |
-
-The external mode exists so the service under test can be the **real server running in its
-own container** rather than a stub: launch the server, point `--service-url` at it, and the
-same expectations apply. That topology is the intended next step and has not been
-exercised here, because the server source is a separate private repository. The external
-path itself is exercised: a service started outside the runner, on its own port, passes
-the full set.
 
 For a deployed service, pass `--member-name`, `--member-code`, `--prompt` and `--no-canary`;
 enrollment then mints a real credential, which must be revoked afterwards in the service's
@@ -137,6 +131,12 @@ pretend to.
   scopes it records, so a least-privilege claim about the deployed service is not
   established here.
 - Any other participant's installation, host, or orchestrator.
+
+The `--crowded` check is red-on-violation, not decorative: run against the code before
+the seating fix it reports `missing: person`, and against the fix it reports all offered
+kinds seated. The kinds it compares against come from the stub's own fixture rather than
+from the receipt, because the receipt lists only what was already chosen and would agree
+with the excerpt by construction.
 
 ## Scenarios not yet covered
 

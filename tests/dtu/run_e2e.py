@@ -78,7 +78,7 @@ def write_overlay(path: Path, base_bundle: str, ref: str, connection: Path, enab
     return path
 
 
-def start_stub(workdir: Path, port: int) -> tuple[subprocess.Popen, Path]:
+def start_stub(workdir: Path, port: int, crowded: bool = False) -> tuple[subprocess.Popen, Path]:
     log = workdir / "stub-requests.jsonl"
     if log.exists():
         log.unlink()
@@ -92,7 +92,7 @@ def start_stub(workdir: Path, port: int) -> tuple[subprocess.Popen, Path]:
             STUB_TOKEN,
             "--log",
             str(log),
-        ],
+        ] + (["--crowded"] if crowded else []),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -282,7 +282,7 @@ def skip(results: list, name: str, reason: str) -> None:
 
 
 def assert_opt_in(rows: list, response_text: str, prompt: str = PROMPT,
-                  expect_canary: bool = True) -> list:
+                  expect_canary: bool = True, crowded: bool = False) -> list:
     """Assert the delivery boundary from the hook's own traffic."""
     results: list = []
     hook_rows = [row for row in rows if row.get("plane", "harness") == "harness" and row["credential_accepted"]]
@@ -345,6 +345,19 @@ def assert_opt_in(rows: list, response_text: str, prompt: str = PROMPT,
     check(results, "unprojected person field withheld", UNPROJECTED_MARKER not in rendered)
     check(results, "injection within the 10000-byte bound", len(rendered.encode()) <= 10000,
           f"{len(rendered.encode())} bytes")
+    if crowded:
+        # The kinds the SERVICE offered, taken from the stub's own fixture -- not
+        # from the receipt, which lists only what was already chosen and would
+        # therefore agree with the excerpt by construction.
+        sys.path.insert(0, str(HERE))
+        from stub_service import crowd_items, fixture_items
+
+        offered = {item["record_type"] for item in fixture_items() + crowd_items()}
+        seated = {line.split(":")[0] for line in rendered.splitlines() if line.count(":") >= 2}
+        missing = sorted(offered - seated)
+        check(results, "no record kind starved out of the excerpt", not missing,
+              ("offered " + str(len(offered)) + ", missing: " + ", ".join(missing)) if missing
+              else f"all {len(offered)} offered kinds seated")
 
     data = turns[0]["data"]
     check(results, "visible prompt published", data.get("user_prompt") == prompt)
@@ -372,6 +385,11 @@ def main() -> int:
     )
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("--skip-opt-out", action="store_true", help="Skip the disabled-overlay control")
+    parser.add_argument(
+        "--crowded",
+        action="store_true",
+        help="Serve many records of one kind, and assert no kind is starved out of the excerpt.",
+    )
     parser.add_argument(
         "--service-url",
         default="",
@@ -414,7 +432,7 @@ def main() -> int:
         # container, or a deployed one. Only what it reports can be asserted.
         log = Path(args.request_log) if args.request_log else None
     else:
-        stub, log = start_stub(workdir, args.port)
+        stub, log = start_stub(workdir, args.port, crowded=args.crowded)
 
     results: list = []
     try:
@@ -461,7 +479,8 @@ def main() -> int:
         check(results, "opted-in session succeeds", True, str(result.get("status")))
         if log is not None:
             opt_in_rows = read_log(log)[session_start:]
-            results.extend(assert_opt_in(opt_in_rows, result.get("response", ""), args.prompt, args.expect_canary))
+            results.extend(assert_opt_in(opt_in_rows, result.get("response", ""), args.prompt,
+                                         args.expect_canary, args.crowded))
         else:
             for name in (
                 "no receipt before context attachment",
