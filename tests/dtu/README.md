@@ -15,6 +15,8 @@ credential, project data, or participant identity is involved.
 | `profiles/teamwork-e2e.yaml` | DTU profile: Ubuntu, uv, Amplifier CLI, Anthropic provider, `url_rewrites` pointing the GitHub origin at a local Gitea mirror |
 | `stub_service.py` | Loopback stub of the member plane (`/api/login`, `/api/harnesses`, `/api/harnesses/revoke`) and the harness plane (`/context`, `/publish`, `/acknowledgements`), logging every request as JSONL |
 | `run_e2e.py` | Clones the bundle, runs the real enrollment script against the stub, then runs one opted-in and one opted-out session and asserts the enrollment contract and the delivery boundary |
+| `setup_work_tracker.sh` | Stands up a real local work queue inside a container: pinned `bd`/`dolt`, `doctor`, the service and its sweeps, and one named project |
+| `inbound_report_e2e.py` | Two enrolled harnesses, one live service: one addresses a message to the other, and the receiving side files it as a report and triages it. `--no-queue` asserts the other half -- no tracker, message still arrives, absence named |
 
 ## Running it
 
@@ -198,6 +200,45 @@ the seating fix it reports `missing: person`, and against the fix it reports all
 kinds seated. The kinds it compares against come from the stub's own fixture rather than
 from the receipt, because the receipt lists only what was already chosen and would agree
 with the excerpt by construction.
+
+## Inbound messages becoming queued work
+
+The queue is an optional dependency, so it is stood up separately rather than baked
+into the profile -- a container without it is a supported configuration, and one of
+the two things this check proves.
+
+```sh
+# In a container that already has an enrolled connection:
+amplifier-digital-twin file-push <dtu> tests/dtu/setup_work_tracker.sh /root/setup_work_tracker.sh
+amplifier-digital-twin exec <dtu> -- sh /root/setup_work_tracker.sh teamwork
+
+# Two DIFFERENT enrollments in that container: the sender and the addressee.
+amplifier-digital-twin exec <dtu> -- bash -lc '
+  export PATH=$HOME/.local/bin:$PATH XDG_RUNTIME_DIR=/run/user/$(id -u)
+  cd /root/tw-checkout && "$HOME/.local/share/uv/tools/amplifier/bin/python" \
+      tests/dtu/inbound_report_e2e.py /root/<sender> /root/<recipient>'
+
+# And, in a container with NO tracker installed:
+#   ... inbound_report_e2e.py /root/<sender> /root/<recipient> --no-queue
+```
+
+Two environment notes, both learned the hard way:
+
+- **Use the Amplifier tool venv's python**, not `/usr/bin/python3`. The hook imports
+  `amplifier_core` for the host-owned `HookResult`, and the system interpreter does
+  not have it.
+- **`loginctl enable-linger` first.** A container entered with `exec` has no login
+  session, so there is no `/run/user/<uid>` and `systemctl --user` cannot reach a
+  bus -- which is where the tracker's service and its reap/notify sweeps live.
+  `setup_work_tracker.sh` does this before running `doctor`, deliberately: `doctor`
+  checks for exactly this, and a red check there is a real finding about the
+  container rather than noise to skip past.
+
+The model is stubbed in this check and only this check asserts on what reached the
+model's *context*, never on what a model then said -- a reply is not evidence about
+delivery. Everything else is real: the live service, two separately enrolled harness
+credentials, the bundle's own hook, and a queue on the pinned `bd`/`dolt` with all
+38 `doctor` assumptions holding.
 
 ## Scenarios not yet covered
 

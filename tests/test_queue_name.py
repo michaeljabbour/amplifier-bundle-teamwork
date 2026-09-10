@@ -61,6 +61,20 @@ class Bind(unittest.TestCase):
         with self.assertRaises(QueueNameConflict):
             bind("design-review", self.registry)
 
+    def test_the_same_project_id_on_two_services_is_two_projects(self):
+        # A project id is unique only within a service. Two deployments that both
+        # call a project "teamwork" are different projects with different members,
+        # and quietly handing them one backlog is the failure this refusal exists
+        # to prevent -- arriving by a different door than a normalisation clash.
+        bind("teamwork", self.registry, "https://team.example.invalid")
+        with self.assertRaises(QueueNameConflict) as caught:
+            bind("teamwork", self.registry, "http://localhost:8090")
+        self.assertIn("already bound", str(caught.exception))
+
+    def test_rebinding_the_same_project_on_the_same_service_is_not_a_conflict(self):
+        first = bind("teamwork", self.registry, "https://team.example.invalid/")
+        self.assertEqual(bind("teamwork", self.registry, "https://team.example.invalid"), first)
+
     def test_the_registry_is_not_world_readable(self):
         bind("design-review", self.registry)
         self.assertEqual(self.registry.stat().st_mode & 0o777, 0o600)
