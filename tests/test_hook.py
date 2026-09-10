@@ -11,7 +11,7 @@ import subprocess
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "modules/hooks-teamwork"))
 from amplifier_module_hooks_teamwork import (HTTPClient, Journal, TeamworkHook, SyncError, sha, NoRedirect,
                                              mount, resolve_connection, describe, PERSON_FIELDS, verbosity,
-                                             PRESENCE_SUMMARY)
+                                             PRESENCE_SUMMARY, TasksTool, ClaimTool, ProgressTool)
 
 
 class Context:
@@ -799,6 +799,94 @@ class StandaloneRecoveryTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Replay this connection", result.stdout)
+
+
+
+class WorkToolTests(unittest.IsolatedAsyncioTestCase):
+    """The tools a session uses to see and move work its own person holds."""
+
+    OWNER = "person-alex"
+
+    class Work:
+        def __init__(self, sid, items, fail=None):
+            self.sid, self.items, self.fail, self.writes = sid, items, fail, []
+
+        def request(self, endpoint, body, key=None):
+            if endpoint == "context":
+                records = [{"record_type": "agent", "content": {"id": self.sid,
+                                                                "owner_person_id": WorkToolTests.OWNER}}]
+                records += [{"record_type": "work", "content": item} for item in self.items]
+                return {"items": records, "next_cursor": None, "has_more": False}
+            if self.fail:
+                raise SyncError(self.fail)
+            self.writes.append(body)
+            return {"results": [{"id": body["operations"][0]["id"], "version": 2}]}
+
+    def build(self, items, fail=None):
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        connection = {"base_url": "https://team.example.invalid", "project_id": "teamwork", "token": "t"}
+        hook = TeamworkHook(Coordinator(Context([])), connection, Journal(Path(tmp.name) / "q.db"),
+                            self.Work("placeholder", items, fail))
+        hook.client.sid = hook.sid
+        return hook
+
+    async def test_it_lists_my_work_and_reads_the_older_status_spelling(self):
+        # Stored records still carry UI labels from before the portal normalised
+        # them on write; a tool that only knew canonical values would report half
+        # the board as unknown.
+        hook = self.build([{"id": "w1", "title": "Ship it", "status": "In progress", "version": 1,
+                            "requested_person_id": self.OWNER}])
+        result = await TasksTool(hook).execute({})
+        self.assertTrue(result.success)
+        self.assertEqual(result.output["assigned"][0]["status"], "in_progress")
+
+    async def test_claiming_writes_the_canonical_status(self):
+        hook = self.build([{"id": "w1", "title": "Ship it", "status": "Ready", "version": 3,
+                            "requested_person_id": self.OWNER}])
+        result = await ClaimTool(hook).execute({"task_id": "w1"})
+        self.assertTrue(result.success)
+        operation = hook.client.writes[0]["operations"][0]
+        self.assertEqual(operation["data"], {"status": "accepted"})
+        self.assertEqual(operation["expected_version"], 3)
+
+    async def test_progress_touches_only_the_allowed_fields(self):
+        hook = self.build([{"id": "w1", "title": "Ship it", "status": "accepted", "version": 1,
+                            "requested_person_id": self.OWNER}])
+        result = await ProgressTool(hook).execute({"task_id": "w1", "note": "Rolled back the bad deploy",
+                                                   "status": "in_progress"})
+        self.assertTrue(result.success)
+        self.assertEqual(set(hook.client.writes[0]["operations"][0]["data"]), {"progress_note", "status"})
+
+    async def test_somebody_elses_work_is_refused_without_confirming_it_exists(self):
+        hook = self.build([{"id": "w1", "title": "Not yours", "status": "requested", "version": 1,
+                            "requested_person_id": "person-blair"}])
+        result = await ClaimTool(hook).execute({"task_id": "w1"})
+        self.assertFalse(result.success)
+        self.assertIn("not assigned to you, or does not exist", result.error["message"])
+        self.assertEqual(hook.client.writes, [])
+
+    async def test_a_server_without_the_narrow_permission_says_so_plainly(self):
+        hook = self.build([{"id": "w1", "title": "Ship it", "status": "requested", "version": 1,
+                            "requested_person_id": self.OWNER}], fail=403)
+        result = await ClaimTool(hook).execute({"task_id": "w1"})
+        self.assertFalse(result.success)
+        self.assertIn("does not yet allow", result.error["message"])
+
+    async def test_the_mounted_tools_can_move_work_but_never_create_it(self):
+        # A session must not invent tasks for anyone, including its own owner:
+        # that is a person's decision, made in the portal.
+        hook = self.build([])
+        mounted = set()
+
+        class Recording(Coordinator):
+            def __init__(self, context): super().__init__(context); self.hooks = Hooks(); self.capabilities = {}
+            def register_capability(self, name, value): self.capabilities[name] = value
+            async def mount(self, point, value, name): mounted.add(name)
+
+        for tool in (TasksTool(hook), ClaimTool(hook), ProgressTool(hook)):
+            mounted.add(tool.name)
+        self.assertEqual(mounted, {"teamwork_tasks", "teamwork_claim", "teamwork_progress"})
+        self.assertFalse(any("add" in n or "create" in n or "new" in n for n in mounted))
 
 
 if __name__ == '__main__':

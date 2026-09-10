@@ -608,6 +608,169 @@ def resolve_connection(config):
     return connection, home
 
 
+# Stored records carry two vocabularies at once: canonical values, and UI labels
+# from before the portal mapped them on write. Reading must tolerate both. Writing
+# must emit canonical only -- a third dialect is exactly what this table exists to
+# prevent, and the server refuses anything outside the canonical set anyway.
+LEGACY_STATUS = {"Proposed": "requested", "Ready": "requested", "In progress": "in_progress",
+                 "Needs review": "in_progress", "Done": "completed"}
+
+
+class WorkTools:
+    """See the work assigned to me, claim it, and report movement on it.
+
+    There is deliberately NO tool here that creates work. A session must not be
+    able to invent tasks for anyone, including its own owner: that is a person's
+    decision, made in the portal. It is also why the server grants this session a
+    narrow per-record permission rather than a broad scope -- the credential's
+    power and the model's reach are not the same thing, and making them the same
+    for convenience is how a confused agent becomes a destructive one.
+    """
+
+    def __init__(self, hook):
+        self.hook = hook
+
+    def project(self):
+        """Records this session may see, with each work item's status normalised."""
+        body = {"session_id": self.hook.sid, "selection": {"include": ["work", "agents"]},
+                "page_size": 100, "max_text_bytes": 262144}
+        page = self.hook.client.request("context", body)
+        work, mine = [], None
+        for entry in page.get("items", []):
+            content = entry.get("content") or {}
+            if entry.get("record_type") == "agent" and content.get("id") == self.hook.sid:
+                mine = content.get("owner_person_id")
+            elif entry.get("record_type") in ("work", "request"):
+                raw = content.get("status")
+                work.append(dict(content, status=LEGACY_STATUS.get(raw, raw), record_type=entry["record_type"]))
+        return work, mine
+
+    def assigned(self):
+        work, mine = self.project()
+        if not mine:
+            return [], None
+        return [w for w in work if mine in (w.get("requested_person_id"), w.get("owner_person_id"))], mine
+
+    def write(self, work_id, data):
+        """One narrow write, addressed by person id and never by display name."""
+        current = next((w for w in self.assigned()[0] if w.get("id") == work_id), None)
+        if current is None:
+            # The server would refuse this anyway, and without disclosing whether
+            # the task exists. Saying the same thing here keeps the two consistent.
+            return None, "that task is not assigned to you, or does not exist"
+        try:
+            self.hook.client.request("publish", {"operations": [
+                {"op": "work.upsert", "id": work_id, "expected_version": current.get("version", 0),
+                 "data": data}]}, uid())
+        except SyncError as error:
+            if error.status == 403:
+                return None, ("this project's service does not yet allow a session to update work "
+                              "(it needs the narrow work-update permission)")
+            if error.status == 404:
+                return None, "that task is not assigned to you, or does not exist"
+            if error.status == 409:
+                return None, "that task changed while you were reading it; look again and retry"
+            return None, ("the project service refused the update (HTTP %s)" % error.status
+                          if error.status else "the project service could not be reached")
+        return current, None
+
+
+class TasksTool(WorkTools):
+    @property
+    def name(self):
+        return "teamwork_tasks"
+
+    @property
+    def description(self):
+        return ("List the shared-project work assigned to the person running this session, with its "
+                "current status. Read-only. Use it before claiming or reporting progress, because the "
+                "task id and its current status both come from here.")
+
+    @property
+    def input_schema(self):
+        return {"type": "object", "properties": {}}
+
+    async def execute(self, input):
+        from amplifier_core.models import ToolResult
+        try:
+            work, mine = await asyncio.to_thread(self.assigned)
+        except SyncError as error:
+            return ToolResult(success=False, error={"message":
+                "Could not read the project (HTTP %s)" % error.status if error.status
+                else "Could not reach the project service"})
+        if not mine:
+            return ToolResult(success=True, output={
+                "assigned": [],
+                "note": "This session is not registered as an agent yet, so nothing could be matched to a person."})
+        return ToolResult(success=True, output={"assigned": [
+            {"id": w.get("id"), "title": w.get("title"), "status": w.get("status"),
+             "kind": w.get("record_type"), "version": w.get("version")} for w in work]})
+
+
+class ClaimTool(WorkTools):
+    @property
+    def name(self):
+        return "teamwork_claim"
+
+    @property
+    def description(self):
+        return ("Take a task assigned to the person running this session: its status becomes accepted. "
+                "Only work already assigned to them can be claimed -- this cannot create work or take "
+                "somebody else's.")
+
+    @property
+    def input_schema(self):
+        return {"type": "object",
+                "properties": {"task_id": {"type": "string", "description": "From teamwork_tasks."}},
+                "required": ["task_id"]}
+
+    async def execute(self, input):
+        from amplifier_core.models import ToolResult
+        task_id = input.get("task_id")
+        if not task_id:
+            return ToolResult(success=False, error={"message": "task_id is required"})
+        current, refusal = await asyncio.to_thread(self.write, task_id, {"status": "accepted"})
+        if refusal:
+            return ToolResult(success=False, error={"message": "Not claimed: " + refusal})
+        return ToolResult(success=True, output={"claimed": task_id, "status": "accepted",
+                                                "was": current.get("status")})
+
+
+class ProgressTool(WorkTools):
+    @property
+    def name(self):
+        return "teamwork_progress"
+
+    @property
+    def description(self):
+        return ("Report movement on a task assigned to the person running this session: a short note, "
+                "and optionally a new status of in_progress or completed. Write what a teammate reading "
+                "the board would need, not a transcript.")
+
+    @property
+    def input_schema(self):
+        return {"type": "object",
+                "properties": {"task_id": {"type": "string", "description": "From teamwork_tasks."},
+                               "note": {"type": "string", "description": "What moved, in a sentence or two."},
+                               "status": {"type": "string", "enum": ["in_progress", "completed"],
+                                          "description": "Optional. Omit to leave the status alone."}},
+                "required": ["task_id", "note"]}
+
+    async def execute(self, input):
+        from amplifier_core.models import ToolResult
+        task_id, note = input.get("task_id"), input.get("note")
+        if not task_id or not note:
+            return ToolResult(success=False, error={"message": "task_id and note are both required"})
+        data = {"progress_note": note[:4000]}
+        if input.get("status"):
+            data["status"] = input["status"]
+        current, refusal = await asyncio.to_thread(self.write, task_id, data)
+        if refusal:
+            return ToolResult(success=False, error={"message": "Not recorded: " + refusal})
+        return ToolResult(success=True, output={"updated": task_id,
+                                                "status": data.get("status", current.get("status"))})
+
+
 class SendTool:
     """Send one message to one other agent in this project.
 
@@ -682,6 +845,8 @@ async def mount(coordinator, config=None):
         coordinator.hooks.register(name, handler, priority=50, name="teamwork-" + name.replace(":", "-"))
     send = SendTool(hook)
     await coordinator.mount("tools", send, name=send.name)
+    for tool in (TasksTool(hook), ClaimTool(hook), ProgressTool(hook)):
+        await coordinator.mount("tools", tool, name=tool.name)
     coordinator.register_capability("teamwork.session_id", hook.sid)
     coordinator.register_capability("teamwork.rebind", hook.rebind)
     return None
