@@ -10,7 +10,7 @@ import subprocess
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "modules/hooks-teamwork"))
 from amplifier_module_hooks_teamwork import (HTTPClient, Journal, TeamworkHook, SyncError, sha, NoRedirect,
-                                             mount, resolve_connection, describe, PERSON_FIELDS)
+                                             mount, resolve_connection, describe, PERSON_FIELDS, verbosity)
 
 
 class Context:
@@ -251,6 +251,38 @@ class InfluenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.hook.influence([]))
         self.assertIsNone(self.hook.influence([record]))
 
+    def test_a_complaint_is_said_once_even_when_the_level_is_silent(self):
+        self.hook.level, self.hook.complaint = "silent", "Teamwork verbosity 'loud' is not usable."
+        record = self.source("insight", "i1", {"summary": "Delivered"})
+        self.assertEqual(self.hook.influence([record]), "Teamwork verbosity 'loud' is not usable.")
+        self.assertIsNone(self.hook.influence([record]))
+
+    def test_a_complaint_leads_the_first_spoken_notice_then_stops(self):
+        self.hook.complaint = "Teamwork verbosity 'loud' is not usable."
+        notice = self.hook.influence([self.source("insight", "i1", {"summary": "Delivered"})])
+        self.assertTrue(notice.startswith("Teamwork verbosity"))
+        self.assertIn("Delivered", notice)
+        later = self.hook.influence([self.source("idea", "d1", {"text": "Second"})])
+        self.assertNotIn("verbosity", later)
+
+    def test_silent_suppresses_the_notice_without_replaying_it_later(self):
+        record = self.source("insight", "i1", {"summary": "Quietly delivered"})
+        self.hook.level = "silent"
+        self.assertIsNone(self.hook.influence([record]))
+        # Tracking still advanced, so speaking again does not replay old influence.
+        self.hook.level = "summary"
+        self.assertIsNone(self.hook.influence([record]))
+        edited = self.source("insight", "i1", {"summary": "Changed since"}, "hash-changed")
+        self.assertIn("Changed since", self.hook.influence([edited]))
+
+    def test_detail_names_every_record_where_summary_abbreviates(self):
+        many = [self.source("work", "t%d" % index, {"title": "Item %d" % index}) for index in range(9)]
+        self.hook.level = "detail"
+        notice = self.hook.influence(many)
+        self.assertEqual(len(notice.splitlines()), 10)         # header + all nine
+        self.assertNotIn("more (", notice)
+        self.assertIn("Item 8", notice)
+
     def test_long_notices_are_bounded_and_summarised(self):
         many = [self.source("work", "t%d" % index, {"title": "Item %d" % index}) for index in range(9)]
         notice = self.hook.influence(many)
@@ -396,6 +428,38 @@ class MountTests(unittest.IsolatedAsyncioTestCase):
     def test_configured_recipient_is_validated(self):
         with self.assertRaises(ValueError):
             resolve_connection({"base_url": "http://team.example.invalid", "project_id": "p", "token": "t"})
+
+    def test_an_unusable_level_degrades_and_complains_rather_than_disabling_sharing(self):
+        self.assertEqual(verbosity({}), ("summary", None))
+        self.assertEqual(verbosity({"verbosity": "silent"}), ("silent", None))
+        level, complaint = verbosity({"verbosity": "loud"})
+        self.assertEqual(level, "summary")
+        self.assertIn("silent, summary, detail", complaint)
+        self.assertEqual(verbosity({"verbosity": 2})[0], "summary")
+
+    async def test_configured_level_reaches_the_mounted_hook(self):
+        class Hooks:
+            def __init__(self): self.handlers = []
+            def register(self, *args, **kwargs): self.handlers.append((args, kwargs))
+
+        class Root:
+            parent_id = None
+            session_id = "verbosity-session"
+            def __init__(self): self.hooks = Hooks(); self.capabilities = {}
+            def register_capability(self, name, value): self.capabilities[name] = value
+
+        root = Root()
+        with tempfile.TemporaryDirectory() as directory:
+            await mount(root, {
+                "share_visible_turns": True,
+                "base_url": "https://team.example.invalid",
+                "project_id": "configured",
+                "token": "[REDACTED:SECRET]",
+                "verbosity": "detail",
+                "journal_path": str(Path(directory) / "queue.sqlite3"),
+            })
+            hook = root.hooks.handlers[0][0][1].__self__
+            self.assertEqual(hook.level, "detail")
 
     def test_http_client_validates_recipient_before_reading_token(self):
         class TokenTrap(dict):

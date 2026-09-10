@@ -82,6 +82,39 @@ halves address different services.
 With no project configured the hook mounts **inert** -- it registers nothing and sends
 nothing -- until a session binds one.
 
+### How much the hook says about what arrived
+
+When project records the user has not been told about are accepted into a turn, the hook
+reports them through the host's `user_message` channel: their kind, author where the
+record carries one, and title. It reports what was delivered, not what the model attended
+to, and is suppressed entirely when input attachment did not succeed.
+
+```yaml
+overrides:
+  hooks-teamwork:
+    config:
+      verbosity: summary      # silent | summary (default) | detail
+```
+
+| Level | Behaviour |
+| --- | --- |
+| `silent` | No notice. Delivery, receipts and publishing are unchanged. |
+| `summary` | Names up to five records, then counts the remainder by kind. |
+| `detail` | Names every newly arrived record. |
+
+An unrecognised level degrades to `summary` and says so once, rather than stopping the
+mount. Refusing outright was tried and rejected: in the CLI verified here a mount
+exception is absorbed, leaving the session running with the hook silently absent and
+nothing reported, so a typo in a cosmetic setting would have quietly disabled sharing.
+`silent` suppresses the notice only, never the tracking behind it: switching back to a
+speaking level reports what has changed since, not everything delivered while quiet.
+
+Whether that notice is displayed is the host's decision. In the CLI verified here
+(amplifier 2026.09.09, core 1.6.1) `HookResult.user_message` is carried by the kernel
+contract but no renderer consumes it, so the notice is not shown by `amplifier run`. The
+hook's obligation ends at reporting it; do not read a silent terminal as evidence that
+nothing was delivered.
+
 ### Choosing and changing the project while running
 
 Two tools bind the running session. Neither accepts a credential.
