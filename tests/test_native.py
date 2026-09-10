@@ -23,6 +23,9 @@ from amplifier_module_hooks_teamwork import service_url
 from amplifier_module_tool_teamwork.page import form_page
 
 BASE = "https://team.example.invalid"
+# The public web origin the member plane gates on. Passed explicitly at every
+# call site on purpose: deriving it from BASE is the bug teamwork-cio names.
+ORIGIN = "https://team.example.invalid"
 FORM = {"project": "selected", "name": "Fixture", "code": "private-fixture-code", "consent": "yes"}
 
 
@@ -98,7 +101,7 @@ class EnrollmentTests(unittest.TestCase):
                     return Response({}, {'Set-Cookie': 'fixture=cookie; HttpOnly'})
                 return Response({'token': 'harness-fixture', 'id': 'harness-id'})
         with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', return_value=Opener()):
-            path, project = connect(FORM, BASE, Path(home))
+            path, project = connect(FORM, BASE, Path(home), origin=ORIGIN)
             self.assertEqual(project, 'selected')
             self.assertEqual(json.loads(path.read_text())['token'], 'harness-fixture')
             self.assertNotIn(FORM['code'], path.read_text())
@@ -106,14 +109,14 @@ class EnrollmentTests(unittest.TestCase):
             self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
             self.assertEqual(json.loads(requests[1].data)['scopes'], ['context:read', 'session:write', 'shared:write'])
             self.assertTrue(all(r.get_header('X-teamwork-project') == 'selected' for r in requests))
-            self.assertEqual(connect({'project': 'selected', 'consent': 'yes'}, BASE, Path(home)), (path, project))
+            self.assertEqual(connect({'project': 'selected', 'consent': 'yes'}, BASE, Path(home), origin=ORIGIN), (path, project))
             self.assertEqual(len(requests), 2)
             for bad in ({'project': 'selected'}, {'consent': 'yes'}):
-                with self.assertRaises(ValueError): connect(bad, BASE, Path(home))
+                with self.assertRaises(ValueError): connect(bad, BASE, Path(home), origin=ORIGIN)
 
     def test_failed_enrollment_removes_reserved_file(self):
         with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', side_effect=OSError('fixture')):
-            with self.assertRaises(OSError): connect(FORM, BASE, Path(home))
+            with self.assertRaises(OSError): connect(FORM, BASE, Path(home), origin=ORIGIN)
             self.assertEqual(list(Path(home).rglob('connection.json')), [])
 
     def test_failed_write_revokes_issued_credential(self):
@@ -125,7 +128,7 @@ class EnrollmentTests(unittest.TestCase):
                     return Response({}, {'Set-Cookie': 'fixture=cookie'})
                 return Response({'token': 'harness-fixture', 'id': 'harness-id'})
         with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', return_value=Opener()), patch('os.fsync', side_effect=OSError('disk fixture')):
-            with self.assertRaises(OSError): connect(FORM, BASE, Path(home))
+            with self.assertRaises(OSError): connect(FORM, BASE, Path(home), origin=ORIGIN)
             self.assertTrue(requests[-1].endswith('/api/harnesses/revoke'))
             self.assertEqual(list(Path(home).rglob('connection.json')), [])
 
@@ -135,7 +138,7 @@ class EnrollmentTests(unittest.TestCase):
             folder.mkdir(mode=0o700)
             path = folder / 'connection.json'
             path.write_text('{}'); path.chmod(0o644)
-            with self.assertRaises(ValueError): connect(FORM, BASE, Path(home))
+            with self.assertRaises(ValueError): connect(FORM, BASE, Path(home), origin=ORIGIN)
 
 
 class SSOEnrollmentTests(unittest.TestCase):
@@ -446,7 +449,7 @@ class ServiceConfigTests(unittest.TestCase):
 
 
 class BrowserTests(unittest.TestCase):
-    def drive(self, act, timeout=5, home='/unused'):
+    def drive(self, act, timeout=5, home='/unused', origin=None):
         """Run the private form and let `act(url, origin)` play the browser's part."""
         errors = []; workers = []
         def browser(url):
@@ -457,7 +460,8 @@ class BrowserTests(unittest.TestCase):
             return True
         with patch('webbrowser.open', side_effect=browser):
             try:
-                result = private_browser_connect(BASE, Path(home), threading.Event(), timeout=timeout, notify=None)
+                result = private_browser_connect(BASE, Path(home), threading.Event(), timeout=timeout,
+                                                 notify=None, origin=origin)
             except Exception as error:
                 result = error
         for worker in workers: worker.join(10)
@@ -498,13 +502,42 @@ class BrowserTests(unittest.TestCase):
             status, body = self.post(url, good, {'Origin': origin})
             self.assertEqual(status, 200)
             self.assertNotIn(FORM['code'], body)
-        def enroll(form, base, home, repository=None):
+        def enroll(form, base, home, repository=None, origin=None):
             seen.append(form); return Path('/private/fixture.json'), 'selected'
         with patch('amplifier_module_tool_teamwork.connect', side_effect=enroll):
             result = self.drive(act)
         self.assertEqual(len(seen), 1)
         self.assertNotIn('csrf', seen[0])
         self.assertEqual(result[1], 'selected')
+
+    def test_the_web_origin_reaches_enrollment_and_is_not_derived_from_the_api_host(self):
+        """A deployment may serve its web app on another host, and the member plane
+        gates on THAT one. Deriving the Origin from the API host is refused 403
+        before a credential is examined -- measured against the live canonical
+        deployment, 3 of 3 (teamwork-cio)."""
+        seen = []
+        def act(url, origin):
+            with urllib.request.urlopen(url) as response: page = response.read().decode()
+            self.assertEqual(self.post(url, dict(FORM, csrf=self.token(page)),
+                                       {'Origin': origin, 'Sec-Fetch-Site': 'same-origin'})[0], 200)
+        def enroll(form, base, home, repository=None, origin=None):
+            seen.append(origin); return Path('/private/fixture.json'), 'selected'
+        with patch('amplifier_module_tool_teamwork.connect', side_effect=enroll):
+            self.drive(act, origin='https://web.example.invalid')
+        self.assertEqual(seen, ['https://web.example.invalid'])
+
+    def test_an_unsupplied_web_origin_still_derives_from_the_service(self):
+        # Every same-origin deployment must behave exactly as it did before.
+        seen = []
+        def act(url, origin):
+            with urllib.request.urlopen(url) as response: page = response.read().decode()
+            self.assertEqual(self.post(url, dict(FORM, csrf=self.token(page)),
+                                       {'Origin': origin, 'Sec-Fetch-Site': 'same-origin'})[0], 200)
+        def enroll(form, base, home, repository=None, origin=None):
+            seen.append(origin); return Path('/private/fixture.json'), 'selected'
+        with patch('amplifier_module_tool_teamwork.connect', side_effect=enroll):
+            self.drive(act)
+        self.assertEqual(seen, [BASE])
 
     def test_browser_omitting_origin_under_no_referrer_still_enrolls(self):
         """Chrome sends `Origin: null` for a same-origin POST under Referrer-Policy: no-referrer."""
@@ -514,7 +547,7 @@ class BrowserTests(unittest.TestCase):
             status, _ = self.post(url, dict(FORM, csrf=self.token(page)),
                                   {'Origin': 'null', 'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'navigate'})
             self.assertEqual(status, 200)
-        def enroll(form, base, home, repository=None):
+        def enroll(form, base, home, repository=None, origin=None):
             seen.append(form); return Path('/private/fixture.json'), 'selected'
         with patch('amplifier_module_tool_teamwork.connect', side_effect=enroll):
             self.drive(act)
@@ -534,7 +567,7 @@ class BrowserTests(unittest.TestCase):
             self.assertIn('type="password"', body)
             status, body = self.post(url, dict(FORM, csrf=self.token(body)), {'Origin': origin})
             self.assertEqual(status, 200)
-        def enroll(form, base, home, repository=None):
+        def enroll(form, base, home, repository=None, origin=None):
             attempts.append(form['project'])
             if form['project'] == 'rejected':
                 raise ConsentError('Fixture reason', 'project', 'Fixture hint')
@@ -552,7 +585,7 @@ class BrowserTests(unittest.TestCase):
             for secret in ('service-detail-leak', 'session=cookievalue', FORM['code']):
                 self.assertNotIn(secret, body)
             self.assertIn('type="password"', body)
-        def enroll(form, base, home, repository=None):
+        def enroll(form, base, home, repository=None, origin=None):
             raise RuntimeError('service-detail-leak session=cookievalue')
         with patch('amplifier_module_tool_teamwork.connect', side_effect=enroll):
             result = self.drive(act, timeout=1)
