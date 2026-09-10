@@ -48,17 +48,18 @@ def without_audit_trail(value):
     return value
 
 
-INFLUENCE_LABELS = {"insight": "\u2605 Insight", "idea": "\u25c6 Idea", "request": "\u276f Request",
+INFLUENCE_LABELS = {"message": "\u2709 Message", "insight": "\u2605 Insight", "idea": "\u25c6 Idea",
+                    "request": "\u276f Request",
                     "work": "\u25cf Work", "plan": "\u25b8 Plan", "plan_step": "\u25b8 Plan step",
                     "project": "\u25aa Project", "person": "\u25cd Teammate", "presence": "\u25cc Presence"}
-INFLUENCE_ORDER = {"insight": 0, "idea": 1, "request": 2, "work": 3, "plan": 4,
-                   "plan_step": 5, "project": 6, "person": 7, "presence": 8}
+INFLUENCE_ORDER = {"message": 0, "insight": 1, "idea": 2, "request": 3, "work": 4, "plan": 5,
+                   "plan_step": 6, "project": 7, "person": 8, "presence": 9}
 TITLE_FIELDS = ("title", "headline", "summary", "statement", "text", "name", "goal", "description", "body")
 AUTHOR_FIELDS = ("author", "author_name", "created_by", "person", "person_name", "owner", "actor", "by", "contributor")
 
 
-RENDER_ORDER = {"project": 0, "plan": 1, "work": 2, "request": 3, "person": 4,
-                "insight": 5, "idea": 6, "plan_step": 7, "presence": 8}
+RENDER_ORDER = {"message": 0, "project": 1, "plan": 2, "work": 3, "request": 4, "person": 5,
+                "insight": 6, "idea": 7, "plan_step": 8, "presence": 9}
 
 # Named rather than numeric: a number invites guessing at what it selects.
 VERBOSITY_LEVELS = ("silent", "summary", "detail")
@@ -177,9 +178,15 @@ class Journal:
 
 
 class TeamworkHook:
-    def __init__(self, coordinator, connection, journal, client=None, level=VERBOSITY_DEFAULT, complaint=None):
+    def __init__(self, coordinator, connection, journal, client=None, level=VERBOSITY_DEFAULT, complaint=None,
+                 node_label=None):
         self.coordinator, self.connection, self.journal = coordinator, connection, journal
         self.level = level
+        # Supplied, never discovered: a hostname can carry an employer, a project
+        # codename, or a person's name. Absent means the server applies its default.
+        self.node_label = node_label
+        self.agent_version = 0
+        self.agent_status = "unregistered"
         # Said once, on the first notice, so a misconfiguration is not silent.
         self.complaint = complaint
         self.client = client or HTTPClient(connection)
@@ -250,6 +257,37 @@ class TeamworkHook:
     async def flush(self):
         await asyncio.to_thread(self.journal.flush, self.sid, self.client)
 
+    def register_agent(self):
+        """Announce this session as an addressable agent. Best effort, never queued.
+
+        Deliberately off the durable outbox. That queue is strictly ordered and stops
+        at its first failure, so a server that does not know this record kind would
+        wedge every later publish behind a record nobody needs. Liveness is also
+        worthless replayed: a heartbeat delivered forty minutes late is a lie, not a
+        late truth. So this is sent directly, and a failure disables it for the rest
+        of the session rather than accumulating.
+        """
+        if self.agent_status == "unavailable" or not self.entered:
+            return
+        data = {"session_id": self.sid}
+        if self.node_label:
+            data["node_label"] = self.node_label
+        try:
+            self.client.request("publish", {"operations": [
+                {"op": "agent.upsert", "id": self.sid, "expected_version": self.agent_version,
+                 "data": data}]}, uid())
+        except SyncError as error:
+            # Never fatal: sharing does not depend on being addressable.
+            self.agent_status = "unavailable"
+            logger.info("Teamwork agent registration unavailable (HTTP %s; 0 means transport failure); "
+                        "sharing is unaffected", error.status)
+            return
+        self.agent_version += 1
+        self.agent_status = "registered"
+
+    async def announce(self):
+        await asyncio.to_thread(self.register_agent)
+
     def ensure_session(self):
         if self.entered: return
         version = self.state["version"]; self.state["version"] += 1; self.entered = True
@@ -262,11 +300,12 @@ class TeamworkHook:
             self.ensure_session()
             try: await self.flush()
             except SyncError as error: logger.warning("Teamwork session queued locally; synchronization pending (HTTP %s; 0 means transport failure)", error.status)
+            await self.announce()
         return hook_result()
 
     async def retrieve(self):
         for _ in range(5):
-            body = {"session_id": self.sid, "cursor": self.state["cursor"], "selection": {"include": ["direction", "plans", "work", "ideas", "insights", "people", "presence"]}, "page_size": 100, "max_text_bytes": 262144}
+            body = {"session_id": self.sid, "cursor": self.state["cursor"], "selection": {"include": ["direction", "plans", "work", "ideas", "insights", "people", "presence", "messages", "agents"]}, "page_size": 100, "max_text_bytes": 262144}
             try: page = await asyncio.to_thread(self.client.request, "context", body)
             except SyncError as error:
                 if error.status == 410:
@@ -432,6 +471,8 @@ class TeamworkHook:
             self.finish(data.get("response", ""))
             try: await self.flush()
             except SyncError: logger.warning("Teamwork visible response queued locally")
+            # Refreshed after the turn, not before it: the user is not waiting on this.
+            await self.announce()
         return hook_result()
 
     async def on_end(self, event, data):
@@ -485,6 +526,56 @@ def resolve_connection(config):
     return connection, home
 
 
+class SendTool:
+    """Send one message to one other agent in this project.
+
+    Deliberately addressed, never broadcast: a room where every agent hears every
+    message is noise. The server refuses an unknown recipient rather than
+    disclosing whether it exists.
+    """
+
+    def __init__(self, hook):
+        self.hook = hook
+
+    @property
+    def name(self):
+        return "teamwork_send"
+
+    @property
+    def description(self):
+        return ("Send a message to another agent in this shared project. Address one agent by its "
+                "agent id, which appears in the shared project excerpt. The message is delivered when "
+                "that agent next runs -- it may be a teammate's laptop that is currently asleep, so do "
+                "not wait on a reply. Delivery is not agreement and not action.")
+
+    @property
+    def input_schema(self):
+        return {"type": "object",
+                "properties": {"to_agent_id": {"type": "string", "description": "The agent to address."},
+                               "body": {"type": "string", "description": "What to say. Plain text, 4000 characters."}},
+                "required": ["to_agent_id", "body"]}
+
+    async def execute(self, input):
+        from amplifier_core.models import ToolResult
+        to_agent, body = input.get("to_agent_id"), input.get("body")
+        if not to_agent or not body:
+            return ToolResult(success=False, error={"message": "to_agent_id and body are both required"})
+        try:
+            await asyncio.to_thread(
+                self.hook.client.request, "publish",
+                {"operations": [{"op": "message.upsert", "id": uid(), "expected_version": 0,
+                                 "data": {"to_agent_id": to_agent, "body": body}}]}, uid())
+        except SyncError as error:
+            # Named plainly rather than retried: the model asked to send now.
+            reason = ("that agent is not in this project" if error.status == 404
+                      else "the project service refused the message (HTTP %s)" % error.status
+                      if error.status else "the project service could not be reached")
+            return ToolResult(success=False, error={"message": "Not sent: " + reason})
+        return ToolResult(success=True, output={
+            "queued_for": to_agent,
+            "note": "Delivered to the project. It reaches that agent when it next runs, which may not be soon."})
+
+
 async def mount(coordinator, config=None):
     # Delegated prompts are internal work, not the opted-in human conversation.
     if getattr(coordinator, "parent_id", None):
@@ -501,9 +592,12 @@ async def mount(coordinator, config=None):
         return None
     journal_path = Path(config.get("journal_path") or home / ("outbox-" + sha(connection["token"])[:16] + ".sqlite3")).expanduser()
     level, complaint = verbosity(config)
-    hook = TeamworkHook(coordinator, connection, Journal(journal_path), level=level, complaint=complaint)
+    hook = TeamworkHook(coordinator, connection, Journal(journal_path), level=level, complaint=complaint,
+                        node_label=config.get("node_label"))
     for name, handler in (("session:start", hook.on_start), ("prompt:submit", hook.on_submit), ("prompt:complete", hook.on_complete), ("session:end", hook.on_end)):
         coordinator.hooks.register(name, handler, priority=50, name="teamwork-" + name.replace(":", "-"))
+    send = SendTool(hook)
+    await coordinator.mount("tools", send, name=send.name)
     coordinator.register_capability("teamwork.session_id", hook.sid)
     coordinator.register_capability("teamwork.rebind", hook.rebind)
     return None
