@@ -259,7 +259,7 @@ class InfluenceTests(unittest.IsolatedAsyncioTestCase):
         ])
         rendered, chosen = self.hook.render()
         self.assertEqual([s["record"]["record_type"] for s in chosen], ["work", "person"])
-        self.assertIn("[excerpt truncated]", rendered)
+        self.assertIn("[excerpt truncated;", rendered)
         self.assertLessEqual(len(rendered.encode()), 10000)
 
     def test_new_records_are_named_with_their_author(self):
@@ -375,6 +375,76 @@ class InfluenceTests(unittest.IsolatedAsyncioTestCase):
         result = await self.hook.on_submit("prompt:submit", {"prompt": "My prompt"})
         self.assertIsNone(result.user_message)
         self.assertFalse(self.hook.state.get("announced"))
+
+
+class ExcerptTests(unittest.TestCase):
+    """The injected excerpt says what it omits and spends its budget on content, not audit trail."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        self.connection = {"base_url": "https://team.example.invalid", "project_id": "teamwork", "token": "fixture-token"}
+        self.hook = TeamworkHook(Coordinator(Context([])), self.connection,
+                                 Journal(Path(self.tmp.name) / "queue.db"), Client([]))
+
+    def cache(self, *records):
+        self.hook.state["cache"] = {r["record"]["record_type"] + ":" + r["record"]["id"]: r for r in records}
+
+    def source(self, kind, rid, content):
+        return {"record": {"key": kind + ":" + rid + ":1", "id": rid, "record_type": kind,
+                           "content": content, "content_sha256": kind + rid}, "delivery_id": "manifest"}
+
+    def audited(self, **content):
+        actor = "141280cb-0000-5000-8000-000000000000"
+        via = {"harness_id": None, "kind": "member", "person_id": actor}
+        content.update(created_at="2026-09-09T20:56:00+00:00", created_by=actor, created_via=via,
+                       updated_at="2026-09-09T20:56:00+00:00", updated_by=actor, updated_via=via)
+        return content
+
+    def test_header_counts_shown_records_against_the_synchronized_cache(self):
+        self.cache(*[self.source("work", "t%d" % index, {"text": "x" * 2000}) for index in range(8)])
+        output, chosen = self.hook.render()
+        self.assertLess(len(chosen), 8)                                # the byte budget omitted some
+        self.assertIn("showing %d of 8 synchronized records" % len(chosen), output)
+        self.assertLessEqual(len(output.encode()), 10000)
+        self.assertNotIn("The synchronized baseline is partial.", output)
+        self.hook.state["partial"] = True
+        self.assertIn("The synchronized baseline is partial.", self.hook.render()[0])
+
+    def test_audit_trail_is_projected_out_so_a_real_project_record_fits_whole(self):
+        repositories = [self.audited(id="repo-%d" % index, label="Repository %d" % index, url="https://example.invalid/%d" % index,
+                                     description="A description long enough to matter for the excerpt budget of this record.",
+                                     access="private", access_verification="Member supplied; not independently checked",
+                                     attribution_source="authenticated", ownership="shared", status="active", version=1)
+                        for index in range(3)]
+        project = self.audited(id="teamwork", goal="Fixture goal", accepted_plan_id=None, repositories=repositories)
+        self.assertGreater(len(json.dumps(project)), 1600)          # would have been cut mid-JSON before
+        self.cache(self.source("project", "teamwork", project))
+        output, chosen = self.hook.render()
+        fragment = output.split("project:teamwork:1\n", 1)[1].splitlines()[0]
+        parsed = json.loads(fragment)                                # whole and valid, not truncated
+        self.assertNotIn("[excerpt truncated", output)
+        self.assertEqual(parsed["goal"], "Fixture goal")
+        self.assertEqual([repo["label"] for repo in parsed["repositories"]], ["Repository 0", "Repository 1", "Repository 2"])
+        for kept in ("attribution_source", "access_verification", "ownership", "status", "url"):
+            self.assertIn(kept, parsed["repositories"][0])           # uncertainty markers survive
+        for dropped in ("created_at", "created_by", "created_via", "updated_at", "updated_by", "updated_via"):
+            self.assertNotIn(dropped, output)
+        self.assertNotIn("141280cb-0000-5000-8000-000000000000", output)
+        self.assertEqual(len(chosen), 1)
+
+    def test_a_record_still_too_large_keeps_its_title_after_the_cut(self):
+        self.cache(self.source("work", "big", {"detail": "d" * 3000, "owner": "MJ", "title": "Needle title"}))
+        output, chosen = self.hook.render()
+        self.assertIn("[excerpt truncated", output)
+        self.assertIn("Needle title", output)                        # sorted-key JSON cut before "title"
+        self.assertEqual(len(chosen), 1)
+
+    def test_person_records_still_use_the_person_projection(self):
+        self.cache(self.source("person", "p1", {"name": "Fixture Person", "summary": "UNPROJECTED", "created_by": "actor"}))
+        output, _ = self.hook.render()
+        self.assertIn("Fixture Person", output)
+        self.assertNotIn("UNPROJECTED", output)
+        self.assertNotIn("created_by", output)
 
 
 class RedirectTests(unittest.TestCase):
