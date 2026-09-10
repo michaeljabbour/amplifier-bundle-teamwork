@@ -177,9 +177,15 @@ class Journal:
 
 
 class TeamworkHook:
-    def __init__(self, coordinator, connection, journal, client=None, level=VERBOSITY_DEFAULT, complaint=None):
+    def __init__(self, coordinator, connection, journal, client=None, level=VERBOSITY_DEFAULT, complaint=None,
+                 node_label=None):
         self.coordinator, self.connection, self.journal = coordinator, connection, journal
         self.level = level
+        # Supplied, never discovered: a hostname can carry an employer, a project
+        # codename, or a person's name. Absent means the server applies its default.
+        self.node_label = node_label
+        self.agent_version = 0
+        self.agent_status = "unregistered"
         # Said once, on the first notice, so a misconfiguration is not silent.
         self.complaint = complaint
         self.client = client or HTTPClient(connection)
@@ -250,6 +256,37 @@ class TeamworkHook:
     async def flush(self):
         await asyncio.to_thread(self.journal.flush, self.sid, self.client)
 
+    def register_agent(self):
+        """Announce this session as an addressable agent. Best effort, never queued.
+
+        Deliberately off the durable outbox. That queue is strictly ordered and stops
+        at its first failure, so a server that does not know this record kind would
+        wedge every later publish behind a record nobody needs. Liveness is also
+        worthless replayed: a heartbeat delivered forty minutes late is a lie, not a
+        late truth. So this is sent directly, and a failure disables it for the rest
+        of the session rather than accumulating.
+        """
+        if self.agent_status == "unavailable" or not self.entered:
+            return
+        data = {"session_id": self.sid}
+        if self.node_label:
+            data["node_label"] = self.node_label
+        try:
+            self.client.request("publish", {"operations": [
+                {"op": "agent.upsert", "id": self.sid, "expected_version": self.agent_version,
+                 "data": data}]}, uid())
+        except SyncError as error:
+            # Never fatal: sharing does not depend on being addressable.
+            self.agent_status = "unavailable"
+            logger.info("Teamwork agent registration unavailable (HTTP %s; 0 means transport failure); "
+                        "sharing is unaffected", error.status)
+            return
+        self.agent_version += 1
+        self.agent_status = "registered"
+
+    async def announce(self):
+        await asyncio.to_thread(self.register_agent)
+
     def ensure_session(self):
         if self.entered: return
         version = self.state["version"]; self.state["version"] += 1; self.entered = True
@@ -262,6 +299,7 @@ class TeamworkHook:
             self.ensure_session()
             try: await self.flush()
             except SyncError as error: logger.warning("Teamwork session queued locally; synchronization pending (HTTP %s; 0 means transport failure)", error.status)
+            await self.announce()
         return hook_result()
 
     async def retrieve(self):
@@ -432,6 +470,8 @@ class TeamworkHook:
             self.finish(data.get("response", ""))
             try: await self.flush()
             except SyncError: logger.warning("Teamwork visible response queued locally")
+            # Refreshed after the turn, not before it: the user is not waiting on this.
+            await self.announce()
         return hook_result()
 
     async def on_end(self, event, data):
@@ -501,7 +541,8 @@ async def mount(coordinator, config=None):
         return None
     journal_path = Path(config.get("journal_path") or home / ("outbox-" + sha(connection["token"])[:16] + ".sqlite3")).expanduser()
     level, complaint = verbosity(config)
-    hook = TeamworkHook(coordinator, connection, Journal(journal_path), level=level, complaint=complaint)
+    hook = TeamworkHook(coordinator, connection, Journal(journal_path), level=level, complaint=complaint,
+                        node_label=config.get("node_label"))
     for name, handler in (("session:start", hook.on_start), ("prompt:submit", hook.on_submit), ("prompt:complete", hook.on_complete), ("session:end", hook.on_end)):
         coordinator.hooks.register(name, handler, priority=50, name="teamwork-" + name.replace(":", "-"))
     coordinator.register_capability("teamwork.session_id", hook.sid)

@@ -68,14 +68,76 @@ class HookTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(e == "acknowledgements" for e, _, _ in self.client.requests))
         self.assertEqual(self.journal.load(self.hook.sid)["turn"]["boundary"], "prepared")
 
+    def outbox_publishes(self, op="session.upsert"):
+        """Only the durable-outbox traffic: registration rides a separate path."""
+        return [r for r in self.client.requests
+                if r[0] == "publish" and any(o["op"] == op for o in r[1]["operations"])]
+
+    def registrations(self):
+        return [r for r in self.client.requests
+                if r[0] == "publish" and any(o["op"] == "agent.upsert" for o in r[1]["operations"])]
+
+    async def test_the_session_registers_itself_as_an_addressable_agent(self):
+        await self.hook.on_start("session:start", {})
+        sent = self.registrations()
+        self.assertEqual(len(sent), 1)
+        operation = sent[0][1]["operations"][0]
+        self.assertEqual(operation["id"], self.hook.sid)
+        self.assertEqual(operation["data"]["session_id"], self.hook.sid)
+        self.assertEqual(operation["expected_version"], 0)
+        self.assertEqual(self.hook.agent_status, "registered")
+
+    async def test_a_completed_turn_refreshes_liveness_rather_than_adding_an_agent(self):
+        await self.hook.on_start("session:start", {})
+        await self.hook.on_submit("prompt:submit", {"prompt": "My prompt"})
+        await self.hook.on_complete("prompt:complete", {"response": "Visible response"})
+        sent = self.registrations()
+        self.assertEqual(len(sent), 2)
+        # Same record, next version: a heartbeat, not a second agent.
+        self.assertEqual({op[1]["operations"][0]["id"] for op in sent}, {self.hook.sid})
+        self.assertEqual([op[1]["operations"][0]["expected_version"] for op in sent], [0, 1])
+
+    async def test_a_configured_node_label_is_sent_and_an_absent_one_reveals_nothing(self):
+        await self.hook.on_start("session:start", {})
+        self.assertNotIn("node_label", self.registrations()[0][1]["operations"][0]["data"])
+        labelled = TeamworkHook(Coordinator(self.context), self.connection, self.journal, self.client,
+                                node_label="laptop-2")
+        await labelled.on_start("session:start", {})
+        self.assertEqual(self.registrations()[-1][1]["operations"][0]["data"]["node_label"], "laptop-2")
+
+    async def test_a_server_that_rejects_registration_does_not_disturb_the_session(self):
+        # The durable outbox stops at its first failure, so registration must never
+        # ride it: an older server that does not know this record kind would
+        # otherwise wedge every later publish behind a record nobody needs.
+        class Selective(Client):
+            def request(self, endpoint, body, key=None):
+                operations = body.get("operations") if isinstance(body, dict) else None
+                if operations and any(o["op"] == "agent.upsert" for o in operations):
+                    self.requests.append((endpoint, json.loads(json.dumps(body)), key))
+                    raise SyncError(400)
+                return super().request(endpoint, body, key)
+
+        self.client = Selective(self.events)
+        hook = TeamworkHook(Coordinator(self.context), self.connection, self.journal, self.client)
+        await hook.on_start("session:start", {})
+        await hook.on_submit("prompt:submit", {"prompt": "My prompt"})
+        await hook.on_complete("prompt:complete", {"response": "Visible response"})
+        self.assertEqual(hook.agent_status, "unavailable")
+        # Tried once, then stopped -- a refusal does not accumulate.
+        self.assertEqual(len(self.registrations()), 1)
+        # And the session shared everything it would have shared anyway.
+        self.assertTrue(any(o["op"] == "turn.upsert"
+                            for r in self.client.requests if r[0] == "publish"
+                            for o in r[1]["operations"]))
+
     async def test_offline_outbox_reuses_key_after_restart(self):
         self.client.fail = True
         await self.hook.on_start("session:start", {})
-        first = self.client.requests[0]
+        first = self.outbox_publishes()[0]
         self.client.fail = False
         resumed = TeamworkHook(Coordinator(self.context), self.connection, self.journal, self.client)
         await resumed.on_start("session:start", {})
-        self.assertEqual(first, self.client.requests[1])
+        self.assertEqual(first, self.outbox_publishes()[1])
         self.assertEqual(resumed.sid, self.hook.sid)
 
     async def test_exact_connection_credential_redacted_and_internal_events_unhandled(self):

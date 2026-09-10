@@ -185,7 +185,8 @@ class FixtureFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(replayed.returncode, 0, replayed.stderr)
         self.assertIn('"pending_requests": 0', replayed.stdout)
-        publishes = [event for event in events if event[1].endswith("/publish")]
+        publishes = [event for event in events if event[1].endswith("/publish")
+                     and any(op["op"] == "session.upsert" for op in event[2]["operations"])]
         self.assertEqual(publishes[0][3], publishes[1][3])
         self.assertEqual(publishes[0][2], publishes[1][2])
 
