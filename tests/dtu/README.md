@@ -64,10 +64,67 @@ log when it produces one.
 | Crowded fixture | `run_e2e.py --crowded` | adds many records of one kind and asserts no kind is starved out of the excerpt |
 | External service, log available | `run_e2e.py --service-url URL --request-log PATH` | every check |
 | Opaque service | `run_e2e.py --service-url URL --no-canary` | client-side checks; traffic-derived ones report `SKIP`, never `PASS` |
+| Real server in the twin | see below | real enrollment and delivery against the actual implementation; traffic-derived checks `SKIP` |
 
 For a deployed service, pass `--member-name`, `--member-code`, `--prompt` and `--no-canary`;
 enrollment then mints a real credential, which must be revoked afterwards in the service's
 own harness controls.
+
+## The real server in the twin
+
+A stub proves behaviour, never the contract: its responses encode the hook's own
+expectations, so the two agree by construction. Running the app source inside the same
+twin removes that circularity -- the server forms its opinions independently and can
+therefore contradict the client.
+
+This needs a checkout of the Teamwork app source, which is a separate repository. Its
+`scripts/local_dev.py` is self-contained: SQLite, fictional members, generated private
+codes, loopback only.
+
+```sh
+# 1. Put the app source in the twin (a private repo, so copy rather than mirror)
+tar --exclude=.git --exclude=.local -czf /tmp/tw_server.tgz -C <app-source> .
+amplifier-digital-twin file-push teamwork-e2e /tmp/tw_server.tgz /root/tw_server.tgz
+amplifier-digital-twin exec teamwork-e2e -- bash -c \
+  'mkdir -p /root/tw-server && tar -xzf /root/tw_server.tgz -C /root/tw-server'
+
+# 2. Start it. NOT on 8080 -- see below.
+amplifier-digital-twin exec teamwork-e2e -- bash -c \
+  'cd /root/tw-server && setsid nohup python3 scripts/local_dev.py --port 8090 \
+     > server.out 2>&1 < /dev/null &'
+
+# 3. Point the harness at it, with a generated member code read inside the container
+amplifier-digital-twin exec teamwork-e2e -- bash -c '
+  CODE=$(python3 -c "import json;print(json.load(open(\"/root/tw-server/.local/access.json\"))[\"members\"][0][\"token\"])")
+  python3 /root/dtu/run_e2e.py --ref <branch> --workdir /root/e2e-real \
+    --service-url http://localhost:8090 --member-name Alex --member-code "$CODE" \
+    --no-canary --skip-opt-out --prompt "Name one task in this project, or say none."'
+```
+
+Two things cost real time to discover, so they are written down rather than rediscovered:
+
+- **Port 8080 is the twin's own mitmdump proxy.** Starting the app there fails with
+  `Address already in use`, and every request to it returns a proxy `502 Bad Gateway`.
+  Use another port. Host-side `curl` must also pass `--noproxy '*'`.
+- **The `Origin` must match the server's public origin exactly.** `local_dev.py` sets
+  `TEAMWORK_PUBLIC_ORIGIN=http://localhost:<port>`, so enrolling against
+  `http://127.0.0.1:8090` is refused with **403** while `http://localhost:8090` succeeds.
+  Same host, different string. A stub written to accept what the hook sends cannot
+  surface this class of defect at all.
+
+The member codes live in the app's `.local/access.json` inside the container at mode 600.
+Read them there; do not copy them onto the host or into a transcript.
+
+Observed on this path, against the real implementation rather than the stub: enrollment
+through the real `/api/login` and `/api/harnesses`, a mode-600 connection file with the
+member code absent, and after one real session the server's own `/api/state` holding one
+session (`Amplifier shared session`, status `completed`), one turn carrying the visible
+prompt, one agent response and one hook injection, and one context receipt
+(`harness_input_accepted`, `verification: adapter_reported`, items marked `derived`).
+
+Seven traffic-derived checks report `SKIP` on this path, because a real server publishes
+no request log. They are recoverable from the server's own records instead; that is not
+implemented here, and the run does not pretend otherwise.
 
 ## Host-configuration mode (settings.yaml + keys.env)
 
@@ -121,15 +178,19 @@ pretend to.
 
 ## What a PASS does not establish
 
-- **The deployed service contract.** The stub's response shapes are written from
-  the hook's own reader, not captured from the hosted service. A schema change
-  upstream would not be detected here.
+- **The deployed service contract, in stub mode.** The stub's response shapes are
+  written from the hook's own reader, not captured from the hosted service, so a schema
+  change upstream would not be detected. Running the app source in the twin (above)
+  removes that circularity for everything it covers; the *hosted deployment* remains a
+  separate question from the *implementation*, since only the deployment can show
+  hosting, migration and real credential lifecycle behaviour.
 - Provider comprehension, agreement, or attention. Only that the excerpt was
   present in the conversation the provider received.
 - Credential scope enforcement, expiry, revocation, or any real conflict
-  semantics. The stub issues and accepts its own credentials; it does not enforce the
-  scopes it records, so a least-privilege claim about the deployed service is not
-  established here.
+  semantics in stub mode: the stub issues and accepts its own credentials and does not
+  enforce the scopes it records. Against the real server the credential is genuinely
+  issued and checked, but expiry, revocation and conflict paths are still not exercised
+  by this run.
 - Any other participant's installation, host, or orchestrator.
 
 The `--crowded` check is red-on-violation, not decorative: run against the code before
