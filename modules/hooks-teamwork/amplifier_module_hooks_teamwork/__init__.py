@@ -65,6 +65,9 @@ RENDER_ORDER = {"message": 0, "project": 1, "plan": 2, "work": 3, "request": 4, 
 VERBOSITY_LEVELS = ("silent", "summary", "detail")
 VERBOSITY_DEFAULT = "summary"
 SUMMARY_NAMED = 5
+# Presence says what a session is doing, not what it said. Kept short on purpose:
+# a longer field invites pasting the prompt, which is what the turn record is for.
+PRESENCE_SUMMARY = 200
 
 
 def verbosity(config):
@@ -187,6 +190,9 @@ class TeamworkHook:
         self.node_label = node_label
         self.agent_version = 0
         self.agent_status = "unregistered"
+        self.presence_version = 0
+        self.presence_status = "unreported"
+        self.presence_summary = ""
         # Said once, on the first notice, so a misconfiguration is not silent.
         self.complaint = complaint
         self.client = client or HTTPClient(connection)
@@ -284,6 +290,44 @@ class TeamworkHook:
             return
         self.agent_version += 1
         self.agent_status = "registered"
+
+    def report_presence(self, state, summary=""):
+        """Say what this session is doing. Best effort, never queued.
+
+        Off the durable outbox for the same two reasons registration is: that queue
+        stops at its first failure, so a server that does not know this record kind
+        would wedge every later publish behind it; and presence replayed late is a
+        lie rather than a late truth -- an entry delivered forty minutes on says a
+        session is working when it has long stopped.
+
+        The summary is SELF-REPORTED. It is the session's own prompt subject, cleaned
+        and bounded by the same projection the shared excerpt uses -- never a model's
+        narrative of its own work, which would be unfalsifiable and always flattering.
+        """
+        if self.presence_status == "unavailable" or not self.entered:
+            return
+        # An idle session reports no NEW subject, which is not the same as having
+        # had none. Blanking it would empty the field almost whenever anyone looks,
+        # since a session is idle far more often than it is running; "idle, last on
+        # X" is both more useful and no less true, because `state` already says idle.
+        if summary:
+            self.presence_summary = self.clean(summary)[:PRESENCE_SUMMARY]
+        try:
+            self.client.request("publish", {"operations": [
+                {"op": "presence.upsert", "id": self.sid, "expected_version": self.presence_version,
+                 "data": {"session_id": self.sid, "state": state,
+                          "summary": self.presence_summary}}]}, uid())
+        except SyncError as error:
+            # Never fatal: sharing does not depend on being legible.
+            self.presence_status = "unavailable"
+            logger.info("Teamwork presence unavailable (HTTP %s; 0 means transport failure); "
+                        "sharing is unaffected", error.status)
+            return
+        self.presence_version += 1
+        self.presence_status = state
+
+    async def sense(self, state, summary=""):
+        await asyncio.to_thread(self.report_presence, state, summary)
 
     async def announce(self):
         await asyncio.to_thread(self.register_agent)
@@ -416,6 +460,10 @@ class TeamworkHook:
             omitted = len(prompt.encode()) > 60000
             self.state["turn"] = {"id": uid(), "prompt": "[Prompt omitted: exceeds sharing size limit]" if omitted else prompt, "omitted": omitted, "injections": [], "hook_run_id": uid(), "boundary": "prepared"}
             self.journal.save(self.sid, self.state)
+            # Reported before the turn rather than after it: "active" is only true
+            # while the turn is running, and a teammate asking "is anyone on this?"
+            # is asking about now.
+            await self.sense("active", "" if omitted else prompt)
             delivery_durable = False
             notice = None
             try:
@@ -473,6 +521,7 @@ class TeamworkHook:
             except SyncError: logger.warning("Teamwork visible response queued locally")
             # Refreshed after the turn, not before it: the user is not waiting on this.
             await self.announce()
+            await self.sense("idle")
         return hook_result()
 
     async def on_end(self, event, data):

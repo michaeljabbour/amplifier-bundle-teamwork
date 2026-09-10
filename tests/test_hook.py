@@ -10,7 +10,8 @@ import subprocess
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "modules/hooks-teamwork"))
 from amplifier_module_hooks_teamwork import (HTTPClient, Journal, TeamworkHook, SyncError, sha, NoRedirect,
-                                             mount, resolve_connection, describe, PERSON_FIELDS, verbosity)
+                                             mount, resolve_connection, describe, PERSON_FIELDS, verbosity,
+                                             PRESENCE_SUMMARY)
 
 
 class Context:
@@ -73,6 +74,66 @@ class HookTests(unittest.IsolatedAsyncioTestCase):
         """Only the durable-outbox traffic: registration rides a separate path."""
         return [r for r in self.client.requests
                 if r[0] == "publish" and any(o["op"] == op for o in r[1]["operations"])]
+
+    def presences(self):
+        return [r for r in self.client.requests
+                if r[0] == "publish" and any(o["op"] == "presence.upsert" for o in r[1]["operations"])]
+
+    async def test_a_running_turn_reports_itself_active(self):
+        await self.hook.on_start("session:start", {})
+        await self.hook.on_submit("prompt:submit", {"prompt": "Look at the deploy failure"})
+        sent = self.presences()
+        self.assertEqual(len(sent), 1)
+        operation = sent[0][1]["operations"][0]
+        self.assertEqual(operation["id"], self.hook.sid)
+        self.assertEqual(operation["data"]["state"], "active")
+        self.assertIn("deploy failure", operation["data"]["summary"])
+
+    async def test_a_finished_turn_reports_idle_rather_than_staying_active(self):
+        await self.hook.on_start("session:start", {})
+        await self.hook.on_submit("prompt:submit", {"prompt": "Look at the deploy failure"})
+        await self.hook.on_complete("prompt:complete", {"response": "Done"})
+        states = [r[1]["operations"][0]["data"]["state"] for r in self.presences()]
+        self.assertEqual(states, ["active", "idle"])
+        # One record, advancing -- not a second session appearing.
+        self.assertEqual({r[1]["operations"][0]["id"] for r in self.presences()}, {self.hook.sid})
+        self.assertEqual([r[1]["operations"][0]["expected_version"] for r in self.presences()], [0, 1])
+
+    async def test_going_idle_keeps_what_the_session_was_last_working_on(self):
+        await self.hook.on_start("session:start", {})
+        await self.hook.on_submit("prompt:submit", {"prompt": "Look at the deploy failure"})
+        await self.hook.on_complete("prompt:complete", {"response": "Done"})
+        idle = self.presences()[-1][1]["operations"][0]["data"]
+        self.assertEqual(idle["state"], "idle")
+        self.assertIn("deploy failure", idle["summary"])
+
+    async def test_the_reported_summary_is_bounded(self):
+        await self.hook.on_start("session:start", {})
+        await self.hook.on_submit("prompt:submit", {"prompt": "x" * 5000})
+        summary = self.presences()[0][1]["operations"][0]["data"]["summary"]
+        self.assertLessEqual(len(summary), PRESENCE_SUMMARY)
+
+    async def test_a_server_that_rejects_presence_does_not_disturb_the_session(self):
+        class Selective(Client):
+            def request(self, endpoint, body, key=None):
+                operations = body.get("operations") if isinstance(body, dict) else None
+                if operations and any(o["op"] == "presence.upsert" for o in operations):
+                    self.requests.append((endpoint, json.loads(json.dumps(body)), key))
+                    raise SyncError(400)
+                return super().request(endpoint, body, key)
+
+        self.client = Selective(self.events)
+        hook = TeamworkHook(Coordinator(self.context), self.connection, self.journal, self.client)
+        await hook.on_start("session:start", {})
+        await hook.on_submit("prompt:submit", {"prompt": "My prompt"})
+        await hook.on_complete("prompt:complete", {"response": "Visible response"})
+        self.assertEqual(hook.presence_status, "unavailable")
+        # Tried once, then stopped -- a refusal does not accumulate.
+        self.assertEqual(len(self.presences()), 1)
+        # And the turn was still shared.
+        self.assertTrue(any(o["op"] == "turn.upsert"
+                            for r in self.client.requests if r[0] == "publish"
+                            for o in r[1]["operations"]))
 
     def registrations(self):
         return [r for r in self.client.requests
