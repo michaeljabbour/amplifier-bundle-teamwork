@@ -78,6 +78,12 @@ PRESENCE_SUMMARY = 200
 # Filing is bounded per turn so a burst of inbound mail cannot stretch one prompt.
 # What is left over is filed on a later turn: a report delivered late is still true.
 REPORT_BATCH = 5
+# A message the mirror cannot yet publish (transport failure, an unrecognised
+# status, a service outage) is retried once per turn -- but not forever. Past
+# this many attempts it stops being retried and the local queue is named as the
+# durable copy, rather than silently retrying every turn for the life of the
+# session.
+MIRROR_MAX_ATTEMPTS = 5
 
 
 def verbosity(config):
@@ -203,6 +209,10 @@ class TeamworkHook:
         # once rather than at every turn, while the probe itself keeps retrying --
         # a report filed two turns late is still true, unlike a replayed heartbeat.
         self.queue_said = None
+        # A 403 means this credential lacks shared:write. Said once, and then
+        # mirroring stops entirely for the rest of the session -- not just the
+        # notice -- rather than asking again on every turn (see `mirror`).
+        self.mirror_said = False
         # Supplied, never discovered: a hostname can carry an employer, a project
         # codename, or a person's name. Absent means the server applies its default.
         self.node_label = node_label
@@ -541,6 +551,102 @@ class TeamworkHook:
         pending.sort(key=lambda record: (record.get("content") or {}).get("sent_at") or "")
         return pending
 
+    def own_person_id(self):
+        """The receiving person for this session, from its own cached agent record.
+
+        Never `/api/me`: harness credentials are refused on every path outside
+        `/api/v1/projects/<p>/...`, so the agent record's `owner_person_id` --
+        the same source `TasksTool.project()` already reads -- is the only
+        legitimate source. Absent until this session's own agent record has
+        synced back, in which case mirroring is retried on a later turn.
+        """
+        for source in self.state.get("cache", {}).values():
+            record = source.get("record") or {}
+            content = record.get("content") or {}
+            if record.get("record_type") == "agent" and content.get("id") == self.sid:
+                return content.get("owner_person_id")
+        return None
+
+    def mirror(self, record, item):
+        """Best-effort mirror of one filed report to the shared project, so the
+        receiving side's inbound mail is visible centrally, not just locally.
+
+        Deliberately off the durable outbox (D6 in the coordination
+        observability plan): that queue is strictly ordered and stops at its
+        first failure, so a credential without `shared:write` would wedge
+        every later publish behind a record it cannot write. Sent directly,
+        the same way registration and presence are.
+
+        Never blocks or fails local filing -- `item` already landed by the
+        time this runs. A 403 disables mirroring for the rest of this session
+        (not just its notice, which is said once); a 409 means another turn or
+        process already mirrored the same message, so it counts as success;
+        anything else leaves the message unmirrored and is retried on a later
+        turn, up to `MIRROR_MAX_ATTEMPTS` -- past that it stops being retried,
+        is recorded as given up (rather than as mirrored, which it never was),
+        and is named once. The report itself is never at risk: it is already
+        durable in the local queue regardless of any of this.
+        """
+        mid = record.get("id")
+        mirrored = self.state.setdefault("mirrored", {})
+        if not mid or mid in mirrored or self.mirror_said:
+            return None
+        person_id = self.own_person_id()
+        if not person_id:
+            return None
+        operation = reports.mirror_operation(
+            record, reports.sender(record, self.people())[0], person_id,
+            self.connection["project_id"], self.connection["base_url"])
+        try:
+            self.client.request("publish", {"operations": [operation]}, uid())
+        except SyncError as error:
+            if error.status == 409:
+                mirrored[mid] = operation["id"]
+                self.journal.save(self.sid, self.state)
+                return None
+            if error.status == 403:
+                self.mirror_said = True
+                return ("This project's service does not yet allow mirroring inbound reports "
+                        "centrally (it needs the shared-write permission); reports stay filed "
+                        "locally only.")
+            # 404 / other / transport: bounded retry, then give up rather than
+            # trying forever, every turn, for the life of the session.
+            attempts = self.state.setdefault("mirror_attempts", {})
+            attempts[mid] = attempts.get(mid, 0) + 1
+            if attempts[mid] >= MIRROR_MAX_ATTEMPTS:
+                mirrored[mid] = {"status": "gave_up", "reason": error.status or "transport"}
+                del attempts[mid]
+                self.journal.save(self.sid, self.state)
+                return ("Could not mirror inbound report %s to the shared project after %d attempts; "
+                        "it stays filed locally only." % (mid, MIRROR_MAX_ATTEMPTS))
+            self.journal.save(self.sid, self.state)
+            return None
+        mirrored[mid] = operation["id"]
+        self.journal.save(self.sid, self.state)
+        return None
+
+    def retry_mirrors(self):
+        """Reattempt mirroring for reports already filed but not yet mirrored.
+
+        A message once filed never reappears in `unfiled()`, so nothing else
+        would ever give a failed mirror another try -- this runs every turn,
+        independent of new inbound mail, bounded the same way filing itself is.
+        """
+        filed = self.state.get("filed", {})
+        mirrored = self.state.get("mirrored", {})
+        outstanding = [mid for mid, item in filed.items()
+                       if mid not in mirrored and isinstance(item, str)
+                       and not item.startswith("refused:") and not item.startswith("acceptance_unknown:")]
+        lines = []
+        for mid in outstanding[:REPORT_BATCH]:
+            source = self.state.get("cache", {}).get("message:" + mid)
+            if source is None:
+                continue
+            notice = self.mirror(source["record"], filed[mid])
+            if notice:
+                lines.append(notice)
+        return lines
+
     def file_reports(self):
         """File newly arrived messages as reports. Returns a line to show, or None.
 
@@ -549,9 +655,10 @@ class TeamworkHook:
         on a later turn. Delivery to the model already happened above and does not
         depend on any of this.
         """
+        lines = self.retry_mirrors() if self.filing is not None else []
         pending = self.unfiled()
         if not pending or self.filing is None:
-            return None
+            return "\n".join(lines) or None
         if self.filing.name is None:
             try:
                 self.filing.ready()
@@ -560,10 +667,11 @@ class TeamworkHook:
                 # retrying, so a queue created mid-session starts working.
                 said, self.queue_said = self.queue_said, str(reason)
                 if said == str(reason):
-                    return None
-                return ("%d inbound message(s) reached this turn but no local work queue took them: %s. "
-                        "They remain in the shared project; nothing was queued on this machine."
-                        % (len(pending), reason))
+                    return "\n".join(lines) or None
+                lines.append("%d inbound message(s) reached this turn but no local work queue took them: %s. "
+                              "They remain in the shared project; nothing was queued on this machine."
+                              % (len(pending), reason))
+                return "\n".join(lines)
         self.queue_said = None
         people = self.people()
         filed, refused, unknown = [], [], []
@@ -591,13 +699,16 @@ class TeamworkHook:
             except reports.QueueUnavailable as reason:
                 self.queue_said = str(reason)
                 self.journal.save(self.sid, self.state)
-                return ("Could not file %d inbound message(s) into %s: %s. They stay in the shared "
-                        "project and will be filed on a later turn."
-                        % (len(pending), self.filing.name, reason))
+                lines.append("Could not file %d inbound message(s) into %s: %s. They stay in the shared "
+                              "project and will be filed on a later turn."
+                              % (len(pending), self.filing.name, reason))
+                return "\n".join(lines)
             self.state["filed"][record["id"]] = item
             filed.append(item)
+            notice = self.mirror(record, item)
+            if notice:
+                lines.append(notice)
         self.journal.save(self.sid, self.state)
-        lines = []
         if filed:
             lines.append("Filed into the local queue %s as reports \u2014 the sender's words, unedited; "
                          "nothing was executed:" % self.filing.name)

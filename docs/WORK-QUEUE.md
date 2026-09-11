@@ -152,6 +152,33 @@ records no sending *agent* id, so a report attributes to a person and a harness
 and stops there. A sender whose person record was not delivered is identified by
 id rather than by an invented name.
 
+## Mirrored to the shared project
+
+A filed report is also best-effort mirrored to the shared project, as a
+`request` addressed to the person who received it: a 500-character excerpt of
+the message plus a pointer to the full text, and an evidence reference to the
+message record itself. This is a **shared view**, not a second authority --
+the local queue stays where the item is claimed, triaged, and resolved; the
+mirror just makes the fact that mail is pending visible to anyone looking at
+the project centrally, not only to whoever is at this machine.
+
+The mirror never blocks or fails the local filing. It is sent directly, off
+the durable outbox that other project writes use: that queue is strictly
+ordered and stops at its first failure, and a credential that cannot write
+requests yet must not wedge every later publish behind a record it will never
+be allowed to send. Idempotent by construction -- the mirrored request's id is
+derived from the message id, so filing the same message twice (a restart, a
+retried turn) mirrors it at most once, tracked the same way locally-filed
+messages already are.
+
+An older credential without the shared-write permission gets a 403. That
+degrades to one notice for the whole session -- mirroring is not retried
+after that, only the local queue keeps working. Any other failure (the
+service unreachable, an unexpected status) leaves the message unmirrored and
+tries again on a later turn; a version conflict (another turn or process
+already mirrored it) counts as success. None of this is ever reported as an
+error: the report was already filed locally by the time any of it happens.
+
 ## Triaging one
 
 Claim it the way you claim anything else — **`bd ready --claim` / `work_claim`,

@@ -948,5 +948,154 @@ class WorkToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any("add" in n or "create" in n or "new" in n for n in mounted))
 
 
+def mirror_message(mid="msg-1", body="Please look at the relay timeouts.", person="person-alex"):
+    content = {"id": mid, "body": body, "from_person_id": person, "from_harness_id": "harness-7",
+               "sent_at": "2026-09-10T10:00:00Z", "created_by": person}
+    return {"key": "message:%s:1" % mid, "id": mid, "version": 1, "record_type": "message",
+            "change": "upsert", "content": content, "content_sha256": "hash-" + mid}
+
+
+def mirror_agent(sid, owner="person-jamie"):
+    return {"key": "agent:%s:1" % sid, "id": sid, "version": 1, "record_type": "agent",
+            "change": "upsert", "content": {"id": sid, "owner_person_id": owner}, "content_sha256": "agent-" + sid}
+
+
+class FakeFiling:
+    """An in-memory local queue: files land immediately, no subprocess involved."""
+
+    def __init__(self):
+        self.name = "teamwork"
+        self.filed = {}
+
+    def ready(self):
+        return self.name
+
+    def file(self, message_id, item_title, item_description):
+        self.filed[message_id] = item_title
+        return "tw-" + message_id
+
+
+class MirrorClient:
+    """Serves one inbound message plus its sender's agent record; `publish` of a
+    `request.upsert` op can be made to fail with a chosen HTTP status."""
+
+    def __init__(self, records, fail_status=None):
+        self.records, self.fail_status, self.requests = records, fail_status, []
+
+    def request(self, endpoint, body, key=None):
+        self.requests.append((endpoint, json.loads(json.dumps(body)), key))
+        if endpoint == "context":
+            return {"next_cursor": "c", "delivery_id": "d", "has_more": False, "truncated": False,
+                    "items": self.records}
+        if endpoint == "publish":
+            operations = body.get("operations") or []
+            if self.fail_status and any(o.get("op") == "request.upsert" for o in operations):
+                raise SyncError(self.fail_status)
+        return {"stored": True}
+
+
+class Mirror(unittest.IsolatedAsyncioTestCase):
+    """A filed report is best-effort mirrored to the shared project as a request."""
+
+    async def asyncSetUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        self.connection = {"base_url": "https://team.example.invalid", "project_id": "teamwork",
+                           "token": "test-credential-no-real-secret"}
+        self.journal_path = Path(self.tmp.name) / "queue.db"
+
+    def build(self, fail_status=None, owner="person-jamie", mid="msg-1", body=None, journal=None):
+        journal = journal or Journal(self.journal_path)
+        client = MirrorClient([], fail_status)
+        hook = TeamworkHook(Coordinator(Context([])), self.connection, journal, client, filing=FakeFiling())
+        message = mirror_message(mid=mid, body=body) if body else mirror_message(mid=mid)
+        message["content"]["to_agent_id"] = hook.sid
+        client.records = [message, mirror_agent(hook.sid, owner)]
+        return hook, client
+
+    def mirror_ops(self, client):
+        return [op for endpoint, body, _ in client.requests if endpoint == "publish"
+                for op in body["operations"] if op["op"] == "request.upsert"]
+
+    async def test_filing_publishes_request_upsert(self):
+        hook, client = self.build()
+        await hook.on_submit("prompt:submit", {"prompt": "hi"})
+        ops = self.mirror_ops(client)
+        self.assertEqual(len(ops), 1)
+        self.assertEqual(ops[0]["id"], "inbound-msg-1")
+
+    async def test_mirror_uses_own_person_id_from_agent_cache(self):
+        hook, client = self.build(owner="person-jamie")
+        await hook.on_submit("prompt:submit", {"prompt": "hi"})
+        self.assertEqual(self.mirror_ops(client)[0]["data"]["requested_person_id"], "person-jamie")
+
+    async def test_mirror_403_degrades_to_one_notice(self):
+        hook, client = self.build(fail_status=403)
+        result = await hook.on_submit("prompt:submit", {"prompt": "hi"})
+        self.assertIn("does not yet allow mirroring", result.user_message)
+        second_message = mirror_message(mid="msg-2")
+        second_message["content"]["to_agent_id"] = hook.sid
+        client.records.append(second_message)
+        second = await hook.on_submit("prompt:submit", {"prompt": "again"})
+        self.assertNotIn("does not yet allow mirroring", second.user_message or "")
+        # Disabled for the rest of the session, not just the notice: one attempt only.
+        self.assertEqual(len(self.mirror_ops(client)), 1)
+
+    async def test_mirror_409_counts_as_mirrored(self):
+        hook, client = self.build(fail_status=409)
+        await hook.on_submit("prompt:submit", {"prompt": "hi"})
+        self.assertEqual(hook.state["mirrored"]["msg-1"], "inbound-msg-1")
+        await hook.on_submit("prompt:submit", {"prompt": "again"})
+        self.assertEqual(len(self.mirror_ops(client)), 1)
+
+    async def test_mirror_failure_never_blocks_local_filing(self):
+        hook, client = self.build(fail_status=500)
+        result = await hook.on_submit("prompt:submit", {"prompt": "hi"})
+        self.assertEqual(hook.state["filed"]["msg-1"], "tw-msg-1")
+        self.assertNotIn("msg-1", hook.state.get("mirrored", {}))
+        self.assertIn("Filed into the local queue", result.user_message)
+
+    async def test_mirror_is_idempotent_across_turns(self):
+        hook, client = self.build(fail_status=None)
+        await hook.on_submit("prompt:submit", {"prompt": "hi"})
+        self.assertEqual(len(self.mirror_ops(client)), 1)
+        resumed = TeamworkHook(Coordinator(Context([])), self.connection, Journal(self.journal_path), client,
+                               filing=FakeFiling())
+        self.assertEqual(resumed.sid, hook.sid)
+        await resumed.on_submit("prompt:submit", {"prompt": "again"})
+        self.assertEqual(len(self.mirror_ops(client)), 1)
+        self.assertEqual(resumed.state["mirrored"]["msg-1"], "inbound-msg-1")
+
+    async def test_mirror_gives_up_after_bounded_attempts_not_forever(self):
+        # A persistent non-403/409 failure must not turn into a lifetime retry:
+        # exactly MIRROR_MAX_ATTEMPTS tries, one notice, then silence.
+        hook, client = self.build(fail_status=422)
+        result = await hook.on_submit("prompt:submit", {"prompt": "1"})
+        for turn in range(2, 6):
+            result = await hook.on_submit("prompt:submit", {"prompt": str(turn)})
+        self.assertEqual(len(self.mirror_ops(client)), 5)
+        self.assertEqual(hook.state["mirrored"]["msg-1"], {"status": "gave_up", "reason": 422})
+        self.assertIn("after 5 attempts", result.user_message)
+        self.assertNotIn("msg-1", hook.state.get("mirror_attempts", {}))
+        # A sixth turn makes no further attempt: it already gave up.
+        sixth = await hook.on_submit("prompt:submit", {"prompt": "6"})
+        self.assertEqual(len(self.mirror_ops(client)), 5)
+        self.assertNotIn("after 5 attempts", sixth.user_message or "")
+
+    async def test_mirror_is_deferred_not_lost_until_the_agent_record_is_cached(self):
+        # On the very first turn this session's own agent record has not
+        # synced back yet, so owner_person_id is unknown. The mirror must
+        # defer rather than fail or give up -- and try again once it is known.
+        hook, client = self.build()
+        client.records = [r for r in client.records if r["record_type"] != "agent"]
+        await hook.on_submit("prompt:submit", {"prompt": "hi"})
+        self.assertEqual(hook.state["filed"]["msg-1"], "tw-msg-1")
+        self.assertNotIn("msg-1", hook.state.get("mirrored", {}))
+        self.assertEqual(self.mirror_ops(client), [])
+        client.records.append(mirror_agent(hook.sid))
+        await hook.on_submit("prompt:submit", {"prompt": "again"})
+        self.assertEqual(len(self.mirror_ops(client)), 1)
+        self.assertEqual(hook.state["mirrored"]["msg-1"], "inbound-msg-1")
+
+
 if __name__ == '__main__':
     unittest.main()
