@@ -31,7 +31,32 @@ hint (mount stays inert, no HTTP call, notice fires once); and `teamwork_bind`'s
 local-first auto-bind (single match, ambiguous match, network-discover
 fallback, no-git-remote case) against a fixture native connection directory.
 `scripts/validate_bundle.py` passes (schema, composition, isolated local
-prepare, standalone replay). None of this exercises a real Entra tenant, a
+prepare, standalone replay).
+
+**The 111-test result was reproduced in two environments**, to guard against
+the `sys.modules["azure.identity"]` stub only working because a real
+`azure-identity` package (and therefore a real `azure` parent module) was
+already importable:
+
+1. The Amplifier CLI's own Python environment (`azure-identity` genuinely
+   installed, via `amplifier_module_provider_azure_openai`) -- `Ran 111 tests
+   in 10.590s / OK`.
+2. A throwaway venv holding only `amplifier-core==1.6.1` (installed from
+   PyPI) and the stdlib, with **no `azure` namespace package at all**
+   (`import azure` raises `ModuleNotFoundError`) -- `Ran 111 tests in
+   10.393s / OK`.
+
+The second environment is what actually exercises the "azure.identity is not
+installed" and "azure.identity is installed but unusable" branches
+faithfully: `entra.py`'s `import azure.identity` first imports the parent
+`azure` package, so a test stub that patches only `sys.modules["azure.identity"]`
+silently passes on a host where `azure` happens to already be importable, and
+would instead raise `ModuleNotFoundError: No module named 'azure'` on a truly
+clean host -- masking exactly the failure `EntraUnavailable` exists to catch
+cleanly. `tests/test_entra.py`'s stub now seeds both `sys.modules["azure"]`
+and `sys.modules["azure.identity"]` for this reason.
+
+None of this exercises a real Entra tenant, a
 real Azure Container Apps deployment, or a real GitHub repository beyond
 string-level canonicalization.
 

@@ -11,7 +11,14 @@ from amplifier_module_hooks_teamwork import entra
 
 
 def stub_azure_identity(get_token):
-    """A fake `azure.identity` module carrying only what entra.py touches."""
+    """Fake `azure` + `azure.identity` modules carrying only what entra.py touches.
+
+    `import azure.identity` first imports the parent `azure` package. On a
+    clean venv with no real `azure` namespace package installed, patching only
+    `sys.modules["azure.identity"]` is not enough: Python still tries (and
+    fails) to import the real `azure` parent first. Both must be seeded.
+    """
+    parent = types.ModuleType("azure")
     module = types.ModuleType("azure.identity")
 
     class AzureCliCredential:
@@ -19,7 +26,8 @@ def stub_azure_identity(get_token):
             return get_token(scope)
 
     module.AzureCliCredential = AzureCliCredential
-    return module
+    parent.identity = module
+    return parent, module
 
 
 class EntraTokenTests(unittest.TestCase):
@@ -34,7 +42,8 @@ class EntraTokenTests(unittest.TestCase):
             calls.append(scope)
             return types.SimpleNamespace(token="fixture-token", expires_on=time.time() + 3600)
 
-        with patch.dict(sys.modules, {"azure.identity": stub_azure_identity(get_token)}):
+        parent, module = stub_azure_identity(get_token)
+        with patch.dict(sys.modules, {"azure": parent, "azure.identity": module}):
             first = entra.access_token("scope-a")
             second = entra.access_token("scope-a")
         self.assertEqual(first, "fixture-token")
@@ -48,15 +57,18 @@ class EntraTokenTests(unittest.TestCase):
             calls.append(scope)
             return types.SimpleNamespace(token="fixture-token-%d" % len(calls), expires_on=time.time() + 100)
 
-        with patch.dict(sys.modules, {"azure.identity": stub_azure_identity(get_token)}):
+        parent, module = stub_azure_identity(get_token)
+        with patch.dict(sys.modules, {"azure": parent, "azure.identity": module}):
             first = entra.access_token("scope-b")
             second = entra.access_token("scope-b")
         self.assertEqual(len(calls), 2)
         self.assertNotEqual(first, second)
 
     def test_missing_azure_identity_raises_a_run_az_login_message(self):
+        parent = types.ModuleType("azure")
         broken = types.ModuleType("azure.identity")  # no AzureCliCredential attribute
-        with patch.dict(sys.modules, {"azure.identity": broken}):
+        parent.identity = broken
+        with patch.dict(sys.modules, {"azure": parent, "azure.identity": broken}):
             with self.assertRaises(entra.EntraUnavailable) as raised:
                 entra.access_token("scope-c")
         message = str(raised.exception)
@@ -65,7 +77,8 @@ class EntraTokenTests(unittest.TestCase):
         self.assertNotIn("Traceback", message)
 
     def test_available_reflects_importability(self):
-        with patch.dict(sys.modules, {"azure.identity": stub_azure_identity(lambda scope: None)}):
+        parent, module = stub_azure_identity(lambda scope: None)
+        with patch.dict(sys.modules, {"azure": parent, "azure.identity": module}):
             self.assertTrue(entra.available())
         # `sys.modules[name] = None` is the documented way to make Python's
         # import system raise ImportError for that name, simulating a host
