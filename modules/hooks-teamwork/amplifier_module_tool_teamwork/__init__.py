@@ -100,7 +100,7 @@ def _reuse_saved_connection(path, base, project):
         raise ConsentError("The saved connection file is not private.", None,
                            "Restore mode 0600 on the saved connection file, then retry.")
     try:
-        saved = json.loads(path.read_text())
+        saved = json.loads(path.read_text(encoding="utf-8"))
     except ValueError:
         raise ConsentError("The saved connection file is unreadable.", None,
                            "Revoke that harness in Teamwork, delete the saved file, then enroll again.") from None
