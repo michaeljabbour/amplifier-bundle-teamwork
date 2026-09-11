@@ -14,8 +14,14 @@ import urllib.request
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .service_url import validate_service_url
+
+# The old default origin, severed in the hard cutover: everyone re-enrolls
+# against the new default via `amplifier update` then `teamwork_connect`.
+RETIRED_HOSTS = ("team.amplifier.run",)
+RETIRED_MESSAGE = "Teamwork moved \u2014 run `amplifier update`, then `teamwork_connect`."
 
 __amplifier_module_type__ = "hook"
 logger = logging.getLogger(__name__)
@@ -525,6 +531,8 @@ class TeamworkHook:
                 if not delivery_durable and self.state.get("turn", {}).get("prepared_injection"):
                     self.state["turn"]["boundary"] = "acceptance_unknown"
                     self.state["turn"]["injections"] = []
+                if isinstance(error, SyncError) and error.status == 410:
+                    notice = RETIRED_MESSAGE
                 logger.warning("Teamwork sync pending; no unobserved delivery is acknowledged (HTTP %s; 0 means transport/input failure)", getattr(error, "status", 0))
             return hook_result(notice)
 
@@ -603,6 +611,9 @@ def resolve_connection(config):
     if not connection.get("base_url"):
         raise ValueError("Teamwork service URL required")
     connection["base_url"] = validate_service_url(connection["base_url"])
+    if urlsplit(connection["base_url"]).hostname in RETIRED_HOSTS:
+        # Deterministic, no network: a retired origin must never spin.
+        raise ValueError(RETIRED_MESSAGE)
     if not connection.get("token"):
         raise ValueError("Teamwork enrolled harness credential required")
     return connection, home
@@ -830,7 +841,22 @@ async def mount(coordinator, config=None):
         return None
     if config.get("share_visible_turns") is not True:
         raise ValueError("Teamwork hook requires explicit share_visible_turns: true opt-in")
-    connection, home = resolve_connection(config)
+    try:
+        connection, home = resolve_connection(config)
+    except ValueError as error:
+        if str(error) != RETIRED_MESSAGE:
+            raise
+        # Stay inert but say so once: a mount exception is silently absorbed
+        # by the host (see verbosity()'s docstring), so raising alone would
+        # say nothing. The handler unregisters itself after firing once.
+        name = "teamwork-retired-notice"
+
+        async def _retired_notice(event, data):
+            coordinator.hooks.unregister(name)
+            return hook_result(RETIRED_MESSAGE)
+
+        coordinator.hooks.register("prompt:submit", _retired_notice, priority=50, name=name)
+        return None
     if not connection.get("project_id"):
         # Persisted settings carry the service and the credential; the project is
         # chosen per session. Stay inert until a tool binds one.

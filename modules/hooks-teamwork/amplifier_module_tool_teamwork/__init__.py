@@ -13,8 +13,9 @@ import urllib.request
 import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
-from amplifier_module_hooks_teamwork import entra, git_remote, mount as mount_hook, sha
+from amplifier_module_hooks_teamwork import RETIRED_HOSTS, RETIRED_MESSAGE, entra, git_remote, mount as mount_hook, sha
 from amplifier_module_hooks_teamwork.service_url import DEFAULT_BASE_URL, service_origin, validate_service_url
 from amplifier_module_hooks_teamwork import NoRedirect
 from amplifier_module_tool_teamwork.page import form_page, result_page
@@ -488,6 +489,8 @@ class TeamworkConnect:
         from amplifier_core import ToolResult
         if input:
             return ToolResult(success=False, error={"message": "This tool accepts no arguments. Enter information only in the private browser form."})
+        if urlsplit(self.base).hostname in RETIRED_HOSTS:
+            return ToolResult(success=False, error={"message": RETIRED_MESSAGE})
         async with self.lock:
             rebind = self.coordinator.get_capability("teamwork.rebind")
             stop = threading.Event()
@@ -536,6 +539,9 @@ class TeamworkBind:
         project = str((input or {}).get("project_id", "")).strip()
         if not project:
             return ToolResult(success=False, error={"message": "A project id is required."})
+        configured_base = self.config.get("base_url")
+        if configured_base and urlsplit(configured_base).hostname in RETIRED_HOSTS:
+            return ToolResult(success=False, error={"message": RETIRED_MESSAGE})
         async with self.lock:
             rebind = self.coordinator.get_capability("teamwork.rebind")
             if rebind is not None:
