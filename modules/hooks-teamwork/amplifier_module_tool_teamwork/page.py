@@ -130,6 +130,10 @@ def form_page(nonce, csrf, style_nonce, service, minutes, values=None, error=Non
                else "Exactly as it appears in Teamwork, for example design/review.",
                extra=('' if project_optional else ' required')
                + ' maxlength="200" autocomplete="off" autocapitalize="off" spellcheck="false" autofocus')
+        + text("credential", "Credential from the portal", "optional",
+               "Paste a credential minted from Account menu \u2192 Manage my harnesses. "
+               "Takes precedence over the fields below.",
+               kind="password", extra=' autocomplete="off"')
         + text("name", "Name or email", code_label,
                "Leave blank if this project is already enrolled on this machine.",
                extra=' autocomplete="username"')

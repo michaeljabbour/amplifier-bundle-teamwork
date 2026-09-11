@@ -69,7 +69,14 @@ class ConsentCopyTests(unittest.TestCase):
                 code_input = re.search(r'<input id="code"[^>]*>', page)
                 self.assertIsNotNone(code_input)
                 self.assertNotIn("value=", code_input.group())
-                self.assertIn('type="password"', code_input.group())
+
+    def test_credential_field_renders_as_a_password_and_never_echoes(self):
+        page = form_page("nonce", "csrf", "style-nonce", BASE, 15)
+        credential_input = re.search(r'<input id="credential"[^>]*>', page)
+        self.assertIsNotNone(credential_input)
+        self.assertIn('type="password"', credential_input.group())
+        self.assertNotIn("value=", credential_input.group())
+        self.assertIn("Manage my harnesses", page)
 
 
 class Response:
