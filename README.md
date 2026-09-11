@@ -103,7 +103,11 @@ member-code fields remain the enrollment path and nothing else changes.
 
 `team.amplifier.run` (the old default) is retired. A session still configured to point at
 it gets a one-line hint -- run `amplifier update`, then `teamwork_connect` -- instead of a
-hang or a raw connection error.
+hang or a raw connection error. Re-enrolling against the new default origin creates a new
+`~/.config/amplifier-teamwork/native/<hash>/` folder (the hash is derived from the service
+URL and project, so a new origin means a new folder). Any folder left over from the old
+origin is simply unused after this cutover; the bundle never deletes files, so you may
+remove it yourself once you have confirmed you no longer need it.
 
 With no project configured the hook mounts **inert** -- it registers nothing and sends
 nothing -- until a session binds one.
