@@ -1,6 +1,47 @@
 # Validation evidence and limits
 
-## Live service and provider run (2026-09-09)
+## Hard cutover to the Azure web origin + Entra SSO + auto-bind (2026-09-10)
+
+This PR changes the default `base_url` to the Amplifier Online web origin
+(`https://amplifier-teamwork-web.livelysea-7d934004.westus2.azurecontainerapps.io`),
+adds Entra (`az login`) enrollment alongside the member-code path, adds local
+git-remote auto-bind for `teamwork_bind`, and retires `team.amplifier.run`.
+
+**A fresh, authorized live session against the new default origin (with a real
+`az login` mint, a real member-code mint, and a real `repository_url` mint) has
+not been run as part of this PR.** It is a required manual step before this
+bundle is tagged and released -- see the cutover order in the plan
+(`docs/plans/2026-09-10-hard-cutover-sso-autobind.md`, section 2, step 3-4) --
+and it cannot be attested here without fabricating evidence. What follows below
+is the complete local, mocked, and structural evidence gathered for this PR;
+it establishes the code paths are correct in isolation, not that a live `az
+login` mint or a live repository-scoped mint has ever succeeded end to end
+against a running service.
+
+### Local evidence for this PR
+
+All 111 unit tests pass (`tests/`), covering: the new `DEFAULT_BASE_URL`
+constant; local git-remote reading and canonical repository identity
+(`git_remote.py`, no network); the Entra token helper (`entra.py`, with
+`azure.identity` itself stubbed -- no real `az` CLI call is made in any test);
+the SSO-aware consent form copy and repository preview; the full Entra
+enrollment flow (mint-then-reserve ordering, 409/401/403 handling, conflict
+revocation and reuse) against a fixture HTTP opener; the retired-host inert
+hint (mount stays inert, no HTTP call, notice fires once); and `teamwork_bind`'s
+local-first auto-bind (single match, ambiguous match, network-discover
+fallback, no-git-remote case) against a fixture native connection directory.
+`scripts/validate_bundle.py` passes (schema, composition, isolated local
+prepare, standalone replay). None of this exercises a real Entra tenant, a
+real Azure Container Apps deployment, or a real GitHub repository beyond
+string-level canonicalization.
+
+## Live service and provider run (2026-09-09, pre-cutover)
+
+**This section predates the hard cutover above and describes the retired
+`team.amplifier.run` origin and the member-code-only enrollment flow. It is
+kept as historical evidence of the underlying delivery/receipt mechanism,
+which this PR does not change; it does not establish anything about the new
+default origin, Entra enrollment, or auto-bind.**
 
 An authorized operator run against the default hosted service (`https://team.amplifier.run`) with a real LLM provider, from a fresh `amplifier bundle update` of the `@main` behavior at merge commit `882f6b9`, observed:
 
