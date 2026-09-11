@@ -361,6 +361,61 @@ class PortalCredentialTests(unittest.TestCase):
             self.assertEqual(json.loads(path.read_text())['token'], 'existing-token')
 
 
+    def test_valid_credential_returns_422_from_the_real_endpoint_and_is_verified(self):
+        """Empirically confirmed against the live web origin: a valid token
+        scoped to the requested project returns 422 invalid_request ("Supply
+        1-20 operations") for a zero-operation batch -- not 2xx. An invalid
+        token returns 401 regardless of project; a valid token against the
+        WRONG project returns 404. This is the exact shape the service
+        returned; it must be treated as verified, not merely tolerated."""
+        requests = []
+        class Opener:
+            def open(self, request, **kwargs):
+                requests.append(request)
+                body = b'{"error": {"code": "invalid_request", "message": "Supply 1\xe2\x80\x9320 operations"}}'
+                raise urllib.error.HTTPError(request.full_url, 422, 'Unprocessable Entity', {}, io.BytesIO(body))
+        with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', return_value=Opener()):
+            path, project = connect(
+                {'project': 'portal-project', 'credential': 'portal-token', 'consent': 'yes'}, BASE, Path(home))
+            self.assertEqual(project, 'portal-project')
+            self.assertEqual(json.loads(path.read_text())['token'], 'portal-token')
+        self.assertEqual(len(requests), 1)
+
+    def test_credential_verification_5xx_is_not_treated_as_verified_and_writes_nothing(self):
+        class Opener:
+            def open(self, request, **kwargs):
+                raise urllib.error.HTTPError(request.full_url, 500, 'Internal Server Error', {}, io.BytesIO(b'{}'))
+        with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', return_value=Opener()):
+            with self.assertRaises(ConsentError) as raised:
+                connect({'project': 'portal-project', 'credential': 'portal-token', 'consent': 'yes'}, BASE, Path(home))
+        self.assertEqual(raised.exception.field, 'credential')
+        self.assertIn('could not verify', str(raised.exception).lower())
+        self.assertEqual(list(Path(home).rglob('connection.json')), [])
+
+    def test_credential_verification_unexpected_4xx_is_not_treated_as_verified_and_writes_nothing(self):
+        class Opener:
+            def open(self, request, **kwargs):
+                raise urllib.error.HTTPError(request.full_url, 404, 'Not Found', {}, io.BytesIO(b'{}'))
+        with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', return_value=Opener()):
+            with self.assertRaises(ConsentError) as raised:
+                connect({'project': 'portal-project', 'credential': 'portal-token', 'consent': 'yes'}, BASE, Path(home))
+        self.assertEqual(raised.exception.field, 'credential')
+        self.assertIn('could not verify', str(raised.exception).lower())
+        self.assertEqual(list(Path(home).rglob('connection.json')), [])
+
+    def test_credential_verification_timeout_is_not_treated_as_verified_and_writes_nothing(self):
+        import socket
+        class Opener:
+            def open(self, request, **kwargs):
+                raise socket.timeout('timed out')
+        with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', return_value=Opener()):
+            with self.assertRaises(ConsentError) as raised:
+                connect({'project': 'portal-project', 'credential': 'portal-token', 'consent': 'yes'}, BASE, Path(home))
+        self.assertEqual(raised.exception.field, 'credential')
+        self.assertIn('could not verify', str(raised.exception).lower())
+        self.assertEqual(list(Path(home).rglob('connection.json')), [])
+
+
 class BrowserTests(unittest.TestCase):
     def drive(self, act, timeout=5, home='/unused'):
         """Run the private form and let `act(url, origin)` play the browser's part."""

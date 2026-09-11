@@ -257,10 +257,17 @@ def _verify_portal_credential(base, project, token):
     """Verify a portal-minted credential with the least side-effecting
     authenticated call available: a publish batch with zero operations.
 
-    Any response other than 401/403 means the bearer authenticated -- that is
-    all this check is for; it makes no claim about project membership or
-    scope. A transport failure cannot confirm anything either way, so it is
-    reported rather than silently accepted.
+    Empirically confirmed against the live web origin (2026-09-10, reading
+    an already-enrolled native connection file's token in-process, token
+    never logged): this endpoint validates auth and project scope BEFORE it
+    ever inspects the operations list, so a genuinely valid token scoped to
+    this exact project returns 422 `invalid_request` ("Supply 1-20
+    operations") for a zero-operation batch -- not 2xx. An invalid token
+    returns 401 regardless of project. A valid token against the WRONG
+    project returns 404. So 422 (or an unexpected outright 2xx, should the
+    service's behavior ever change) is the positive signal; 401/403 is an
+    explicit rejection; anything else -- 404, 5xx, or a transport failure --
+    proves nothing either way and must not be treated as verified.
     """
     endpoint = "/api/v1/projects/" + project + "/publish"
     try:
@@ -272,12 +279,16 @@ def _verify_portal_credential(base, project, token):
                 "Copy a fresh credential from the portal (Account menu \u2192 Manage my harnesses), "
                 "then submit again.",
             ) from None
-        # Any other status (2xx, or an application-level 4xx like 404/422) means
-        # the bearer authenticated; that is all this check verifies.
-    except (urllib.error.URLError, OSError) as error:
+        if error.status == 422:
+            return
         raise ConsentError(
-            "Could not verify that credential; the service could not be reached.", "credential",
-            "Check your connection and try again.",
+            "Could not verify that credential with the service; try again.", "credential",
+            "The service did not confirm or reject the credential. Try again in a moment.",
+        ) from None
+    except Exception as error:
+        raise ConsentError(
+            "Could not verify that credential with the service; try again.", "credential",
+            "The service did not confirm or reject the credential. Try again in a moment.",
         ) from error
 
 
