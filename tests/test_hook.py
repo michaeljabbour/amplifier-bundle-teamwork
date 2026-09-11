@@ -1100,8 +1100,9 @@ class Mirror(unittest.IsolatedAsyncioTestCase):
 class SendClient:
     """Serves whatever `context` payload the test sets and records every publish."""
 
-    def __init__(self, fail_status=None, message_status=None):
+    def __init__(self, fail_status=None, message_status=None, fail_body=None):
         self.fail_status, self.message_status, self.requests = fail_status, message_status or [], []
+        self.fail_body = fail_body
 
     def request(self, endpoint, body, key=None):
         self.requests.append((endpoint, json.loads(json.dumps(body)), key))
@@ -1110,7 +1111,7 @@ class SendClient:
                     "message_status": self.message_status}
         if endpoint == "publish":
             if self.fail_status:
-                raise SyncError(self.fail_status)
+                raise SyncError(self.fail_status, self.fail_body)
             return {"results": [{"id": body["operations"][0]["id"], "version": 1}]}
         return {"stored": True}
 
@@ -1118,10 +1119,10 @@ class SendClient:
 class Send(unittest.IsolatedAsyncioTestCase):
     """teamwork_send accepts exactly one recipient key and reports the message id."""
 
-    def build(self, fail_status=None):
+    def build(self, fail_status=None, fail_body=None):
         tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
         connection = {"base_url": "https://team.example.invalid", "project_id": "teamwork", "token": "t"}
-        client = SendClient(fail_status)
+        client = SendClient(fail_status, fail_body=fail_body)
         hook = TeamworkHook(Coordinator(Context([])), connection, Journal(Path(tmp.name) / "q.db"), client)
         return hook, client
 
@@ -1152,7 +1153,22 @@ class Send(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.requests, [])
 
     async def test_send_reports_ambiguous_recipient(self):
-        hook, _ = self.build(fail_status=409)
+        body = {"error": {"code": "ambiguous_recipient", "message": "More than one agent matches this address",
+                          "candidates": [{"agent_id": "a1", "node_label": "Blair's laptop", "owner": "Blair"},
+                                         {"agent_id": "a2", "node_label": "Blair's phone", "owner": "Blair"}]}}
+        hook, _ = self.build(fail_status=409, fail_body=body)
+        result = await SendTool(hook).execute({"to_person": "Blair", "body": "hi"})
+        self.assertFalse(result.success)
+        self.assertIn("a1", result.error["message"])
+        self.assertIn("Blair's laptop", result.error["message"])
+        self.assertIn("a2", result.error["message"])
+        self.assertIn("Blair's phone", result.error["message"])
+        self.assertIn("Retry with to_agent_id.", result.error["message"])
+
+    async def test_send_reports_ambiguous_recipient_generically_when_body_is_not_json(self):
+        # A non-JSON or malformed error body degrades to the generic 409
+        # message rather than raising or silently dropping the error.
+        hook, _ = self.build(fail_status=409, fail_body=None)
         result = await SendTool(hook).execute({"to_person": "Blair", "body": "hi"})
         self.assertFalse(result.success)
         self.assertIn("more than one agent answers to that name; address it by agent id", result.error["message"])
@@ -1181,6 +1197,24 @@ class MessageStatus(unittest.IsolatedAsyncioTestCase):
         await hook.retrieve()
         rendered, _ = hook.render()
         self.assertNotIn("Your recent messages:", rendered)
+
+    async def test_message_status_block_stays_bounded_and_stable_across_turns(self):
+        # The server bounds message_status to 20 entries; the injected block
+        # must not grow turn over turn when the underlying status is unchanged
+        # -- a per-turn-growing block would eventually crowd out the rest of
+        # the excerpt within its own byte budget.
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        connection = {"base_url": "https://team.example.invalid", "project_id": "teamwork", "token": "t"}
+        status = [{"id": "m%d" % i, "to_agent_id": "agent-%d" % i, "sent_at": "t", "delivered_at": None,
+                   "accepted_at": None, "state": "queued"} for i in range(20)]
+        client = SendClient(message_status=status)
+        hook = TeamworkHook(Coordinator(Context([])), connection, Journal(Path(tmp.name) / "q.db"), client)
+        await hook.retrieve()
+        first, _ = hook.render()
+        await hook.retrieve()  # a second turn; the service reports the same unchanged status
+        second, _ = hook.render()
+        self.assertEqual(len(first), len(second))
+        self.assertEqual(first.count(" -> "), 20)
 
 
 if __name__ == '__main__':

@@ -140,7 +140,7 @@ def describe(record, limit=140):
 
 
 class SyncError(Exception):
-    def __init__(self, status=0): self.status = status
+    def __init__(self, status=0, body=None): self.status, self.body = status, body
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -161,7 +161,20 @@ class HTTPClient:
         try:
             with urllib.request.build_opener(NoRedirect()).open(req, timeout=30) as response: return json.load(response)
         except urllib.error.HTTPError as error:
-            status = error.code; error.close(); raise SyncError(status) from None
+            status = error.code
+            # Read and parse the body BEFORE closing the response -- error.close()
+            # discards it, and the server's error payload (e.g. ambiguous_recipient's
+            # candidates) is otherwise lost. Bounded and best-effort: a non-JSON or
+            # oversized body degrades to no body, never to a raised exception here.
+            body = None
+            try:
+                raw = error.read(8192)
+                body = json.loads(raw.decode("utf-8", errors="replace"))
+            except Exception:
+                body = None
+            finally:
+                error.close()
+            raise SyncError(status, body) from None
         except (OSError, ValueError): raise SyncError() from None
 
 
@@ -1081,6 +1094,14 @@ class SendTool:
                                  "data": {**recipient, "body": body}}]}, uid())
         except SyncError as error:
             # Named plainly rather than retried: the model asked to send now.
+            candidates = None
+            if error.status == 409 and isinstance(error.body, dict):
+                candidates = (error.body.get("error") or {}).get("candidates")
+            if candidates:
+                lines = ["Not sent: more than one agent answers to that name:"]
+                lines += ["  %s \u2014 %s (%s)" % (c.get("agent_id"), c.get("node_label"), c.get("owner")) for c in candidates]
+                lines.append("Retry with to_agent_id.")
+                return ToolResult(success=False, error={"message": "\n".join(lines)})
             reason = ("that agent is not in this project" if error.status == 404
                       else "more than one agent answers to that name; address it by agent id" if error.status == 409
                       else "the project service refused the message (HTTP %s)" % error.status
