@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "modules/hooks-team
 
 from amplifier_module_hooks_teamwork import Journal, TeamworkHook
 from amplifier_module_hooks_teamwork.reports import (BODY_LIMIT, FilingUnknown, Queue, QueueUnavailable,
-                                                     description, sender, title)
+                                                     description, mirror_operation, sender, title)
 
 BODY = "Can you look at the relay timeouts before Thursday? We saw three drops."
 
@@ -63,6 +63,32 @@ class Words(unittest.TestCase):
     def test_a_known_sender_is_named_from_the_cached_person_record(self):
         name, _, _ = sender(message(), {"person-alex": {"id": "person-alex", "name": "Alex Stone"}})
         self.assertEqual(name, "Alex Stone")
+
+
+class Mirror(unittest.TestCase):
+    def test_mirror_payload_shape(self):
+        record = message()
+        op = mirror_operation(record, "Alex Stone", "person-jamie", "teamwork", "https://team.example.invalid")
+        self.assertEqual(op["op"], "request.upsert")
+        self.assertEqual(op["id"], "inbound-msg-1")
+        self.assertEqual(op["expected_version"], 0)
+        data = op["data"]
+        self.assertEqual(data["title"], "Inbound message from Alex Stone")
+        self.assertEqual(data["requested_person_id"], "person-jamie")
+        self.assertEqual(data["status"], "requested")
+        self.assertEqual(data["evidence_refs"],
+                         [{"kind": "record", "record_type": "message", "record_id": "msg-1", "version": 1}])
+        self.assertIn(BODY, data["description"])
+
+    def test_mirror_description_truncated_to_500_with_pointer(self):
+        record = message(body="z" * 900)
+        op = mirror_operation(record, "Alex", "person-jamie", "teamwork", "https://team.example.invalid")
+        description_text = op["data"]["description"]
+        head = description_text.split("\n\n")[0]
+        self.assertEqual(head, "z" * 500)
+        self.assertIn("teamwork", description_text)
+        self.assertIn("https://team.example.invalid", description_text)
+        self.assertIn("msg-1", description_text)
 
 
 class QueueBehaviour(unittest.TestCase):

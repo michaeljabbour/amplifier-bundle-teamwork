@@ -35,6 +35,10 @@ TITLE_LIMIT = 120
 # truncated body is no longer the sender's words, and filing it as though it were
 # is the one thing this path must never do.
 BODY_LIMIT = 65536
+# The mirrored request record is a shared-view pointer, not the report itself --
+# the local queue keeps the whole body. An excerpt is enough to identify what
+# arrived without duplicating the filing limit's own headroom.
+MIRROR_BODY_LIMIT = 500
 
 
 class QueueUnavailable(Exception):
@@ -128,6 +132,36 @@ def description(record, project_id, session_id, name):
         "Declining is a complete outcome: resolve this item saying so.",
     ]
     return "\n".join(lines)
+
+
+def mirror_operation(record, sender_name, requested_person_id, project_id, base_url):
+    """The publish operation that mirrors one filed report to the shared project.
+
+    A best-effort `request.upsert`, never queued on the durable outbox (see the
+    hook's own `mirror` docstring for why): a credential without `shared:write`
+    must not wedge every later publish behind a record it cannot write. `id`
+    is derived from the message id so republishing the same message is the
+    same idempotent write, not a duplicate request.
+    """
+    content = record.get("content") or {}
+    mid = record.get("id") or ""
+    body = (content.get("body") or "").strip()
+    excerpt = body[:MIRROR_BODY_LIMIT]
+    who = sender_name or content.get("from_person_id") or "an unidentified sender"
+    pointer = "\n\n\u2014 full message: teamwork project %s at %s, message %s" % (project_id, base_url, mid)
+    return {
+        "op": "request.upsert",
+        "id": "inbound-" + mid,
+        "expected_version": 0,
+        "data": {
+            "title": "Inbound message from %s" % who,
+            "description": excerpt + pointer,
+            "requested_person_id": requested_person_id,
+            "status": "requested",
+            "evidence_refs": [{"kind": "record", "record_type": "message",
+                               "record_id": mid, "version": record.get("version", 0)}],
+        },
+    }
 
 
 class Queue:
