@@ -326,6 +326,14 @@ AMP_PY="$AMPLIFIER_PY"
 
 Current and historical validation evidence is in [`docs/VALIDATION.md`](docs/VALIDATION.md). A clean current CLI smoke and an external-service smoke remain unverified. The current local-fixture checks do not prove a live Teamwork service, an external provider, another participant's machine, or every custom orchestrator. The bundle is intentionally narrow and is not a compatibility promise for every custom orchestrator.
 
+## Architecture and flows
+
+Diagrams and prose for how this fits together -- the two service planes, the consent
+boundary, the receipt contract, agent-to-agent messaging, and how an inbound message
+becomes queued work -- are in [`docs/architecture/ARCHITECTURE.md`](docs/architecture/ARCHITECTURE.md),
+with three Graphviz diagrams beside it. It also states plainly what is not designed
+yet, rather than implying it is.
+
 ## Bundle structure
 
 - `bundle.md` is the Foundation-based entry point.
