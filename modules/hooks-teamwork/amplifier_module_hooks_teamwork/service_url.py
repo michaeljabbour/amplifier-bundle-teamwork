@@ -4,6 +4,10 @@ from urllib.parse import urlsplit, urlunsplit
 
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
+# The Amplifier Online web origin (Azure Container Apps). One named constant
+# so every caller shares the same default instead of repeating the literal.
+DEFAULT_BASE_URL = "https://amplifier-teamwork-web.livelysea-7d934004.westus2.azurecontainerapps.io"
+
 
 def validate_service_url(value):
     """Return a normalized service URL or reject an ambiguous recipient."""

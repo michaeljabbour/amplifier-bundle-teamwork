@@ -19,9 +19,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "modules/hooks-team
 from amplifier_module_tool_teamwork import (announce, connect, ConsentAborted, ConsentError, POINTER_NAME,
                                             private_browser_connect, TeamworkConnect, TeamworkBind, mount)
 from amplifier_module_hooks_teamwork import sha
+from amplifier_module_hooks_teamwork import service_url
 
 BASE = "https://team.example.invalid"
 FORM = {"project": "selected", "name": "Fixture", "code": "private-fixture-code", "consent": "yes"}
+
+
+class DefaultsTests(unittest.TestCase):
+    def test_default_base_url_is_the_azure_web_origin(self):
+        self.assertEqual(
+            service_url.DEFAULT_BASE_URL,
+            "https://amplifier-teamwork-web.livelysea-7d934004.westus2.azurecontainerapps.io",
+        )
+        self.assertEqual(
+            service_url.validate_service_url(service_url.DEFAULT_BASE_URL),
+            service_url.DEFAULT_BASE_URL,
+        )
 
 
 class Response:

@@ -11,7 +11,7 @@ import urllib.error
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "modules/hooks-teamwork"))
-from amplifier_module_hooks_teamwork.service_url import service_origin, validate_service_url
+from amplifier_module_hooks_teamwork.service_url import DEFAULT_BASE_URL, service_origin, validate_service_url
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -77,7 +77,7 @@ def enroll_and_save(post, base, project, base_bundle, label, name, code, path, o
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base-url", default="https://team.amplifier.run")
+    parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
     parser.add_argument("--project", default="teamwork")
     parser.add_argument("--bundle", required=True, help="Your existing bundle name or path; never guessed")
     parser.add_argument("--label", default="Amplifier harness", help="Optional label; no machine hostname is collected")

@@ -14,7 +14,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from amplifier_module_hooks_teamwork import mount as mount_hook, sha
-from amplifier_module_hooks_teamwork.service_url import service_origin, validate_service_url
+from amplifier_module_hooks_teamwork.service_url import DEFAULT_BASE_URL, service_origin, validate_service_url
 from amplifier_module_hooks_teamwork import NoRedirect
 from amplifier_module_tool_teamwork.page import form_page, result_page
 
@@ -314,7 +314,7 @@ class TeamworkConnect:
 
     def __init__(self, coordinator, config):
         self.coordinator = coordinator
-        self.base = validate_service_url(config.get("base_url", "https://team.amplifier.run"))
+        self.base = validate_service_url(config.get("base_url", DEFAULT_BASE_URL))
         # Forwarded so a session connected through this tool honours the same level.
         self.notice = {"verbosity": config["verbosity"]} if "verbosity" in config else {}
         self.home = Path(config.get("connection_directory", "~/.config/amplifier-teamwork/native")).expanduser()
