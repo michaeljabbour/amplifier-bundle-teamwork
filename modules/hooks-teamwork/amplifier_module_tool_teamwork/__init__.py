@@ -29,6 +29,11 @@ POINTER_NAME = "pending-form-url.txt"
 # same set so a later publish call never needs a separate re-enrollment.
 SCOPES = ["context:read", "session:write", "shared:write"]
 
+# The Azure Container Apps origin can cold-start after scale-to-zero, taking
+# 30-60s to answer its first request. A request-level timeout shorter than
+# that turns a normal cold start into a spurious enrollment failure.
+HTTP_TIMEOUT = 75
+
 
 class ConsentError(ValueError):
     """Self-authored message safe to render in the private form; never service text."""
@@ -60,7 +65,7 @@ def _http(base, endpoint, body=None, headers=None):
     if data is not None:
         headers.setdefault("Content-Type", "application/json")
     request = urllib.request.Request(base + endpoint, data=data, headers=headers)
-    with urllib.request.build_opener(NoRedirect()).open(request, timeout=20) as response:
+    with urllib.request.build_opener(NoRedirect()).open(request, timeout=HTTP_TIMEOUT) as response:
         return json.load(response), response.headers
 
 
@@ -627,7 +632,7 @@ class TeamworkBind:
                        "Origin": service_origin(base)}
             request = urllib.request.Request(base + "/api/projects/discover",
                                              json.dumps({"repository_url": identity}).encode(), headers)
-            with urllib.request.build_opener(NoRedirect()).open(request, timeout=20) as response:
+            with urllib.request.build_opener(NoRedirect()).open(request, timeout=HTTP_TIMEOUT) as response:
                 return json.load(response)
 
         try:
