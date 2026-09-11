@@ -7,44 +7,84 @@ This PR changes the default `base_url` to the Amplifier Online web origin
 adds Entra (`az login`) enrollment alongside the member-code path, adds local
 git-remote auto-bind for `teamwork_bind`, and retires `team.amplifier.run`.
 
-**A fresh, authorized live session against the new default origin (with a real
-`az login` mint, a real member-code mint, and a real `repository_url` mint) has
-not been run as part of this PR.** It is a required manual step before this
-bundle is tagged and released -- see the cutover order in the plan
+### Reconciliation with what the service actually shipped (2026-09-10)
+
+The service shipped "SSO phase 1" with a different shape than this plan
+assumed, verified live against the new default origin minutes before this
+note was written: EasyAuth now gates everything except a short allowlist
+(`/api/login`, `/api/harnesses`, `/api/harnesses/`, `/api/v1`, `/api/v1/`,
+`/welcome`). Through the new default origin, `GET /api/config`,
+`POST /api/projects/discover`, and `/api/me` all return 401 from EasyAuth
+before the service's own code runs; `/api/harnesses` and `/api/login` are
+reachable (403, needing a cookie); `/api/v1/...` is reachable (403, needing a
+bearer). **The service does not yet validate Entra bearer JWTs on
+`/api/harnesses`, and `/api/config` does not yet advertise
+`api_app_id`/`tenant_id`.** What does exist today: a signed-in member can
+mint a harness credential in the portal (Account menu → Manage my harnesses
+→ `POST /api/harnesses` with all three scopes → token shown once for
+copy/paste).
+
+In response, this PR adds a third enrollment method -- pasting that
+portal-minted credential directly into the consent form -- ahead of the
+Entra sign-in path in the dispatch order, and hardens both the sign-in path
+and `teamwork_bind`'s network fallback to tolerate `/api/config` and
+`/api/projects/discover` returning 401/403 (from EasyAuth or from the
+endpoint not yet existing) as "not available" rather than a hard failure.
+See `docs/PROTOCOL.md`'s "Entra (Microsoft sign-in) enrollment" section for
+the current three-method dispatch order.
+
+**A fresh, authorized live session against the new default origin, exercising
+all three enrollment methods end to end (a real portal-credential mint and
+paste, a real member-code mint, and -- once the service validates Entra
+bearer JWTs -- a real `az login` mint) has not been run as part of this PR.**
+It is a required manual step before this bundle is tagged and released -- see
+the cutover order in the plan
 (`docs/plans/2026-09-10-hard-cutover-sso-autobind.md`, section 2, step 3-4) --
 and it cannot be attested here without fabricating evidence. What follows below
 is the complete local, mocked, and structural evidence gathered for this PR;
-it establishes the code paths are correct in isolation, not that a live `az
-login` mint or a live repository-scoped mint has ever succeeded end to end
-against a running service.
+it establishes the code paths are correct in isolation, not that a live
+portal-credential mint, member-code mint, or `az login` mint has ever
+succeeded end to end against the running service.
 
 ### Local evidence for this PR
 
-All 111 unit tests pass (`tests/`), covering: the new `DEFAULT_BASE_URL`
+All 146 unit tests pass (`tests/`), covering: the new `DEFAULT_BASE_URL`
 constant; local git-remote reading and canonical repository identity
 (`git_remote.py`, no network); the Entra token helper (`entra.py`, with
 `azure.identity` itself stubbed -- no real `az` CLI call is made in any test);
-the SSO-aware consent form copy and repository preview; the full Entra
-enrollment flow (mint-then-reserve ordering, 409/401/403 handling, conflict
-revocation and reuse) against a fixture HTTP opener; the retired-host inert
-hint (mount stays inert, no HTTP call, notice fires once); and `teamwork_bind`'s
+the consent form copy and repository preview, including the portal-credential
+field; the full Entra enrollment flow (mint-then-reserve ordering,
+409/401/403 handling, conflict revocation and reuse) against a fixture HTTP
+opener; the portal-credential enrollment path (verifies via the least
+side-effecting authenticated call, stores the connection with
+`harness_id: null`, never calls `/api/login` or touches `entra`, is rejected
+cleanly on 401, and reuses an existing saved connection without any network
+call); tolerance of `/api/config` returning 401 (enrollment proceeds via the
+member-code fallback rather than raising); the retired-host inert hint (mount
+stays inert, no HTTP call, notice fires once); and `teamwork_bind`'s
 local-first auto-bind (single match, ambiguous match, network-discover
-fallback, no-git-remote case) against a fixture native connection directory.
-`scripts/validate_bundle.py` passes (schema, composition, isolated local
-prepare, standalone replay).
+fallback and its own 401/403 tolerance, no-git-remote case) against a fixture
+native connection directory. `scripts/validate_bundle.py` passes (schema,
+composition, isolated local prepare, standalone replay).
 
-**The 111-test result was reproduced in two environments**, to guard against
-the `sys.modules["azure.identity"]` stub only working because a real
+**The dual-environment reproduction below predates the branch rebase onto
+main's agent-registration/work-queue commits and the portal-credential work
+in this same section; it recorded 111 tests at the time.** The underlying
+point -- that the suite must be proven green with genuinely no `azure`
+package importable, not just with `azure-identity` coincidentally installed
+-- still holds and was re-verified at 146 tests (see the top-level report for
+this PR). It was reproduced in two environments, to guard against the
+`sys.modules["azure.identity"]` stub only working because a real
 `azure-identity` package (and therefore a real `azure` parent module) was
 already importable:
 
 1. The Amplifier CLI's own Python environment (`azure-identity` genuinely
    installed, via `amplifier_module_provider_azure_openai`) -- `Ran 111 tests
-   in 10.590s / OK`.
+   in 10.590s / OK` (at the time; 146 as of this PR).
 2. A throwaway venv holding only `amplifier-core==1.6.1` (installed from
    PyPI) and the stdlib, with **no `azure` namespace package at all**
    (`import azure` raises `ModuleNotFoundError`) -- `Ran 111 tests in
-   10.393s / OK`.
+   10.393s / OK` (at the time; 146 as of this PR).
 
 The second environment is what actually exercises the "azure.identity is not
 installed" and "azure.identity is installed but unusable" branches
