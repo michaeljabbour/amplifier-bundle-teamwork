@@ -79,7 +79,7 @@ class ConsentCopyTests(unittest.TestCase):
         self.assertIsNotNone(credential_input)
         self.assertIn('type="password"', credential_input.group())
         self.assertNotIn("value=", credential_input.group())
-        self.assertIn("Manage my harnesses", page)
+        self.assertIn("Harnesses &amp; agents", page)
 
 
 class Response:

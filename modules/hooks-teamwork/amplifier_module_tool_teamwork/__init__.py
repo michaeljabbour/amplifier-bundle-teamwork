@@ -299,7 +299,7 @@ def _verify_portal_credential(base, project, token):
         if error.status in (401, 403):
             raise ConsentError(
                 "That credential was rejected.", "credential",
-                "Copy a fresh credential from the portal (Account menu \u2192 Manage my harnesses), "
+                "Copy a fresh credential from the portal (Account menu \u2192 Harnesses & agents), "
                 "then submit again.",
             ) from None
         if error.status == 422:
