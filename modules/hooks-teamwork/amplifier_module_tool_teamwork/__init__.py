@@ -62,10 +62,18 @@ class _MintError(Exception):
         self.payload = payload if isinstance(payload, dict) else {}
 
 
-def _http(base, endpoint, body=None, headers=None):
-    """A single request; NoRedirect refuses redirects. Raises urllib.error.HTTPError untouched."""
+def _http(base, endpoint, body=None, headers=None, origin=None):
+    """A single request; NoRedirect refuses redirects. Raises urllib.error.HTTPError untouched.
+
+    `origin` overrides the derived `service_origin(base)` when a deployment
+    serves its public web app on a different host than the API: the member
+    (cookie) plane gates requests on the WEB origin, so deriving it from the
+    API host is refused before a credential is ever examined on a split
+    deployment. Defaults to the derived value, so a same-origin deployment
+    is unaffected.
+    """
     headers = dict(headers or {})
-    headers.setdefault("Origin", service_origin(base))
+    headers.setdefault("Origin", origin or service_origin(base))
     data = json.dumps(body).encode() if body is not None else None
     if data is not None:
         headers.setdefault("Content-Type", "application/json")
@@ -131,8 +139,15 @@ def _write_recovery_breadcrumb(directory, harness_id):
         json.dump({"harness_id": harness_id, "action": "Revoke in Teamwork harness controls"}, output)
 
 
-def _mint_member(form, base, home, project, repository):
-    """Member-code path: reserve the file before issuing a credential; never overwrite."""
+def _mint_member(form, base, home, project, repository, origin=None):
+    """Member-code path: reserve the file before issuing a credential; never overwrite.
+
+    `origin` is threaded to every request here because this path is the one
+    that authenticates via a cookie (`/api/login` then `/api/harnesses` with
+    that cookie): the member plane gates cookie-authenticated requests on the
+    deployment's public web origin, which is refused before a credential is
+    ever examined when it is derived from a split-deployment's API host.
+    """
     directory = _safe_directory(home, base, project)
     path = directory / "connection.json"
     if path.exists():
@@ -147,16 +162,16 @@ def _mint_member(form, base, home, project, repository):
     try:
         with os.fdopen(fd, "w") as output:
             _, headers = _http(base, "/api/login", {"name": form["name"].strip(), "token": form["code"]},
-                               {"X-Teamwork-Project": project})
+                               {"X-Teamwork-Project": project}, origin=origin)
             cookie = headers["Set-Cookie"].split(";")[0]
             credential, _ = _http(base, "/api/harnesses", {"label": "Amplifier native", "scopes": SCOPES},
-                                  {"X-Teamwork-Project": project, "Cookie": cookie})
+                                  {"X-Teamwork-Project": project, "Cookie": cookie}, origin=origin)
             _write_connection(output, base, project, credential, repository)
     except BaseException:
         if credential:
             try:
                 _http(base, "/api/harnesses/revoke", {"id": credential["id"]},
-                     {"X-Teamwork-Project": project, "Cookie": cookie})
+                     {"X-Teamwork-Project": project, "Cookie": cookie}, origin=origin)
             except Exception:
                 _write_recovery_breadcrumb(directory, credential["id"])
         path.unlink(missing_ok=True)
@@ -341,7 +356,7 @@ def _mint_credential(form, base, home, project, repository, token):
     return path, project
 
 
-def connect(form, base, home, repository=None):
+def connect(form, base, home, repository=None, origin=None):
     """Called only with private browser input, never model-supplied credentials.
 
     No network call happens before consent. Dispatch order: (1) a portal
@@ -350,6 +365,12 @@ def connect(form, base, home, repository=None):
     host, AND the service advertises an `api_app_id` -- `_mint_sso`;
     (3) otherwise the member-code path -- `_mint_member`, widened to request
     all three scopes the single consent checkbox describes.
+
+    `origin` is the deployment's PUBLIC WEB origin, forwarded to the
+    member-code path (`_mint_member`), which authenticates via a cookie and
+    is refused by a split api/web deployment when the origin is derived from
+    the API host instead. Defaults (via `_http`) to the derived value, so a
+    same-origin deployment is unaffected.
     """
     if form.get("consent") != "yes":
         raise ConsentError("Consent is required before anything is shared.", "consent",
@@ -378,7 +399,7 @@ def connect(form, base, home, repository=None):
             raise ConsentError("First enrollment needs your name and private member code.",
                                "name" if not form.get("name", "").strip() else "code",
                                "This project is not enrolled yet on this machine, so both fields are required.")
-        return _mint_member(form, base, home, project, repository)
+        return _mint_member(form, base, home, project, repository, origin=origin)
 
     if use_sso:
         return _mint_sso(form, base, home, project, repository)
@@ -421,8 +442,9 @@ def announce(url, pointer, opened, minutes, stream=None):
         pass
 
 
-def private_browser_connect(base, home, stop, timeout=IDLE_TIMEOUT, notify=announce, repository=None):
+def private_browser_connect(base, home, stop, timeout=IDLE_TIMEOUT, notify=announce, repository=None, origin=None):
     """Serve a private consent form. `timeout` is the IDLE window; activity resets it."""
+    origin = origin or service_origin(base)
     nonce = secrets.token_urlsafe(32)
     csrf = secrets.token_urlsafe(32)
     style_nonce = secrets.token_urlsafe(16)
@@ -541,7 +563,7 @@ def private_browser_connect(base, home, stop, timeout=IDLE_TIMEOUT, notify=annou
                 with guard:
                     if outcome:
                         return self.done()
-                    outcome.append(connect(form, base, home, repository=repository))
+                    outcome.append(connect(form, base, home, repository=repository, origin=origin))
             except ConsentError as error:
                 return self.form(400, kept, str(error), error.field, error.hint)
             except Exception:
@@ -600,6 +622,11 @@ class TeamworkConnect:
     def __init__(self, coordinator, config):
         self.coordinator = coordinator
         self.base = validate_service_url(config.get("base_url", DEFAULT_BASE_URL))
+        # The public web origin, when a deployment serves its web app on a
+        # different host than the API (a split deployment). None means
+        # "derive it from base_url," which is what every same-origin
+        # deployment needs and what this always did.
+        self.origin = service_origin(config["web_origin"]) if config.get("web_origin") else None
         # Forwarded so a session connected through this tool honours the same level.
         self.notice = {"verbosity": config["verbosity"]} if "verbosity" in config else {}
         self.home = Path(config.get("connection_directory", "~/.config/amplifier-teamwork/native")).expanduser()
@@ -618,7 +645,7 @@ class TeamworkConnect:
             repository = await asyncio.to_thread(lambda: git_remote.repository_identity(git_remote.origin_url()))
             try:
                 path, project = await asyncio.to_thread(
-                    private_browser_connect, self.base, self.home, stop, self.timeout, announce, repository)
+                    private_browser_connect, self.base, self.home, stop, self.timeout, announce, repository, self.origin)
                 if rebind is not None:
                     # Already sharing: move this session rather than mounting twice,
                     # handing over the project-scoped credential the form just minted.

@@ -83,9 +83,19 @@ def main():
     parser.add_argument("--label", default="Amplifier harness", help="Optional label; no machine hostname is collected")
     parser.add_argument("--output")
     parser.add_argument("--connection-file")
+    # A deployment may serve its web app on a different host from its API, and the
+    # member plane gates on the WEB one. Deriving the Origin from --base-url is
+    # right only when the two coincide, which is every environment this had been
+    # exercised against and is not the one that matters; against a split
+    # deployment it is refused 403 before a credential is ever examined. Defaults
+    # to the derived value, so a same-origin deployment is unaffected.
+    parser.add_argument("--origin", help="Public web origin, when it differs from --base-url")
     args = parser.parse_args()
     try:
         base = validate_service_url(args.base_url)
+        # Validated by the same rule as the base URL: an unambiguous HTTP(S)
+        # origin, HTTPS unless it is a literal loopback host.
+        origin = service_origin(args.origin) if args.origin else service_origin(base)
     except ValueError as error:
         raise SystemExit(str(error)) from None
     default_connection, default_overlay = project_paths(args.project)
@@ -97,7 +107,7 @@ def main():
     name = input("Name or email: ").strip()
     token = getpass.getpass("Private member login code (not saved): ")
     def post(endpoint, body, cookie=None):
-        headers = {"Content-Type": "application/json", "Origin": service_origin(base), "X-Teamwork-Project": args.project}
+        headers = {"Content-Type": "application/json", "Origin": origin, "X-Teamwork-Project": args.project}
         if cookie: headers["Cookie"] = cookie
         request = urllib.request.Request(base + endpoint, data=json.dumps(body).encode(), headers=headers)
         try:
