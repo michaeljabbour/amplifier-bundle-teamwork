@@ -1081,6 +1081,21 @@ class Mirror(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.mirror_ops(client)), 5)
         self.assertNotIn("after 5 attempts", sixth.user_message or "")
 
+    async def test_mirror_is_deferred_not_lost_until_the_agent_record_is_cached(self):
+        # On the very first turn this session's own agent record has not
+        # synced back yet, so owner_person_id is unknown. The mirror must
+        # defer rather than fail or give up -- and try again once it is known.
+        hook, client = self.build()
+        client.records = [r for r in client.records if r["record_type"] != "agent"]
+        await hook.on_submit("prompt:submit", {"prompt": "hi"})
+        self.assertEqual(hook.state["filed"]["msg-1"], "tw-msg-1")
+        self.assertNotIn("msg-1", hook.state.get("mirrored", {}))
+        self.assertEqual(self.mirror_ops(client), [])
+        client.records.append(mirror_agent(hook.sid))
+        await hook.on_submit("prompt:submit", {"prompt": "again"})
+        self.assertEqual(len(self.mirror_ops(client)), 1)
+        self.assertEqual(hook.state["mirrored"]["msg-1"], "inbound-msg-1")
+
 
 if __name__ == '__main__':
     unittest.main()
