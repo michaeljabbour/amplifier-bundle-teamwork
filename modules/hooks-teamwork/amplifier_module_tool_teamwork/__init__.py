@@ -159,6 +159,23 @@ def _mint_member(form, base, home, project, repository):
     return path, project
 
 
+def _fetch_service_config(base):
+    """GET /api/config, tolerating any failure as 'unavailable' rather than raising.
+
+    Advertised as unauthenticated in the plan, but under EasyAuth-at-the-gateway
+    this can itself come back 401/403 -- or simply time out on a cold origin --
+    before the service's own code ever sees the request. None of that should
+    abort enrollment: it only means SSO cannot be offered here, so the
+    api_app_id check falls back exactly as an explicitly unconfigured service
+    would.
+    """
+    try:
+        config, _ = _http(base, "/api/config")
+    except Exception:
+        return {}
+    return config or {}
+
+
 def _mint_sso(form, base, home, project, repository):
     """Entra-authenticated enrollment.
 
@@ -168,10 +185,9 @@ def _mint_sso(form, base, home, project, repository):
     the minted project) revokes the new credential with the same bearer and
     reuses the saved connection instead of overwriting it.
     """
-    config, _ = _http(base, "/api/config")
-    api_app_id = (config or {}).get("api_app_id") or ""
+    api_app_id = _fetch_service_config(base).get("api_app_id") or ""
     if not api_app_id:
-        raise ConsentError("This service is not configured for Microsoft sign-in.", "code",
+        raise ConsentError("Microsoft sign-in enrollment is not enabled on this service yet.", "code",
                            "Enter your name and private member code below, then submit again.")
     try:
         bearer = entra.access_token("api://" + api_app_id + "/.default")
@@ -232,13 +248,72 @@ def _mint_sso(form, base, home, project, repository):
     return path, minted_project
 
 
+def _verify_portal_credential(base, project, token):
+    """Verify a portal-minted credential with the least side-effecting
+    authenticated call available: a publish batch with zero operations.
+
+    Any response other than 401/403 means the bearer authenticated -- that is
+    all this check is for; it makes no claim about project membership or
+    scope. A transport failure cannot confirm anything either way, so it is
+    reported rather than silently accepted.
+    """
+    endpoint = "/api/v1/projects/" + project + "/publish"
+    try:
+        _http_bearer(base, endpoint, {"operations": []}, token)
+    except _MintError as error:
+        if error.status in (401, 403):
+            raise ConsentError(
+                "That credential was rejected.", "credential",
+                "Copy a fresh credential from the portal (Account menu \u2192 Manage my harnesses), "
+                "then submit again.",
+            ) from None
+        # Any other status (2xx, or an application-level 4xx like 404/422) means
+        # the bearer authenticated; that is all this check verifies.
+    except (urllib.error.URLError, OSError) as error:
+        raise ConsentError(
+            "Could not verify that credential; the service could not be reached.", "credential",
+            "Check your connection and try again.",
+        ) from error
+
+
+def _mint_credential(form, base, home, project, repository, token):
+    """Portal-issued credential: verify it, then reserve. No /api/login, no az.
+
+    Requires an explicit project id: unlike SSO's mint response, a manually
+    pasted credential carries no `projects` list to auto-pick from.
+    """
+    if not project:
+        raise ConsentError("Enter the project ID you joined.", "project",
+                           "Use the exact project ID shown in Teamwork.")
+    directory = _safe_directory(home, base, project)
+    path = directory / "connection.json"
+    if path.exists():
+        return _reuse_saved_connection(path, base, project)
+    _verify_portal_credential(base, project, token)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w") as output:
+            data = {"base_url": base, "project_id": project, "token": token, "harness_id": None}
+            if repository:
+                data["repository_url"] = repository
+            json.dump(data, output)
+            output.flush()
+            os.fsync(output.fileno())
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    return path, project
+
+
 def connect(form, base, home, repository=None):
     """Called only with private browser input, never model-supplied credentials.
 
-    No network call happens before consent. When the code field is left blank
-    and Entra sign-in is available on this host, enrollment goes through
-    `_mint_sso`; otherwise the member-code path (`_mint_member`) runs, widened
-    to request all three scopes the single consent checkbox describes.
+    No network call happens before consent. Dispatch order: (1) a portal
+    credential, when supplied, always wins -- `_mint_credential`; (2) SSO,
+    only when the code field is blank, Entra sign-in is available on this
+    host, AND the service advertises an `api_app_id` -- `_mint_sso`;
+    (3) otherwise the member-code path -- `_mint_member`, widened to request
+    all three scopes the single consent checkbox describes.
     """
     if form.get("consent") != "yes":
         raise ConsentError("Consent is required before anything is shared.", "consent",
@@ -246,6 +321,11 @@ def connect(form, base, home, repository=None):
     project = form.get("project", "").strip()
     if len(project) > 200:
         raise ConsentError("That project ID is too long.", "project", "Project IDs are at most 200 characters.")
+    credential = form.get("credential", "").strip()
+    if credential:
+        # Takes precedence: a portal credential is a complete, already-minted
+        # answer, so neither SSO nor the member-code fields are consulted.
+        return _mint_credential(form, base, home, project, repository, credential)
     use_sso = not form.get("code") and entra.available()
 
     if project:

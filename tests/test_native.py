@@ -272,6 +272,95 @@ class SSOEnrollmentTests(unittest.TestCase):
         self.assertEqual(json.loads(mint_request.data)['scopes'], ['context:read', 'session:write', 'shared:write'])
 
 
+    def test_config_401_is_tolerated_and_sso_is_not_offered(self):
+        class Opener:
+            def open(self, request, **kwargs):
+                if request.full_url.endswith('/api/config'):
+                    raise urllib.error.HTTPError(request.full_url, 401, 'Unauthorized', {}, io.BytesIO(b'{}'))
+                raise AssertionError('unexpected endpoint ' + request.full_url)
+        with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', return_value=Opener()):
+            with self.assertRaises(ConsentError) as raised:
+                connect({'project': 'selected', 'consent': 'yes'}, BASE, Path(home))
+        self.assertEqual(raised.exception.field, 'code')
+        self.assertIn('not enabled', str(raised.exception).lower())
+        self.assertEqual(list(Path(home).rglob('connection.json')), [])
+
+
+class PortalCredentialTests(unittest.TestCase):
+    """Copy/paste enrollment: a credential minted in the portal, no /api/login, no az."""
+
+    def test_credential_path_verifies_stores_and_never_calls_login_or_az(self):
+        requests = []
+        class Opener:
+            def open(self, request, **kwargs):
+                requests.append(request)
+                return Response({'stored': True})
+        with tempfile.TemporaryDirectory() as home, \
+             patch('urllib.request.build_opener', return_value=Opener()), \
+             patch('amplifier_module_tool_teamwork.entra.available', side_effect=AssertionError('entra touched')), \
+             patch('amplifier_module_tool_teamwork.entra.access_token', side_effect=AssertionError('entra touched')):
+            path, project = connect(
+                {'project': 'portal-project', 'credential': 'portal-token', 'consent': 'yes'},
+                BASE, Path(home), repository='https://github.com/owner/repo')
+            self.assertEqual(project, 'portal-project')
+            saved = json.loads(path.read_text())
+            self.assertEqual(saved['project_id'], 'portal-project')
+            self.assertEqual(saved['token'], 'portal-token')
+            self.assertIsNone(saved['harness_id'])
+            self.assertEqual(saved['repository_url'], 'https://github.com/owner/repo')
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(len(requests), 1)
+        self.assertTrue(requests[0].full_url.endswith('/api/v1/projects/portal-project/publish'))
+        self.assertEqual(requests[0].get_header('Authorization'), 'Bearer portal-token')
+        self.assertEqual(json.loads(requests[0].data), {'operations': []})
+        self.assertFalse(any(r.full_url.endswith('/api/login') for r in requests))
+
+    def test_rejected_credential_is_a_retryable_form_error_and_writes_nothing(self):
+        class Opener:
+            def open(self, request, **kwargs):
+                raise urllib.error.HTTPError(request.full_url, 401, 'Unauthorized', {}, io.BytesIO(b'{}'))
+        with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', return_value=Opener()):
+            with self.assertRaises(ConsentError) as raised:
+                connect({'project': 'portal-project', 'credential': 'bad-token', 'consent': 'yes'}, BASE, Path(home))
+        self.assertEqual(raised.exception.field, 'credential')
+        self.assertEqual(list(Path(home).rglob('connection.json')), [])
+
+    def test_credential_takes_precedence_over_sso_and_member_code_fields(self):
+        requests = []
+        class Opener:
+            def open(self, request, **kwargs):
+                requests.append(request)
+                return Response({'stored': True})
+        with tempfile.TemporaryDirectory() as home, \
+             patch('urllib.request.build_opener', return_value=Opener()), \
+             patch('amplifier_module_tool_teamwork.entra.available', side_effect=AssertionError('entra touched')):
+            path, project = connect(
+                {'project': 'portal-project', 'credential': 'portal-token',
+                 'name': 'Fixture', 'code': 'private-fixture-code', 'consent': 'yes'},
+                BASE, Path(home))
+        self.assertEqual(project, 'portal-project')
+        self.assertTrue(all('/api/login' not in r.full_url and '/api/harnesses' not in r.full_url
+                            for r in requests))
+
+    def test_credential_path_reuses_an_existing_saved_connection(self):
+        with tempfile.TemporaryDirectory() as home:
+            home_path = Path(home)
+            directory = home_path / sha(BASE + "\0" + "portal-project")
+            directory.mkdir(parents=True, mode=0o700)
+            saved_path = directory / "connection.json"
+            saved_path.write_text(json.dumps({
+                "base_url": BASE, "project_id": "portal-project",
+                "token": "existing-token", "harness_id": None,
+            }))
+            saved_path.chmod(0o600)
+            with patch('urllib.request.build_opener', side_effect=AssertionError('network touched')):
+                path, project = connect(
+                    {'project': 'portal-project', 'credential': 'new-token', 'consent': 'yes'}, BASE, home_path)
+            self.assertEqual(path, saved_path)
+            self.assertEqual(project, 'portal-project')
+            self.assertEqual(json.loads(path.read_text())['token'], 'existing-token')
+
+
 class BrowserTests(unittest.TestCase):
     def drive(self, act, timeout=5, home='/unused'):
         """Run the private form and let `act(url, origin)` play the browser's part."""
