@@ -97,7 +97,7 @@ class EnrollmentTests(unittest.TestCase):
             self.assertNotIn(FORM['code'], path.read_text())
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
-            self.assertEqual(json.loads(requests[1].data)['scopes'], ['context:read', 'session:write'])
+            self.assertEqual(json.loads(requests[1].data)['scopes'], ['context:read', 'session:write', 'shared:write'])
             self.assertTrue(all(r.get_header('X-teamwork-project') == 'selected' for r in requests))
             self.assertEqual(connect({'project': 'selected', 'consent': 'yes'}, BASE, Path(home)), (path, project))
             self.assertEqual(len(requests), 2)
@@ -129,6 +129,140 @@ class EnrollmentTests(unittest.TestCase):
             path = folder / 'connection.json'
             path.write_text('{}'); path.chmod(0o644)
             with self.assertRaises(ValueError): connect(FORM, BASE, Path(home))
+
+
+class SSOEnrollmentTests(unittest.TestCase):
+    """Entra-authenticated enrollment; azure.identity itself is never really invoked."""
+
+    def setUp(self):
+        available_patcher = patch('amplifier_module_tool_teamwork.entra.available', return_value=True)
+        token_patcher = patch('amplifier_module_tool_teamwork.entra.access_token', return_value='fixture-bearer-token')
+        available_patcher.start()
+        token_patcher.start()
+        self.addCleanup(available_patcher.stop)
+        self.addCleanup(token_patcher.stop)
+
+    def test_sso_enrollment_mints_all_three_scopes_and_stores_project_and_repository(self):
+        requests = []
+        class Opener:
+            def open(self, request, **kwargs):
+                requests.append(request)
+                if request.full_url.endswith('/api/config'):
+                    return Response({'tenant_id': 'fixture-tenant', 'api_app_id': 'fixture-app-id'})
+                if request.full_url.endswith('/api/harnesses'):
+                    return Response({'id': 'harness-id', 'token': 'sso-harness-token', 'projects': ['auto-project']})
+                raise AssertionError('unexpected endpoint ' + request.full_url)
+        with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', return_value=Opener()):
+            path, project = connect({'consent': 'yes'}, BASE, Path(home), repository='https://github.com/owner/repo')
+            self.assertEqual(project, 'auto-project')
+            saved = json.loads(path.read_text())
+            self.assertEqual(saved['project_id'], 'auto-project')
+            self.assertEqual(saved['repository_url'], 'https://github.com/owner/repo')
+            self.assertEqual(saved['token'], 'sso-harness-token')
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        mint_request = next(r for r in requests if r.full_url.endswith('/api/harnesses'))
+        body = json.loads(mint_request.data)
+        self.assertEqual(body['scopes'], ['context:read', 'session:write', 'shared:write'])
+        self.assertEqual(body['repository_url'], 'https://github.com/owner/repo')
+        self.assertEqual(mint_request.get_header('Authorization'), 'Bearer fixture-bearer-token')
+
+    def test_sso_enrollment_sends_only_the_canonical_repository_url(self):
+        requests = []
+        class Opener:
+            def open(self, request, **kwargs):
+                requests.append(request)
+                if request.full_url.endswith('/api/config'):
+                    return Response({'api_app_id': 'fixture-app-id'})
+                return Response({'id': 'harness-id', 'token': 'sso-harness-token', 'projects': ['typed-project']})
+        with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', return_value=Opener()):
+            path, project = connect({'project': 'typed-project', 'consent': 'yes'}, BASE, Path(home),
+                                    repository='https://github.com/owner/repo')
+        self.assertEqual(project, 'typed-project')
+        mint_request = next(r for r in requests if r.full_url.endswith('/api/harnesses'))
+        body = json.loads(mint_request.data)
+        self.assertNotIn('repository_url', body)
+        self.assertEqual(mint_request.get_header('X-teamwork-project'), 'typed-project')
+
+    def test_ambiguous_repository_is_a_retryable_form_error(self):
+        class Opener:
+            def open(self, request, **kwargs):
+                if request.full_url.endswith('/api/config'):
+                    return Response({'api_app_id': 'fixture-app-id'})
+                error_body = json.dumps({'projects': ['proj-a', 'proj-b'], 'reason': 'ambiguous_repository'}).encode()
+                raise urllib.error.HTTPError(request.full_url, 409, 'Conflict', {}, io.BytesIO(error_body))
+        with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', return_value=Opener()):
+            with self.assertRaises(ConsentError) as raised:
+                connect({'consent': 'yes'}, BASE, Path(home), repository='https://github.com/owner/repo')
+            self.assertEqual(raised.exception.field, 'project')
+            self.assertIn('proj-a', raised.exception.hint)
+            self.assertEqual(list(Path(home).rglob('connection.json')), [])
+
+    def test_service_without_api_app_id_asks_for_the_member_code(self):
+        class Opener:
+            def open(self, request, **kwargs):
+                return Response({'api_app_id': ''})
+        with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', return_value=Opener()):
+            with self.assertRaises(ConsentError) as raised:
+                connect({'project': 'selected', 'consent': 'yes'}, BASE, Path(home))
+        self.assertEqual(raised.exception.field, 'code')
+        self.assertIn('member code', raised.exception.hint.lower())
+
+    def test_unmapped_entra_identity_falls_back_to_the_member_code_fields(self):
+        class Opener:
+            def open(self, request, **kwargs):
+                if request.full_url.endswith('/api/config'):
+                    return Response({'api_app_id': 'fixture-app-id'})
+                error_body = json.dumps({'error': 'entra_unmapped'}).encode()
+                raise urllib.error.HTTPError(request.full_url, 403, 'Forbidden', {}, io.BytesIO(error_body))
+        with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', return_value=Opener()):
+            with self.assertRaises(ConsentError) as raised:
+                connect({'project': 'selected', 'consent': 'yes'}, BASE, Path(home))
+        self.assertEqual(raised.exception.field, 'name')
+        self.assertIn('member code', raised.exception.hint.lower())
+
+    def test_sso_conflict_revokes_the_new_credential_and_reuses_the_saved_one(self):
+        with tempfile.TemporaryDirectory() as home:
+            home_path = Path(home)
+            directory = home_path / sha(BASE + "\0" + "auto-project")
+            directory.mkdir(parents=True, mode=0o700)
+            saved_path = directory / "connection.json"
+            saved_path.write_text(json.dumps({
+                "base_url": BASE, "project_id": "auto-project",
+                "token": "existing-token", "harness_id": "existing-harness",
+            }))
+            saved_path.chmod(0o600)
+
+            revoked = []
+            class Opener:
+                def open(self, request, **kwargs):
+                    if request.full_url.endswith('/api/config'):
+                        return Response({'api_app_id': 'fixture-app-id'})
+                    if request.full_url.endswith('/api/harnesses/revoke'):
+                        revoked.append(json.loads(request.data))
+                        return Response({'revoked': True})
+                    if request.full_url.endswith('/api/harnesses'):
+                        return Response({'id': 'new-harness-id', 'token': 'new-token', 'projects': ['auto-project']})
+                    raise AssertionError('unexpected endpoint ' + request.full_url)
+            with patch('urllib.request.build_opener', return_value=Opener()):
+                path, project = connect({'consent': 'yes'}, BASE, home_path, repository='https://github.com/owner/repo')
+            self.assertEqual(project, 'auto-project')
+            self.assertEqual(path, saved_path)
+            self.assertEqual(json.loads(path.read_text())['token'], 'existing-token')
+            self.assertEqual(revoked, [{'id': 'new-harness-id'}])
+
+    def test_member_code_path_is_unchanged_and_now_requests_shared_write(self):
+        requests = []
+        class Opener:
+            def open(self, request, **kwargs):
+                requests.append(request)
+                if request.full_url.endswith('/api/login'):
+                    return Response({}, {'Set-Cookie': 'fixture=cookie; HttpOnly'})
+                return Response({'token': 'harness-fixture', 'id': 'harness-id'})
+        with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', return_value=Opener()):
+            path, project = connect(FORM, BASE, Path(home))
+        self.assertEqual(project, 'selected')
+        mint_request = requests[1]
+        self.assertEqual(json.loads(mint_request.data)['scopes'], ['context:read', 'session:write', 'shared:write'])
 
 
 class BrowserTests(unittest.TestCase):
@@ -184,7 +318,7 @@ class BrowserTests(unittest.TestCase):
             status, body = self.post(url, good, {'Origin': origin})
             self.assertEqual(status, 200)
             self.assertNotIn(FORM['code'], body)
-        def enroll(form, base, home):
+        def enroll(form, base, home, repository=None):
             seen.append(form); return Path('/private/fixture.json'), 'selected'
         with patch('amplifier_module_tool_teamwork.connect', side_effect=enroll):
             result = self.drive(act)
@@ -200,7 +334,7 @@ class BrowserTests(unittest.TestCase):
             status, _ = self.post(url, dict(FORM, csrf=self.token(page)),
                                   {'Origin': 'null', 'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'navigate'})
             self.assertEqual(status, 200)
-        def enroll(form, base, home):
+        def enroll(form, base, home, repository=None):
             seen.append(form); return Path('/private/fixture.json'), 'selected'
         with patch('amplifier_module_tool_teamwork.connect', side_effect=enroll):
             self.drive(act)
@@ -220,7 +354,7 @@ class BrowserTests(unittest.TestCase):
             self.assertIn('type="password"', body)
             status, body = self.post(url, dict(FORM, csrf=self.token(body)), {'Origin': origin})
             self.assertEqual(status, 200)
-        def enroll(form, base, home):
+        def enroll(form, base, home, repository=None):
             attempts.append(form['project'])
             if form['project'] == 'rejected':
                 raise ConsentError('Fixture reason', 'project', 'Fixture hint')
@@ -238,7 +372,7 @@ class BrowserTests(unittest.TestCase):
             for secret in ('service-detail-leak', 'session=cookievalue', FORM['code']):
                 self.assertNotIn(secret, body)
             self.assertIn('type="password"', body)
-        def enroll(form, base, home):
+        def enroll(form, base, home, repository=None):
             raise RuntimeError('service-detail-leak session=cookievalue')
         with patch('amplifier_module_tool_teamwork.connect', side_effect=enroll):
             result = self.drive(act, timeout=1)
