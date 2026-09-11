@@ -116,6 +116,10 @@ class StubState:
         self.issued = {token} if token else set()
         self.revoked: set = set()
         self.harness_ids: dict = {}
+        # The relay. Kept here rather than in the fixture list because these are
+        # records the CLIENT creates and the server stamps, not scenery.
+        self.agents: dict = {}
+        self.messages: list = []
         self.lock = threading.Lock()
 
     def issue(self) -> dict:
@@ -146,6 +150,53 @@ class StubState:
             entry["seq"] = self.seq
             with open(self.log_path, "a", encoding="utf-8") as handle:
                 handle.write(json.dumps(entry) + "\n")
+
+
+# Shape captured from one real /context response from the live service, so the
+# stub is not merely agreeing with the client by construction: the service sets
+# `from_person_id`, `from_harness_id`, `to_person_id` and `sent_at` itself and
+# refuses to take any of them from the caller, which is what makes a message
+# unforgeable. Reproducing that here is the point -- a stub that let the sender
+# name itself would prove nothing about the path under test.
+FIXTURE_SENDER = "fixture-person"
+FIXTURE_HARNESS = "fixture-sender-harness"
+
+
+def apply_relay(state: StubState, operations: list) -> None:
+    """Record agent.upsert and message.upsert the way the service does."""
+    for op in operations or []:
+        name, rid, data = op.get("op"), op.get("id"), op.get("data") or {}
+        if name == "agent.upsert":
+            with state.lock:
+                state.agents[rid] = dict(data, id=rid,
+                                         owner_person_id=data.get("owner_person_id", FIXTURE_SENDER),
+                                         harness_id=FIXTURE_HARNESS)
+        elif name == "message.upsert":
+            content = {
+                "id": rid,
+                "version": 1,
+                "record_type": "message",
+                "to_agent_id": data.get("to_agent_id"),
+                "body": data.get("body"),
+                # Stamped by the service, never taken from the caller.
+                "from_person_id": FIXTURE_SENDER,
+                "from_harness_id": FIXTURE_HARNESS,
+                "to_person_id": FIXTURE_SENDER,
+                "sent_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "created_by": FIXTURE_SENDER,
+                "attribution_source": "authenticated",
+            }
+            with state.lock:
+                state.messages.append(record("message", rid, content))
+
+
+def delivered_to(state: StubState, session_id: str) -> list:
+    """A message reaches the session it was addressed to, and no other."""
+    with state.lock:
+        agents = [record("agent", aid, content) for aid, content in state.agents.items()]
+        mail = [m for m in state.messages
+                if (m["content"] or {}).get("to_agent_id") == session_id]
+    return agents + mail
 
 
 def make_handler(state: StubState):
@@ -219,11 +270,16 @@ def make_handler(state: StubState):
                     401,
                     {"error": {"code": "unauthorized", "message": "Invalid or expired harness credential"}},
                 )
+            if endpoint == "publish":
+                apply_relay(state, body.get("operations") if isinstance(body, dict) else None)
             if endpoint == "context":
+                session_id = body.get("session_id") if isinstance(body, dict) else None
                 return self._send(
                     200,
                     {
-                        "items": fixture_items() + (crowd_items() if state.crowded else []),
+                        "items": fixture_items()
+                        + delivered_to(state, session_id)
+                        + (crowd_items() if state.crowded else []),
                         "next_cursor": "cursor-1",
                         "delivery_id": "delivery-1",
                         "has_more": False,
