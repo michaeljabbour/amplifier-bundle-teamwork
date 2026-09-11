@@ -34,14 +34,29 @@ A session that is already running keeps the tool set it started with, so `teamwo
 
 ## Connect in Amplifier
 
-1. Start a normal new Amplifier session with your existing bundle/provider.
+1. Start a normal new Amplifier session with your existing bundle/provider, in a checkout with a `github.com` `origin` remote if you have one.
 2. Ask: **Connect this session to Teamwork.** Amplifier invokes `teamwork_connect`, which opens a private local browser form.
-3. Enter the exact project ID you joined, your name/email and private member code in that form, and confirm sharing. Never paste the code into chat. On later sessions, select the same project and consent again; leave login fields blank to reuse its saved connection.
+3. The form supports three enrollment methods, tried in this order for whatever you fill in and submit:
+   1. **Portal credential (current default path).** In Teamwork's web portal, open Account menu → Manage my harnesses, mint a harness credential (shown once), and paste it into the form's **Credential from the portal** field along with the exact project ID. This never touches `/api/login` or `az`; it is verified with the service directly and, if accepted, stored the same as any other enrollment. If it is rejected, or if the service cannot confirm it, the form re-renders asking to try again. If a connection is already saved for that project, the new credential is not used -- an existing saved connection is never overwritten -- and the form tells you so explicitly, with how to rotate it.
+   2. **Microsoft sign-in (`az login`), when the service advertises it.** If you have run `az login` and left both the credential and member-code fields blank, the form offers Microsoft sign-in. When this directory has a usable GitHub remote, the form shows the exact repository URL that will be sent and the project ID becomes optional -- Teamwork resolves the project from that repository. **This path requires the service to advertise Entra bearer support (`api_app_id`) via `/api/config`, which is pending server-side work; until then, sign-in enrollment is not offered and the form falls back to the credential or member-code fields instead.**
+   3. **Private member code (fallback, always available).** Enter the exact project ID you joined, your name/email and private member code, and confirm sharing. Never paste the code into chat.
+   On later sessions, select the same project and leave the credential/login fields blank to reuse its saved connection.
    If the browser tab does not appear, open the one-time address Amplifier prints to the terminal. It is also written to `~/.config/amplifier-teamwork/native/pending-form-url.txt` (mode 0600) while the form is open, and removed when it closes. That address contains a private code, so treat it like the form itself.
-   A submission that fails re-renders the form with the specific reason and what you typed, minus the member code, so you can correct it and submit again in place.
+   A submission that fails re-renders the form with the specific reason and what you typed, minus the credential and the member code, so you can correct it and submit again in place.
 4. Return to Amplifier. Sharing and bounded project-context delivery begin with your **next prompt**. The connection request and earlier conversation are not retroactively published.
 
-The tool takes no arguments and never returns credentials. It stores project-specific credentials in private files under `~/.config/amplifier-teamwork/native/`, enrolls only `context:read` and `session:write`, and leaves the primary bundle/provider unchanged. A session shares with one project at a time. Asking to connect again re-opens the form and moves the session; the enrollment it mints for the new project replaces the previous project's credential, and any turn still open is closed under the project it started in. Child sessions do not get the connection tool or sharing hook. This path requires a browser on the Amplifier host; remote/headless browser forwarding is not implemented. The form closes after 15 minutes with no activity; filling it in counts as activity, so the window measures inactivity rather than total time. A request arriving just after it closes is answered with an explanation instead of a refused connection.
+The tool takes no arguments and never returns credentials. It stores project-specific credentials in private files under `~/.config/amplifier-teamwork/native/`, enrolls `context:read`, `session:write` and `shared:write` (one consent checkbox mints all three), and leaves the primary bundle/provider unchanged. A session shares with one project at a time. Asking to connect again re-opens the form and moves the session; the enrollment it mints for the new project replaces the previous project's credential, and any turn still open is closed under the project it started in. Child sessions do not get the connection tool or sharing hook. This path requires a browser on the Amplifier host; remote/headless browser forwarding is not implemented. The form closes after 15 minutes with no activity; filling it in counts as activity, so the window measures inactivity rather than total time. A request arriving just after it closes is answered with an explanation instead of a refused connection.
+
+### Binding without typing a project ID
+
+`teamwork_bind` no longer requires `project_id`. Omit it and Teamwork resolves the
+project linked to this working directory's `github.com` `origin` remote: first
+against connection files already saved on this machine, then (if none match) by
+asking the currently configured credential to confirm the one project it can
+see. If neither resolves anything, pass `project_id` explicitly. If the network
+confirm step itself is refused by the service (for example, gated by EasyAuth or
+not yet rolled out), the error says so plainly rather than reporting a false
+"no match" -- pass `project_id` in that case too.
 
 ### Seeing what influenced the session
 
@@ -70,11 +85,11 @@ overrides:
   hooks-teamwork:
     config:
       share_visible_turns: true
-      base_url: https://team.amplifier.run
+      base_url: https://amplifier-teamwork-web.livelysea-7d934004.westus2.azurecontainerapps.io
       token: ${TEAMWORK_HARNESS_TOKEN}
   tool-teamwork:
     config:
-      base_url: https://team.amplifier.run
+      base_url: https://amplifier-teamwork-web.livelysea-7d934004.westus2.azurecontainerapps.io
       token: ${TEAMWORK_HARNESS_TOKEN}
 ```
 
@@ -85,7 +100,21 @@ chmod 600 ~/.amplifier/keys.env
 
 `base_url` is read from both module configs: the hook uses it to reach the project API and
 the tool uses it for enrollment, so a non-default service must be set in both or the two
-halves address different services.
+halves address different services. The value shown above is the default and does not need
+to be set explicitly; override it only for a different Teamwork deployment.
+
+**Microsoft sign-in (`az login`) is optional.** Install the `sso` extra
+(`azure-identity>=1.17,<2`) and run `az login` once on the host to enable it in
+`teamwork_connect`; without it, or on a host where `az login` has not been run, the
+member-code fields remain the enrollment path and nothing else changes.
+
+`team.amplifier.run` (the old default) is retired. A session still configured to point at
+it gets a one-line hint -- run `amplifier update`, then `teamwork_connect` -- instead of a
+hang or a raw connection error. Re-enrolling against the new default origin creates a new
+`~/.config/amplifier-teamwork/native/<hash>/` folder (the hash is derived from the service
+URL and project, so a new origin means a new folder). Any folder left over from the old
+origin is simply unused after this cutover; the bundle never deletes files, so you may
+remove it yourself once you have confirmed you no longer need it.
 
 With no project configured the hook mounts **inert** -- it registers nothing and sends
 nothing -- until a session binds one.
@@ -175,7 +204,7 @@ Use their output to preserve your actual base bundle. Do not guess a registry al
 
 ### 3. Enroll and create project-private files
 
-Sign in at [team.amplifier.run](https://team.amplifier.run) with your name/email and private member code, and select the project you were added to. Then choose a project-specific private directory outside the checkout. The explicit paths below avoid relying on any installer default:
+This legacy path is member-code only (no Microsoft sign-in). Sign in at the Teamwork service with your name/email and private member code, and select the project you were added to. Then choose a project-specific private directory outside the checkout. The explicit paths below avoid relying on any installer default:
 
 ```sh
 BASE_BUNDLE="/absolute/path/to/your/existing/bundle.yaml"
@@ -191,7 +220,7 @@ python3 setup_teamwork.py \
 
 The script asks for the member code without saving it, enrolls a separate project-scoped harness credential, writes a private connection file, and writes the overlay. Existing output files are not overwritten. Keep the connection file, SQLite journal, and overlay outside the repository and out of source control.
 
-By default enrollment uses `https://team.amplifier.run`. You may explicitly select a trusted custom HTTPS service URL, but that does **not** establish that the service is Teamwork-compatible. Deceptive URLs containing userinfo, a query, or a fragment are rejected. HTTP is for literal loopback test hosts only (`localhost`, `127.0.0.1`, or `::1`), never a production service.
+By default enrollment uses the Amplifier Online web origin (`https://amplifier-teamwork-web.livelysea-7d934004.westus2.azurecontainerapps.io`). You may explicitly select a trusted custom HTTPS service URL, but that does **not** establish that the service is Teamwork-compatible. Deceptive URLs containing userinfo, a query, or a fragment are rejected. HTTP is for literal loopback test hosts only (`localhost`, `127.0.0.1`, or `::1`), never a production service.
 
 ### 4. Start a new opted-in session
 

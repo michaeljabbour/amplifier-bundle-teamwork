@@ -19,9 +19,64 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "modules/hooks-team
 from amplifier_module_tool_teamwork import (announce, connect, ConsentAborted, ConsentError, POINTER_NAME,
                                             private_browser_connect, TeamworkConnect, TeamworkBind, mount)
 from amplifier_module_hooks_teamwork import sha
+from amplifier_module_hooks_teamwork import service_url
+from amplifier_module_tool_teamwork.page import form_page
 
 BASE = "https://team.example.invalid"
 FORM = {"project": "selected", "name": "Fixture", "code": "private-fixture-code", "consent": "yes"}
+
+
+class DefaultsTests(unittest.TestCase):
+    def test_default_base_url_is_the_azure_web_origin(self):
+        self.assertEqual(
+            service_url.DEFAULT_BASE_URL,
+            "https://amplifier-teamwork-web.livelysea-7d934004.westus2.azurecontainerapps.io",
+        )
+        self.assertEqual(
+            service_url.validate_service_url(service_url.DEFAULT_BASE_URL),
+            service_url.DEFAULT_BASE_URL,
+        )
+
+
+class ConsentCopyTests(unittest.TestCase):
+    def test_consent_copy_names_shared_write_publishing(self):
+        page = form_page("nonce", "csrf", "style-nonce", BASE, 15)
+        self.assertIn("shared:write", page)
+        self.assertIn("publish shared knowledge and work requests", page)
+
+    def test_sso_form_shows_the_detected_repository_and_makes_project_optional(self):
+        page = form_page("nonce", "csrf", "style-nonce", BASE, 15,
+                          sso=True, repository="https://github.com/owner/repo")
+        self.assertIn("<dt>Repository</dt><dd>https://github.com/owner/repo</dd>", page)
+        self.assertIn("<dt>Sign-in</dt><dd>Your Microsoft account (az login)</dd>", page)
+        self.assertIn("member-code fallback only", page)
+        project_input = re.search(r'<input id="project"[^>]*>', page)
+        self.assertIsNotNone(project_input)
+        self.assertNotIn("required", project_input.group())
+
+    def test_non_sso_form_still_requires_a_project_id(self):
+        page = form_page("nonce", "csrf", "style-nonce", BASE, 15)
+        project_input = re.search(r'<input id="project"[^>]*>', page)
+        self.assertIsNotNone(project_input)
+        self.assertIn("required", project_input.group())
+        self.assertNotIn("<dt>Sign-in</dt>", page)
+        self.assertNotIn("<dt>Repository</dt>", page)
+
+    def test_form_never_renders_a_member_code(self):
+        for kwargs in ({}, {"sso": True, "repository": "https://github.com/owner/repo"}):
+            with self.subTest(kwargs=kwargs):
+                page = form_page("nonce", "csrf", "style-nonce", BASE, 15, **kwargs)
+                code_input = re.search(r'<input id="code"[^>]*>', page)
+                self.assertIsNotNone(code_input)
+                self.assertNotIn("value=", code_input.group())
+
+    def test_credential_field_renders_as_a_password_and_never_echoes(self):
+        page = form_page("nonce", "csrf", "style-nonce", BASE, 15)
+        credential_input = re.search(r'<input id="credential"[^>]*>', page)
+        self.assertIsNotNone(credential_input)
+        self.assertIn('type="password"', credential_input.group())
+        self.assertNotIn("value=", credential_input.group())
+        self.assertIn("Manage my harnesses", page)
 
 
 class Response:
@@ -49,7 +104,7 @@ class EnrollmentTests(unittest.TestCase):
             self.assertNotIn(FORM['code'], path.read_text())
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
-            self.assertEqual(json.loads(requests[1].data)['scopes'], ['context:read', 'session:write'])
+            self.assertEqual(json.loads(requests[1].data)['scopes'], ['context:read', 'session:write', 'shared:write'])
             self.assertTrue(all(r.get_header('X-teamwork-project') == 'selected' for r in requests))
             self.assertEqual(connect({'project': 'selected', 'consent': 'yes'}, BASE, Path(home)), (path, project))
             self.assertEqual(len(requests), 2)
@@ -81,6 +136,313 @@ class EnrollmentTests(unittest.TestCase):
             path = folder / 'connection.json'
             path.write_text('{}'); path.chmod(0o644)
             with self.assertRaises(ValueError): connect(FORM, BASE, Path(home))
+
+
+class SSOEnrollmentTests(unittest.TestCase):
+    """Entra-authenticated enrollment; azure.identity itself is never really invoked."""
+
+    def setUp(self):
+        available_patcher = patch('amplifier_module_tool_teamwork.entra.available', return_value=True)
+        token_patcher = patch('amplifier_module_tool_teamwork.entra.access_token', return_value='fixture-bearer-token')
+        available_patcher.start()
+        token_patcher.start()
+        self.addCleanup(available_patcher.stop)
+        self.addCleanup(token_patcher.stop)
+
+    def test_sso_enrollment_mints_all_three_scopes_and_stores_project_and_repository(self):
+        requests = []
+        class Opener:
+            def open(self, request, **kwargs):
+                requests.append(request)
+                if request.full_url.endswith('/api/config'):
+                    return Response({'tenant_id': 'fixture-tenant', 'api_app_id': 'fixture-app-id'})
+                if request.full_url.endswith('/api/harnesses'):
+                    return Response({'id': 'harness-id', 'token': 'sso-harness-token', 'projects': ['auto-project']})
+                raise AssertionError('unexpected endpoint ' + request.full_url)
+        with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', return_value=Opener()):
+            path, project = connect({'consent': 'yes'}, BASE, Path(home), repository='https://github.com/owner/repo')
+            self.assertEqual(project, 'auto-project')
+            saved = json.loads(path.read_text())
+            self.assertEqual(saved['project_id'], 'auto-project')
+            self.assertEqual(saved['repository_url'], 'https://github.com/owner/repo')
+            self.assertEqual(saved['token'], 'sso-harness-token')
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        mint_request = next(r for r in requests if r.full_url.endswith('/api/harnesses'))
+        body = json.loads(mint_request.data)
+        self.assertEqual(body['scopes'], ['context:read', 'session:write', 'shared:write'])
+        self.assertEqual(body['repository_url'], 'https://github.com/owner/repo')
+        self.assertEqual(mint_request.get_header('Authorization'), 'Bearer fixture-bearer-token')
+
+    def test_sso_enrollment_sends_only_the_canonical_repository_url(self):
+        requests = []
+        class Opener:
+            def open(self, request, **kwargs):
+                requests.append(request)
+                if request.full_url.endswith('/api/config'):
+                    return Response({'api_app_id': 'fixture-app-id'})
+                return Response({'id': 'harness-id', 'token': 'sso-harness-token', 'projects': ['typed-project']})
+        with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', return_value=Opener()):
+            path, project = connect({'project': 'typed-project', 'consent': 'yes'}, BASE, Path(home),
+                                    repository='https://github.com/owner/repo')
+        self.assertEqual(project, 'typed-project')
+        mint_request = next(r for r in requests if r.full_url.endswith('/api/harnesses'))
+        body = json.loads(mint_request.data)
+        self.assertNotIn('repository_url', body)
+        self.assertEqual(mint_request.get_header('X-teamwork-project'), 'typed-project')
+
+    def test_ambiguous_repository_is_a_retryable_form_error(self):
+        class Opener:
+            def open(self, request, **kwargs):
+                if request.full_url.endswith('/api/config'):
+                    return Response({'api_app_id': 'fixture-app-id'})
+                error_body = json.dumps({'projects': ['proj-a', 'proj-b'], 'reason': 'ambiguous_repository'}).encode()
+                raise urllib.error.HTTPError(request.full_url, 409, 'Conflict', {}, io.BytesIO(error_body))
+        with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', return_value=Opener()):
+            with self.assertRaises(ConsentError) as raised:
+                connect({'consent': 'yes'}, BASE, Path(home), repository='https://github.com/owner/repo')
+            self.assertEqual(raised.exception.field, 'project')
+            self.assertIn('proj-a', raised.exception.hint)
+            self.assertEqual(list(Path(home).rglob('connection.json')), [])
+
+    def test_service_without_api_app_id_asks_for_the_member_code(self):
+        class Opener:
+            def open(self, request, **kwargs):
+                return Response({'api_app_id': ''})
+        with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', return_value=Opener()):
+            with self.assertRaises(ConsentError) as raised:
+                connect({'project': 'selected', 'consent': 'yes'}, BASE, Path(home))
+        self.assertEqual(raised.exception.field, 'code')
+        self.assertIn('member code', raised.exception.hint.lower())
+
+    def test_unmapped_entra_identity_falls_back_to_the_member_code_fields(self):
+        class Opener:
+            def open(self, request, **kwargs):
+                if request.full_url.endswith('/api/config'):
+                    return Response({'api_app_id': 'fixture-app-id'})
+                error_body = json.dumps({'error': 'entra_unmapped'}).encode()
+                raise urllib.error.HTTPError(request.full_url, 403, 'Forbidden', {}, io.BytesIO(error_body))
+        with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', return_value=Opener()):
+            with self.assertRaises(ConsentError) as raised:
+                connect({'project': 'selected', 'consent': 'yes'}, BASE, Path(home))
+        self.assertEqual(raised.exception.field, 'name')
+        self.assertIn('member code', raised.exception.hint.lower())
+
+    def test_sso_conflict_revokes_the_new_credential_and_reuses_the_saved_one(self):
+        with tempfile.TemporaryDirectory() as home:
+            home_path = Path(home)
+            directory = home_path / sha(BASE + "\0" + "auto-project")
+            directory.mkdir(parents=True, mode=0o700)
+            saved_path = directory / "connection.json"
+            saved_path.write_text(json.dumps({
+                "base_url": BASE, "project_id": "auto-project",
+                "token": "existing-token", "harness_id": "existing-harness",
+            }))
+            saved_path.chmod(0o600)
+
+            revoked = []
+            class Opener:
+                def open(self, request, **kwargs):
+                    if request.full_url.endswith('/api/config'):
+                        return Response({'api_app_id': 'fixture-app-id'})
+                    if request.full_url.endswith('/api/harnesses/revoke'):
+                        revoked.append(json.loads(request.data))
+                        return Response({'revoked': True})
+                    if request.full_url.endswith('/api/harnesses'):
+                        return Response({'id': 'new-harness-id', 'token': 'new-token', 'projects': ['auto-project']})
+                    raise AssertionError('unexpected endpoint ' + request.full_url)
+            with patch('urllib.request.build_opener', return_value=Opener()):
+                path, project = connect({'consent': 'yes'}, BASE, home_path, repository='https://github.com/owner/repo')
+            self.assertEqual(project, 'auto-project')
+            self.assertEqual(path, saved_path)
+            self.assertEqual(json.loads(path.read_text())['token'], 'existing-token')
+            self.assertEqual(revoked, [{'id': 'new-harness-id'}])
+
+    def test_member_code_path_is_unchanged_and_now_requests_shared_write(self):
+        requests = []
+        class Opener:
+            def open(self, request, **kwargs):
+                requests.append(request)
+                if request.full_url.endswith('/api/login'):
+                    return Response({}, {'Set-Cookie': 'fixture=cookie; HttpOnly'})
+                return Response({'token': 'harness-fixture', 'id': 'harness-id'})
+        with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', return_value=Opener()):
+            path, project = connect(FORM, BASE, Path(home))
+        self.assertEqual(project, 'selected')
+        mint_request = requests[1]
+        self.assertEqual(json.loads(mint_request.data)['scopes'], ['context:read', 'session:write', 'shared:write'])
+
+
+    def test_config_401_is_tolerated_and_sso_is_not_offered(self):
+        class Opener:
+            def open(self, request, **kwargs):
+                if request.full_url.endswith('/api/config'):
+                    raise urllib.error.HTTPError(request.full_url, 401, 'Unauthorized', {}, io.BytesIO(b'{}'))
+                raise AssertionError('unexpected endpoint ' + request.full_url)
+        with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', return_value=Opener()):
+            with self.assertRaises(ConsentError) as raised:
+                connect({'project': 'selected', 'consent': 'yes'}, BASE, Path(home))
+        self.assertEqual(raised.exception.field, 'code')
+        self.assertIn('not enabled', str(raised.exception).lower())
+        self.assertEqual(list(Path(home).rglob('connection.json')), [])
+
+
+class PortalCredentialTests(unittest.TestCase):
+    """Copy/paste enrollment: a credential minted in the portal, no /api/login, no az."""
+
+    def test_credential_path_verifies_stores_and_never_calls_login_or_az(self):
+        requests = []
+        class Opener:
+            def open(self, request, **kwargs):
+                requests.append(request)
+                return Response({'stored': True})
+        with tempfile.TemporaryDirectory() as home, \
+             patch('urllib.request.build_opener', return_value=Opener()), \
+             patch('amplifier_module_tool_teamwork.entra.available', side_effect=AssertionError('entra touched')), \
+             patch('amplifier_module_tool_teamwork.entra.access_token', side_effect=AssertionError('entra touched')):
+            path, project = connect(
+                {'project': 'portal-project', 'credential': 'portal-token', 'consent': 'yes'},
+                BASE, Path(home), repository='https://github.com/owner/repo')
+            self.assertEqual(project, 'portal-project')
+            saved = json.loads(path.read_text())
+            self.assertEqual(saved['project_id'], 'portal-project')
+            self.assertEqual(saved['token'], 'portal-token')
+            self.assertIsNone(saved['harness_id'])
+            self.assertEqual(saved['repository_url'], 'https://github.com/owner/repo')
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(len(requests), 1)
+        self.assertTrue(requests[0].full_url.endswith('/api/v1/projects/portal-project/publish'))
+        self.assertEqual(requests[0].get_header('Authorization'), 'Bearer portal-token')
+        self.assertEqual(json.loads(requests[0].data), {'operations': []})
+        self.assertFalse(any(r.full_url.endswith('/api/login') for r in requests))
+
+    def test_rejected_credential_is_a_retryable_form_error_and_writes_nothing(self):
+        class Opener:
+            def open(self, request, **kwargs):
+                raise urllib.error.HTTPError(request.full_url, 401, 'Unauthorized', {}, io.BytesIO(b'{}'))
+        with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', return_value=Opener()):
+            with self.assertRaises(ConsentError) as raised:
+                connect({'project': 'portal-project', 'credential': 'bad-token', 'consent': 'yes'}, BASE, Path(home))
+        self.assertEqual(raised.exception.field, 'credential')
+        self.assertEqual(list(Path(home).rglob('connection.json')), [])
+
+    def test_credential_takes_precedence_over_sso_and_member_code_fields(self):
+        requests = []
+        class Opener:
+            def open(self, request, **kwargs):
+                requests.append(request)
+                return Response({'stored': True})
+        with tempfile.TemporaryDirectory() as home, \
+             patch('urllib.request.build_opener', return_value=Opener()), \
+             patch('amplifier_module_tool_teamwork.entra.available', side_effect=AssertionError('entra touched')):
+            path, project = connect(
+                {'project': 'portal-project', 'credential': 'portal-token',
+                 'name': 'Fixture', 'code': 'private-fixture-code', 'consent': 'yes'},
+                BASE, Path(home))
+        self.assertEqual(project, 'portal-project')
+        self.assertTrue(all('/api/login' not in r.full_url and '/api/harnesses' not in r.full_url
+                            for r in requests))
+
+    def test_credential_path_reuses_an_existing_saved_connection(self):
+        with tempfile.TemporaryDirectory() as home:
+            home_path = Path(home)
+            directory = home_path / sha(BASE + "\0" + "portal-project")
+            directory.mkdir(parents=True, mode=0o700)
+            saved_path = directory / "connection.json"
+            saved_path.write_text(json.dumps({
+                "base_url": BASE, "project_id": "portal-project",
+                "token": "existing-token", "harness_id": None,
+            }))
+            saved_path.chmod(0o600)
+            with patch('urllib.request.build_opener', side_effect=AssertionError('network touched')):
+                with self.assertRaises(ConsentError) as raised:
+                    connect(
+                        {'project': 'portal-project', 'credential': 'new-token', 'consent': 'yes'}, BASE, home_path)
+            self.assertIn('already saved', str(raised.exception).lower())
+            self.assertIn('delete', raised.exception.hint.lower())
+            self.assertEqual(json.loads(saved_path.read_text())['token'], 'existing-token')
+
+    def test_valid_credential_returns_422_from_the_real_endpoint_and_is_verified(self):
+        """Empirically confirmed against the live web origin: a valid token
+        scoped to the requested project returns 422 invalid_request ("Supply
+        1-20 operations") for a zero-operation batch -- not 2xx. An invalid
+        token returns 401 regardless of project; a valid token against the
+        WRONG project returns 404. This is the exact shape the service
+        returned; it must be treated as verified, not merely tolerated."""
+        requests = []
+        class Opener:
+            def open(self, request, **kwargs):
+                requests.append(request)
+                body = b'{"error": {"code": "invalid_request", "message": "Supply 1\xe2\x80\x9320 operations"}}'
+                raise urllib.error.HTTPError(request.full_url, 422, 'Unprocessable Entity', {}, io.BytesIO(body))
+        with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', return_value=Opener()):
+            path, project = connect(
+                {'project': 'portal-project', 'credential': 'portal-token', 'consent': 'yes'}, BASE, Path(home))
+            self.assertEqual(project, 'portal-project')
+            self.assertEqual(json.loads(path.read_text())['token'], 'portal-token')
+        self.assertEqual(len(requests), 1)
+
+    def test_credential_verification_5xx_is_not_treated_as_verified_and_writes_nothing(self):
+        class Opener:
+            def open(self, request, **kwargs):
+                raise urllib.error.HTTPError(request.full_url, 500, 'Internal Server Error', {}, io.BytesIO(b'{}'))
+        with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', return_value=Opener()):
+            with self.assertRaises(ConsentError) as raised:
+                connect({'project': 'portal-project', 'credential': 'portal-token', 'consent': 'yes'}, BASE, Path(home))
+        self.assertEqual(raised.exception.field, 'credential')
+        self.assertIn('could not verify', str(raised.exception).lower())
+        self.assertEqual(list(Path(home).rglob('connection.json')), [])
+
+    def test_credential_verification_unexpected_4xx_is_not_treated_as_verified_and_writes_nothing(self):
+        class Opener:
+            def open(self, request, **kwargs):
+                raise urllib.error.HTTPError(request.full_url, 404, 'Not Found', {}, io.BytesIO(b'{}'))
+        with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', return_value=Opener()):
+            with self.assertRaises(ConsentError) as raised:
+                connect({'project': 'portal-project', 'credential': 'portal-token', 'consent': 'yes'}, BASE, Path(home))
+        self.assertEqual(raised.exception.field, 'credential')
+        self.assertIn('could not verify', str(raised.exception).lower())
+        self.assertEqual(list(Path(home).rglob('connection.json')), [])
+
+    def test_credential_verification_timeout_is_not_treated_as_verified_and_writes_nothing(self):
+        import socket
+        class Opener:
+            def open(self, request, **kwargs):
+                raise socket.timeout('timed out')
+        with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', return_value=Opener()):
+            with self.assertRaises(ConsentError) as raised:
+                connect({'project': 'portal-project', 'credential': 'portal-token', 'consent': 'yes'}, BASE, Path(home))
+        self.assertEqual(raised.exception.field, 'credential')
+        self.assertIn('could not verify', str(raised.exception).lower())
+        self.assertEqual(list(Path(home).rglob('connection.json')), [])
+
+
+class ServiceConfigTests(unittest.TestCase):
+    """_fetch_service_config narrows: auth-layer rejection tolerated, other failures surfaced."""
+
+    def test_connection_error_reaching_config_is_a_clear_retryable_error(self):
+        class Opener:
+            def open(self, request, **kwargs):
+                raise urllib.error.URLError('Connection refused')
+        with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', return_value=Opener()), \
+             patch('amplifier_module_tool_teamwork.entra.available', return_value=True):
+            with self.assertRaises(ConsentError) as raised:
+                connect({'project': 'selected', 'consent': 'yes'}, BASE, Path(home))
+        self.assertIn('unreachable', str(raised.exception).lower())
+        self.assertIn(urllib.parse.urlsplit(BASE).hostname, str(raised.exception))
+        self.assertEqual(list(Path(home).rglob('connection.json')), [])
+
+    def test_config_401_still_proceeds_to_the_member_code_fallback(self):
+        class Opener:
+            def open(self, request, **kwargs):
+                if request.full_url.endswith('/api/config'):
+                    raise urllib.error.HTTPError(request.full_url, 401, 'Unauthorized', {}, io.BytesIO(b'{}'))
+                raise AssertionError('unexpected endpoint ' + request.full_url)
+        with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', return_value=Opener()), \
+             patch('amplifier_module_tool_teamwork.entra.available', return_value=True):
+            with self.assertRaises(ConsentError) as raised:
+                connect({'project': 'selected', 'consent': 'yes'}, BASE, Path(home))
+        self.assertEqual(raised.exception.field, 'code')
+        self.assertIn('not enabled', str(raised.exception).lower())
 
 
 class BrowserTests(unittest.TestCase):
@@ -136,7 +498,7 @@ class BrowserTests(unittest.TestCase):
             status, body = self.post(url, good, {'Origin': origin})
             self.assertEqual(status, 200)
             self.assertNotIn(FORM['code'], body)
-        def enroll(form, base, home):
+        def enroll(form, base, home, repository=None):
             seen.append(form); return Path('/private/fixture.json'), 'selected'
         with patch('amplifier_module_tool_teamwork.connect', side_effect=enroll):
             result = self.drive(act)
@@ -152,7 +514,7 @@ class BrowserTests(unittest.TestCase):
             status, _ = self.post(url, dict(FORM, csrf=self.token(page)),
                                   {'Origin': 'null', 'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'navigate'})
             self.assertEqual(status, 200)
-        def enroll(form, base, home):
+        def enroll(form, base, home, repository=None):
             seen.append(form); return Path('/private/fixture.json'), 'selected'
         with patch('amplifier_module_tool_teamwork.connect', side_effect=enroll):
             self.drive(act)
@@ -172,7 +534,7 @@ class BrowserTests(unittest.TestCase):
             self.assertIn('type="password"', body)
             status, body = self.post(url, dict(FORM, csrf=self.token(body)), {'Origin': origin})
             self.assertEqual(status, 200)
-        def enroll(form, base, home):
+        def enroll(form, base, home, repository=None):
             attempts.append(form['project'])
             if form['project'] == 'rejected':
                 raise ConsentError('Fixture reason', 'project', 'Fixture hint')
@@ -190,7 +552,7 @@ class BrowserTests(unittest.TestCase):
             for secret in ('service-detail-leak', 'session=cookievalue', FORM['code']):
                 self.assertNotIn(secret, body)
             self.assertIn('type="password"', body)
-        def enroll(form, base, home):
+        def enroll(form, base, home, repository=None):
             raise RuntimeError('service-detail-leak session=cookievalue')
         with patch('amplifier_module_tool_teamwork.connect', side_effect=enroll):
             result = self.drive(act, timeout=1)
@@ -366,6 +728,111 @@ class NativeToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(result.success)
             self.assertNotIn('private-fixture-code', str(result))
             self.assertFalse(root.handlers)
+
+
+class AutoBindTests(unittest.IsolatedAsyncioTestCase):
+    """teamwork_bind with an omitted project_id: local-first, network as fallback (A7)."""
+
+    def _native_dir(self, home):
+        directory = Path(home) / ".config" / "amplifier-teamwork" / "native"
+        directory.mkdir(parents=True)
+        return directory
+
+    def _write_connection(self, directory, name, data):
+        folder = directory / name
+        folder.mkdir()
+        path = folder / "connection.json"
+        path.write_text(json.dumps(data))
+        path.chmod(0o600)
+        return path
+
+    async def test_bind_without_project_uses_a_saved_connection_matching_the_git_remote(self):
+        root = Coordinator()
+        with tempfile.TemporaryDirectory() as home:
+            native = self._native_dir(home)
+            self._write_connection(native, "match", {
+                "base_url": BASE, "project_id": "auto-project", "token": "auto-token",
+                "repository_url": "https://github.com/owner/repo",
+            })
+            with patch.dict(os.environ, {"HOME": home}, clear=False), \
+                 patch('amplifier_module_tool_teamwork.git_remote.origin_url',
+                       return_value='git@github.com:owner/repo.git'):
+                tool = TeamworkBind(root, {})
+                result = await tool.execute({})
+        self.assertTrue(result.success)
+        self.assertEqual(result.output['project'], 'auto-project')
+        hook = root.handlers[0][1].__self__
+        self.assertEqual(hook.connection['project_id'], 'auto-project')
+        self.assertEqual(hook.connection['token'], 'auto-token')
+
+    async def test_bind_reports_candidates_when_two_saved_connections_match(self):
+        root = Coordinator()
+        with tempfile.TemporaryDirectory() as home:
+            native = self._native_dir(home)
+            self._write_connection(native, "a", {
+                "base_url": BASE, "project_id": "proj-a", "token": "t",
+                "repository_url": "https://github.com/owner/repo",
+            })
+            self._write_connection(native, "b", {
+                "base_url": BASE, "project_id": "proj-b", "token": "t",
+                "repository_url": "https://github.com/owner/repo",
+            })
+            with patch.dict(os.environ, {"HOME": home}, clear=False), \
+                 patch('amplifier_module_tool_teamwork.git_remote.origin_url',
+                       return_value='git@github.com:owner/repo.git'):
+                tool = TeamworkBind(root, {})
+                result = await tool.execute({})
+        self.assertFalse(result.success)
+        self.assertIn('proj-a', str(result))
+        self.assertIn('proj-b', str(result))
+        self.assertFalse(root.handlers)
+
+    async def test_bind_falls_back_to_discover_when_no_saved_connection_matches(self):
+        root = Coordinator()
+        with tempfile.TemporaryDirectory() as home:
+            self._native_dir(home)  # empty: no saved connection matches
+
+            class Opener:
+                def open(self, request, **kwargs):
+                    return Response({'selected_project_id': 'discovered-project'})
+
+            with patch.dict(os.environ, {"HOME": home}, clear=False), \
+                 patch('amplifier_module_tool_teamwork.git_remote.origin_url',
+                       return_value='git@github.com:owner/repo.git'), \
+                 patch('urllib.request.build_opener', return_value=Opener()):
+                tool = TeamworkBind(root, {'base_url': BASE, 'token': 'discover-token'})
+                result = await tool.execute({})
+        self.assertTrue(result.success)
+        self.assertEqual(result.output['project'], 'discovered-project')
+        hook = root.handlers[0][1].__self__
+        self.assertEqual(hook.connection['project_id'], 'discovered-project')
+
+    async def test_bind_discover_401_is_tolerated_with_a_clear_message(self):
+        root = Coordinator()
+        with tempfile.TemporaryDirectory() as home:
+            self._native_dir(home)  # empty: no saved connection matches
+
+            class Opener:
+                def open(self, request, **kwargs):
+                    raise urllib.error.HTTPError(request.full_url, 401, 'Unauthorized', {}, io.BytesIO(b'{}'))
+
+            with patch.dict(os.environ, {"HOME": home}, clear=False), \
+                 patch('amplifier_module_tool_teamwork.git_remote.origin_url',
+                       return_value='git@github.com:owner/repo.git'), \
+                 patch('urllib.request.build_opener', return_value=Opener()):
+                tool = TeamworkBind(root, {'base_url': BASE, 'token': 'discover-token'})
+                result = await tool.execute({})
+        self.assertFalse(result.success)
+        self.assertIn('not available', str(result).lower())
+        self.assertFalse(root.handlers)
+
+    async def test_bind_without_a_git_remote_asks_for_a_project_id(self):
+        root = Coordinator()
+        with patch('amplifier_module_tool_teamwork.git_remote.origin_url', return_value=None):
+            result = await TeamworkBind(root, {'base_url': BASE, 'token': 'token'}).execute({})
+        self.assertFalse(result.success)
+        self.assertIn('project_id', str(result))
+        self.assertFalse(root.handlers)
 
 
 if __name__ == '__main__': unittest.main()

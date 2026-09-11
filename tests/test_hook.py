@@ -11,7 +11,8 @@ import subprocess
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "modules/hooks-teamwork"))
 from amplifier_module_hooks_teamwork import (HTTPClient, Journal, TeamworkHook, SyncError, sha, NoRedirect,
                                              mount, resolve_connection, describe, PERSON_FIELDS, verbosity,
-                                             PRESENCE_SUMMARY, TasksTool, ClaimTool, ProgressTool)
+                                             PRESENCE_SUMMARY, TasksTool, ClaimTool, ProgressTool,
+                                             RETIRED_MESSAGE)
 
 
 class Context:
@@ -616,6 +617,64 @@ class RedirectTests(unittest.TestCase):
         request = urllib.request.Request('https://team.example.invalid/api/v1/projects/test/context', headers={'Authorization': 'Bearer fixture'})
         with self.assertRaises(urllib.error.HTTPError):
             NoRedirect().redirect_request(request, None, 307, 'Moved', {}, 'https://other.example.invalid/')
+
+
+class RetiredHostTests(unittest.IsolatedAsyncioTestCase):
+    """A retired base_url must never spin: mount stays inert and says so once."""
+
+    class Hooks:
+        def __init__(self):
+            self.handlers = {}
+
+        def register(self, event, handler, priority=0, name=None):
+            self.handlers[name] = (event, handler)
+
+        def unregister(self, name):
+            self.handlers.pop(name, None)
+
+    class Root:
+        parent_id = None
+        session_id = "retired-session"
+
+        def __init__(self):
+            self.hooks = RetiredHostTests.Hooks()
+            self.capabilities = {}
+
+        def register_capability(self, name, value):
+            self.capabilities[name] = value
+
+    async def test_retired_host_connection_stays_inert_and_says_so_once(self):
+        root = self.Root()
+        result = await mount(root, {
+            "share_visible_turns": True,
+            "base_url": "https://team.amplifier.run",
+            "token": "fixture-token",
+        })
+        self.assertIsNone(result)
+        self.assertNotIn("teamwork.session_id", root.capabilities)
+        self.assertEqual(len(root.hooks.handlers), 1)
+        event, handler = next(iter(root.hooks.handlers.values()))
+        self.assertEqual(event, "prompt:submit")
+        first = await handler("prompt:submit", {})
+        self.assertEqual(first.user_message, RETIRED_MESSAGE)
+        self.assertEqual(len(root.hooks.handlers), 0)
+        # A retired-host result never performs a second HTTP call: the handler
+        # unregistered itself, so a second submit reaches no Teamwork handler at all.
+
+    async def test_retired_host_bind_returns_the_update_hint(self):
+        # Same retired base_url, but with a project_id set -- the "bind" shape.
+        root = self.Root()
+        result = await mount(root, {
+            "share_visible_turns": True,
+            "base_url": "https://team.amplifier.run",
+            "token": "fixture-token",
+            "project_id": "some-project",
+        })
+        self.assertIsNone(result)
+        self.assertNotIn("teamwork.session_id", root.capabilities)
+        event, handler = next(iter(root.hooks.handlers.values()))
+        notice = await handler("prompt:submit", {})
+        self.assertEqual(notice.user_message, RETIRED_MESSAGE)
 
 
 class MountTests(unittest.IsolatedAsyncioTestCase):

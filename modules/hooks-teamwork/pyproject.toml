@@ -1,11 +1,17 @@
 [project]
 name = "amplifier-module-hooks-teamwork"
-version = "0.1.0"
+version = "0.2.0"
 description = "Opt-in project-scoped Teamwork session sharing and context receipts"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 # amplifier-core is a peer dependency supplied by the Amplifier host.
 dependencies = []
+
+# azure-identity is lazy-imported (see amplifier_module_hooks_teamwork/entra.py)
+# so a host without it keeps the member-code enrollment path working. Install
+# this extra to enable `az login` SSO enrollment.
+[project.optional-dependencies]
+sso = ["azure-identity>=1.17,<2"]
 
 [project.entry-points."amplifier.modules"]
 hooks-teamwork = "amplifier_module_hooks_teamwork:mount"

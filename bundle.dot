@@ -2,18 +2,18 @@ digraph teamwork {
     rankdir=LR
     fontname="Helvetica"
     fontsize=12
-    label="teamwork v0.1.0 — bundle repo"
+    label="teamwork v0.2.0 — bundle repo"
     labelloc=t
     labeljust=c
     nodesep=0.6
     ranksep=0.7
     bgcolor="white"
-    source_hash="51169b22ac1fe97c55b69b47255d440c6acda57c9e66b39774fb69001cb86418"
+    source_hash="eabf46aba12adbe35f74deaebe9bb8b220621fc80306348ffc8e11a454e85ce5"
 
     node [fontname="Helvetica", fontsize=11, style="filled,rounded"]
     edge [fontname="Helvetica", fontsize=9]
 
-    root_teamwork [label="teamwork v0.1.0\n0 tools · 0 agents\n~68 tok aggregate", shape=box, fillcolor="#80cbc4", style="filled,rounded,bold", penwidth=2]
+    root_teamwork [label="teamwork v0.2.0\n0 tools · 0 agents\n~68 tok aggregate", shape=box, fillcolor="#80cbc4", style="filled,rounded,bold", penwidth=2]
 
     subgraph cluster_behaviors {
         label="Behaviors"

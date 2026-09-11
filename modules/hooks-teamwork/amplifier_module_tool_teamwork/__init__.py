@@ -7,14 +7,16 @@ import secrets
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
-from amplifier_module_hooks_teamwork import mount as mount_hook, sha
-from amplifier_module_hooks_teamwork.service_url import service_origin, validate_service_url
+from amplifier_module_hooks_teamwork import RETIRED_HOSTS, RETIRED_MESSAGE, entra, git_remote, mount as mount_hook, sha
+from amplifier_module_hooks_teamwork.service_url import DEFAULT_BASE_URL, service_origin, validate_service_url
 from amplifier_module_hooks_teamwork import NoRedirect
 from amplifier_module_tool_teamwork.page import form_page, result_page
 
@@ -22,6 +24,20 @@ __amplifier_module_type__ = "tool"
 
 IDLE_TIMEOUT = 900
 POINTER_NAME = "pending-form-url.txt"
+
+# One consent checkbox mints all three; the member-code path now requests the
+# same set so a later publish call never needs a separate re-enrollment.
+SCOPES = ["context:read", "session:write", "shared:write"]
+
+# The Azure Container Apps origin can cold-start after scale-to-zero, taking
+# 30-60s to answer its first request. A request-level timeout shorter than
+# that turns a normal cold start into a spurious enrollment failure.
+HTTP_TIMEOUT = 75
+
+# Distinguishes "the discover endpoint refused the request" (EasyAuth gating,
+# or a service that has not rolled out bearer auth on it yet) from "reached
+# the service, no matching project" -- the two need different messages.
+_DISCOVER_UNAVAILABLE = object()
 
 
 class ConsentError(ValueError):
@@ -37,70 +53,337 @@ class ConsentAborted(RuntimeError):
     """Self-authored message safe to return to the model; never service text."""
 
 
-def connect(form, base, home):
-    """Called only with private browser input, never model-supplied credentials."""
-    project = form.get("project", "").strip()
-    if not project:
-        raise ConsentError("Enter the project ID you joined.", "project",
-                           "Use the exact project ID shown in Teamwork.")
-    if len(project) > 200:
-        raise ConsentError("That project ID is too long.", "project", "Project IDs are at most 200 characters.")
-    if form.get("consent") != "yes":
-        raise ConsentError("Consent is required before anything is shared.", "consent",
-                           "Tick the consent box to enable sharing for this session.")
+class _MintError(Exception):
+    """An HTTP error response from a bearer-authenticated mint/revoke call."""
+
+    def __init__(self, status, payload):
+        super().__init__(status)
+        self.status = status
+        self.payload = payload if isinstance(payload, dict) else {}
+
+
+def _http(base, endpoint, body=None, headers=None):
+    """A single request; NoRedirect refuses redirects. Raises urllib.error.HTTPError untouched."""
+    headers = dict(headers or {})
+    headers.setdefault("Origin", service_origin(base))
+    data = json.dumps(body).encode() if body is not None else None
+    if data is not None:
+        headers.setdefault("Content-Type", "application/json")
+    request = urllib.request.Request(base + endpoint, data=data, headers=headers)
+    with urllib.request.build_opener(NoRedirect()).open(request, timeout=HTTP_TIMEOUT) as response:
+        return json.load(response), response.headers
+
+
+def _http_bearer(base, endpoint, body, bearer, extra_headers=None):
+    """POST with an Entra bearer; HTTP error responses surface their JSON body via _MintError."""
+    headers = {"Authorization": "Bearer " + bearer}
+    if extra_headers:
+        headers.update(extra_headers)
+    try:
+        return _http(base, endpoint, body, headers)
+    except urllib.error.HTTPError as error:
+        try:
+            payload = json.loads(error.read() or b"{}")
+        except ValueError:
+            payload = {}
+        finally:
+            error.close()
+        raise _MintError(error.code, payload) from None
+
+
+def _safe_directory(home, base, project):
     directory = home / sha(base + "\0" + project)
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     if directory.is_symlink() or (os.name != "nt" and directory.stat().st_mode & 0o077):
         raise ConsentError("The local connection folder is not private.", None,
                            "Remove group and other permissions on ~/.config/amplifier-teamwork/native, then retry.")
+    return directory
+
+
+def _reuse_saved_connection(path, base, project):
+    if path.is_symlink() or (os.name != "nt" and path.stat().st_mode & 0o077):
+        raise ConsentError("The saved connection file is not private.", None,
+                           "Restore mode 0600 on the saved connection file, then retry.")
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError:
+        raise ConsentError("The saved connection file is unreadable.", None,
+                           "Revoke that harness in Teamwork, delete the saved file, then enroll again.") from None
+    if saved.get("base_url") != base or saved.get("project_id") != project or not saved.get("token"):
+        raise ConsentError("A different connection is already saved for this project.", "project",
+                           "Revoke that harness in Teamwork and delete its saved file before re-enrolling.")
+    return path, project
+
+
+def _write_connection(output, base, project, credential, repository):
+    data = {"base_url": base, "project_id": project, "token": credential["token"], "harness_id": credential["id"]}
+    if repository:
+        data["repository_url"] = repository
+    json.dump(data, output)
+    output.flush()
+    os.fsync(output.fileno())
+
+
+def _write_recovery_breadcrumb(directory, harness_id):
+    """Preserve recovery evidence privately, without returning the credential."""
+    recovery = directory / ("recovery-" + uuid.uuid4().hex + ".json")
+    with os.fdopen(os.open(recovery, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as output:
+        json.dump({"harness_id": harness_id, "action": "Revoke in Teamwork harness controls"}, output)
+
+
+def _mint_member(form, base, home, project, repository):
+    """Member-code path: reserve the file before issuing a credential; never overwrite."""
+    directory = _safe_directory(home, base, project)
     path = directory / "connection.json"
     if path.exists():
-        if path.is_symlink() or (os.name != "nt" and path.stat().st_mode & 0o077):
-            raise ConsentError("The saved connection file is not private.", None,
-                               "Restore mode 0600 on the saved connection file, then retry.")
-        try:
-            saved = json.loads(path.read_text())
-        except ValueError:
-            raise ConsentError("The saved connection file is unreadable.", None,
-                               "Revoke that harness in Teamwork, delete the saved file, then enroll again.") from None
-        if saved.get("base_url") != base or saved.get("project_id") != project or not saved.get("token"):
-            raise ConsentError("A different connection is already saved for this project.", "project",
-                               "Revoke that harness in Teamwork and delete its saved file before re-enrolling.")
-        return path, project
+        return _reuse_saved_connection(path, base, project)
     if not form.get("name", "").strip() or not form.get("code"):
         raise ConsentError("First enrollment needs your name and private member code.",
                            "name" if not form.get("name", "").strip() else "code",
                            "This project is not enrolled yet on this machine, so both fields are required.")
-    def post(endpoint, body, cookie=None):
-        headers = {"Content-Type": "application/json", "Origin": service_origin(base), "X-Teamwork-Project": project}
-        if cookie:
-            headers["Cookie"] = cookie
-        request = urllib.request.Request(base + endpoint, json.dumps(body).encode(), headers)
-        with urllib.request.build_opener(NoRedirect()).open(request, timeout=20) as response:
-            return json.load(response), response.headers
-    # Reserve before issuing a credential; never overwrite a concurrent enrollment.
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    credential = cookie = None
+    credential = None
+    cookie = None
     try:
         with os.fdopen(fd, "w") as output:
-            _, headers = post("/api/login", {"name": form["name"].strip(), "token": form["code"]})
+            _, headers = _http(base, "/api/login", {"name": form["name"].strip(), "token": form["code"]},
+                               {"X-Teamwork-Project": project})
             cookie = headers["Set-Cookie"].split(";")[0]
-            credential, _ = post("/api/harnesses", {"label": "Amplifier native", "scopes": ["context:read", "session:write"]}, cookie)
-            json.dump({"base_url": base, "project_id": project, "token": credential["token"], "harness_id": credential["id"]}, output)
-            output.flush()
-            os.fsync(output.fileno())
+            credential, _ = _http(base, "/api/harnesses", {"label": "Amplifier native", "scopes": SCOPES},
+                                  {"X-Teamwork-Project": project, "Cookie": cookie})
+            _write_connection(output, base, project, credential, repository)
     except BaseException:
         if credential:
             try:
-                post("/api/harnesses/revoke", {"id": credential["id"]}, cookie)
+                _http(base, "/api/harnesses/revoke", {"id": credential["id"]},
+                     {"X-Teamwork-Project": project, "Cookie": cookie})
             except Exception:
-                # Preserve recovery evidence privately, without returning the credential.
-                recovery = directory / ("recovery-" + uuid.uuid4().hex + ".json")
-                with os.fdopen(os.open(recovery, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as output:
-                    json.dump({"harness_id": credential["id"], "action": "Revoke in Teamwork harness controls"}, output)
+                _write_recovery_breadcrumb(directory, credential["id"])
         path.unlink(missing_ok=True)
         raise
     return path, project
+
+
+def _fetch_service_config(base):
+    """GET /api/config. A 401/403 (EasyAuth-at-the-gateway) means SSO is not
+    offered here -- treated identically to an explicitly unconfigured
+    service. Any OTHER failure (DNS, TLS, connection refused, timeout, 5xx)
+    is a service reachability problem, not an SSO-configuration signal, and
+    must not be misdiagnosed as "SSO not enabled": it is surfaced as a clear,
+    retryable error naming only the host, never the full URL or any path.
+    """
+    try:
+        config, _ = _http(base, "/api/config")
+    except urllib.error.HTTPError as error:
+        if error.code in (401, 403):
+            return {}
+        raise ConsentError(
+            "Teamwork service unreachable at " + (urlsplit(base).hostname or base) + ".", "code",
+            "Check the configured Teamwork service URL and your connection, then try again.",
+        ) from error
+    except Exception as error:
+        raise ConsentError(
+            "Teamwork service unreachable at " + (urlsplit(base).hostname or base) + ".", "code",
+            "Check the configured Teamwork service URL and your connection, then try again.",
+        ) from error
+    return config or {}
+
+
+def _mint_sso(form, base, home, project, repository):
+    """Entra-authenticated enrollment.
+
+    The directory key `sha(base + "\\0" + project)` is unknowable before the mint
+    when no project was typed, so this path inverts the member-code order: mint
+    first, then reserve the file. A conflict (an enrollment already saved under
+    the minted project) revokes the new credential with the same bearer and
+    reuses the saved connection instead of overwriting it.
+    """
+    api_app_id = _fetch_service_config(base).get("api_app_id") or ""
+    if not api_app_id:
+        raise ConsentError("Microsoft sign-in enrollment is not enabled on this service yet.", "code",
+                           "Enter your name and private member code below, then submit again.")
+    try:
+        bearer = entra.access_token("api://" + api_app_id + "/.default")
+    except entra.EntraUnavailable as error:
+        raise ConsentError(str(error), "code",
+                           "Enter your name and private member code below, then submit again.") from error
+
+    body = {"label": "Amplifier native", "scopes": SCOPES}
+    extra_headers = {}
+    if project:
+        extra_headers["X-Teamwork-Project"] = project
+    elif repository:
+        body["repository_url"] = repository
+
+    try:
+        credential = _http_bearer(base, "/api/harnesses", body, bearer, extra_headers)[0]
+    except _MintError as error:
+        if error.status == 409:
+            candidates = error.payload.get("projects") or []
+            raise ConsentError(
+                "That repository does not identify exactly one Teamwork project.", "project",
+                ("Type one of these project ids: " + ", ".join(candidates))
+                if candidates else "Type the exact project ID you joined.",
+            ) from None
+        if error.status in (401, 403):
+            raise ConsentError(
+                "Microsoft sign-in did not match a Teamwork member.", "name",
+                "Ask a maintainer to set your Teamwork email, or enroll with your name and private "
+                "member code below.",
+            ) from None
+        raise
+
+    minted_project = project or next(iter(credential.get("projects") or []), None)
+    if not minted_project:
+        raise ConsentError("Microsoft sign-in did not return a project.", "project",
+                           "Enter the project ID you joined.")
+
+    directory = _safe_directory(home, base, minted_project)
+    path = directory / "connection.json"
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        try:
+            _http_bearer(base, "/api/harnesses/revoke", {"id": credential["id"]}, bearer)
+        except Exception:
+            _write_recovery_breadcrumb(directory, credential["id"])
+        return _reuse_saved_connection(path, base, minted_project)
+    try:
+        with os.fdopen(fd, "w") as output:
+            _write_connection(output, base, minted_project, credential, repository)
+    except BaseException:
+        try:
+            _http_bearer(base, "/api/harnesses/revoke", {"id": credential["id"]}, bearer)
+        except Exception:
+            _write_recovery_breadcrumb(directory, credential["id"])
+        path.unlink(missing_ok=True)
+        raise
+    return path, minted_project
+
+
+def _verify_portal_credential(base, project, token):
+    """Verify a portal-minted credential with the least side-effecting
+    authenticated call available: a publish batch with zero operations.
+
+    Empirically confirmed against the live web origin (2026-09-10, reading
+    an already-enrolled native connection file's token in-process, token
+    never logged): this endpoint validates auth and project scope BEFORE it
+    ever inspects the operations list, so a genuinely valid token scoped to
+    this exact project returns 422 `invalid_request` ("Supply 1-20
+    operations") for a zero-operation batch -- not 2xx. An invalid token
+    returns 401 regardless of project. A valid token against the WRONG
+    project returns 404. So 422 (or an unexpected outright 2xx, should the
+    service's behavior ever change) is the positive signal; 401/403 is an
+    explicit rejection; anything else -- 404, 5xx, or a transport failure --
+    proves nothing either way and must not be treated as verified.
+    """
+    endpoint = "/api/v1/projects/" + project + "/publish"
+    try:
+        _http_bearer(base, endpoint, {"operations": []}, token)
+    except _MintError as error:
+        if error.status in (401, 403):
+            raise ConsentError(
+                "That credential was rejected.", "credential",
+                "Copy a fresh credential from the portal (Account menu \u2192 Manage my harnesses), "
+                "then submit again.",
+            ) from None
+        if error.status == 422:
+            return
+        raise ConsentError(
+            "Could not verify that credential with the service; try again.", "credential",
+            "The service did not confirm or reject the credential. Try again in a moment.",
+        ) from None
+    except Exception as error:
+        raise ConsentError(
+            "Could not verify that credential with the service; try again.", "credential",
+            "The service did not confirm or reject the credential. Try again in a moment.",
+        ) from error
+
+
+def _mint_credential(form, base, home, project, repository, token):
+    """Portal-issued credential: verify it, then reserve. No /api/login, no az.
+
+    Requires an explicit project id: unlike SSO's mint response, a manually
+    pasted credential carries no `projects` list to auto-pick from.
+
+    An existing saved connection for this project is never overwritten (see
+    AGENTS.md). Unlike the SSO/member-code paths -- where reuse is silent
+    because the user did not just hand over something new -- a pasted
+    credential IS something new, so silently keeping the old one would be a
+    surprise. This is reported explicitly, with how to rotate.
+    """
+    if not project:
+        raise ConsentError("Enter the project ID you joined.", "project",
+                           "Use the exact project ID shown in Teamwork.")
+    directory = _safe_directory(home, base, project)
+    path = directory / "connection.json"
+    if path.exists():
+        _reuse_saved_connection(path, base, project)  # validates private/readable/matching; raises on mismatch
+        raise ConsentError(
+            "A connection for this project is already saved on this machine; the pasted credential was not used.",
+            "credential",
+            "To use a different credential, revoke the old harness in Teamwork, delete the saved connection "
+            "file for this project, then reconnect.",
+        )
+    _verify_portal_credential(base, project, token)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w") as output:
+            data = {"base_url": base, "project_id": project, "token": token, "harness_id": None}
+            if repository:
+                data["repository_url"] = repository
+            json.dump(data, output)
+            output.flush()
+            os.fsync(output.fileno())
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    return path, project
+
+
+def connect(form, base, home, repository=None):
+    """Called only with private browser input, never model-supplied credentials.
+
+    No network call happens before consent. Dispatch order: (1) a portal
+    credential, when supplied, always wins -- `_mint_credential`; (2) SSO,
+    only when the code field is blank, Entra sign-in is available on this
+    host, AND the service advertises an `api_app_id` -- `_mint_sso`;
+    (3) otherwise the member-code path -- `_mint_member`, widened to request
+    all three scopes the single consent checkbox describes.
+    """
+    if form.get("consent") != "yes":
+        raise ConsentError("Consent is required before anything is shared.", "consent",
+                           "Tick the consent box to enable sharing for this session.")
+    project = form.get("project", "").strip()
+    if len(project) > 200:
+        raise ConsentError("That project ID is too long.", "project", "Project IDs are at most 200 characters.")
+    credential = form.get("credential", "").strip()
+    if credential:
+        # Takes precedence: a portal credential is a complete, already-minted
+        # answer, so neither SSO nor the member-code fields are consulted.
+        return _mint_credential(form, base, home, project, repository, credential)
+    use_sso = not form.get("code") and entra.available()
+
+    if project:
+        # The directory key is known upfront, so an existing saved connection
+        # is checked (and reused) before anything is minted, for either
+        # auth method -- no network call happens for an already-enrolled project.
+        directory = _safe_directory(home, base, project)
+        path = directory / "connection.json"
+        if path.exists():
+            return _reuse_saved_connection(path, base, project)
+        if use_sso:
+            return _mint_sso(form, base, home, project, repository)
+        if not form.get("name", "").strip() or not form.get("code"):
+            raise ConsentError("First enrollment needs your name and private member code.",
+                               "name" if not form.get("name", "").strip() else "code",
+                               "This project is not enrolled yet on this machine, so both fields are required.")
+        return _mint_member(form, base, home, project, repository)
+
+    if use_sso:
+        return _mint_sso(form, base, home, project, repository)
+    raise ConsentError("Enter the project ID you joined.", "project",
+                       "Use the exact project ID shown in Teamwork.")
 
 
 def publish_pointer(home, url):
@@ -138,12 +421,13 @@ def announce(url, pointer, opened, minutes, stream=None):
         pass
 
 
-def private_browser_connect(base, home, stop, timeout=IDLE_TIMEOUT, notify=announce):
+def private_browser_connect(base, home, stop, timeout=IDLE_TIMEOUT, notify=announce, repository=None):
     """Serve a private consent form. `timeout` is the IDLE window; activity resets it."""
     nonce = secrets.token_urlsafe(32)
     csrf = secrets.token_urlsafe(32)
     style_nonce = secrets.token_urlsafe(16)
     minutes = max(1, round(timeout / 60))
+    sso = entra.available()
     outcome, cancelled, expired = [], [], []
     activity = [0]
     guard = threading.Lock()
@@ -174,7 +458,8 @@ def private_browser_connect(base, home, stop, timeout=IDLE_TIMEOUT, notify=annou
             return origin in (None, "null", "http://" + address) and site in (None, "same-origin", "none")
 
         def form(self, status=200, values=None, error=None, field=None, hint=None):
-            self.reply(status, form_page(nonce, csrf, style_nonce, base, minutes, values, error, field, hint))
+            self.reply(status, form_page(nonce, csrf, style_nonce, base, minutes, values, error, field, hint,
+                                         sso=sso, repository=repository))
 
         def stale(self):
             # A late request gets an explanation instead of ERR_CONNECTION_REFUSED.
@@ -256,7 +541,7 @@ def private_browser_connect(base, home, stop, timeout=IDLE_TIMEOUT, notify=annou
                 with guard:
                     if outcome:
                         return self.done()
-                    outcome.append(connect(form, base, home))
+                    outcome.append(connect(form, base, home, repository=repository))
             except ConsentError as error:
                 return self.form(400, kept, str(error), error.field, error.hint)
             except Exception:
@@ -314,7 +599,7 @@ class TeamworkConnect:
 
     def __init__(self, coordinator, config):
         self.coordinator = coordinator
-        self.base = validate_service_url(config.get("base_url", "https://team.amplifier.run"))
+        self.base = validate_service_url(config.get("base_url", DEFAULT_BASE_URL))
         # Forwarded so a session connected through this tool honours the same level.
         self.notice = {"verbosity": config["verbosity"]} if "verbosity" in config else {}
         self.home = Path(config.get("connection_directory", "~/.config/amplifier-teamwork/native")).expanduser()
@@ -325,11 +610,15 @@ class TeamworkConnect:
         from amplifier_core import ToolResult
         if input:
             return ToolResult(success=False, error={"message": "This tool accepts no arguments. Enter information only in the private browser form."})
+        if urlsplit(self.base).hostname in RETIRED_HOSTS:
+            return ToolResult(success=False, error={"message": RETIRED_MESSAGE})
         async with self.lock:
             rebind = self.coordinator.get_capability("teamwork.rebind")
             stop = threading.Event()
+            repository = await asyncio.to_thread(lambda: git_remote.repository_identity(git_remote.origin_url()))
             try:
-                path, project = await asyncio.to_thread(private_browser_connect, self.base, self.home, stop, self.timeout)
+                path, project = await asyncio.to_thread(
+                    private_browser_connect, self.base, self.home, stop, self.timeout, announce, repository)
                 if rebind is not None:
                     # Already sharing: move this session rather than mounting twice,
                     # handing over the project-scoped credential the form just minted.
@@ -351,12 +640,12 @@ class TeamworkBind:
         "Bind this Amplifier session to a Teamwork project, or move it to a different one. "
         "Uses the service URL and harness credential already configured on this machine; "
         "never ask for or pass credentials. Sharing begins with the next prompt. "
-        "Use teamwork_connect instead when no credential is configured yet."
+        "Use teamwork_connect instead when no credential is configured yet. "
+        "Omit project_id to bind the project linked to this working directory's git remote."
     )
     input_schema = {
         "type": "object",
         "properties": {"project_id": {"type": "string", "description": "Exact project id to bind this session to."}},
-        "required": ["project_id"],
         "additionalProperties": False,
     }
 
@@ -369,18 +658,28 @@ class TeamworkBind:
     async def execute(self, input):
         from amplifier_core import ToolResult
         project = str((input or {}).get("project_id", "")).strip()
-        if not project:
-            return ToolResult(success=False, error={"message": "A project id is required."})
+        configured_base = self.config.get("base_url")
+        if configured_base and urlsplit(configured_base).hostname in RETIRED_HOSTS:
+            return ToolResult(success=False, error={"message": RETIRED_MESSAGE})
         async with self.lock:
+            saved_connection = None
+            if not project:
+                resolved = await self._resolve_project_from_git_remote()
+                if isinstance(resolved, ToolResult):
+                    return resolved
+                project, saved_connection = resolved
             rebind = self.coordinator.get_capability("teamwork.rebind")
             if rebind is not None:
                 # Already sharing: move this session without re-registering handlers.
                 try:
-                    rebind(project)
+                    rebind(project, saved_connection)
                 except Exception:
                     return ToolResult(success=False, error={"message": "Could not bind that project."})
                 return ToolResult(success=True, output={"project": project, "sharing": "rebound; effective from the next prompt"})
-            settings = {key: self.config[key] for key in ("base_url", "token", "connection_file") if self.config.get(key)}
+            if saved_connection is not None:
+                settings = {key: saved_connection[key] for key in ("base_url", "token", "harness_id") if saved_connection.get(key)}
+            else:
+                settings = {key: self.config[key] for key in ("base_url", "token", "connection_file") if self.config.get(key)}
             if not settings.get("token") and not settings.get("connection_file"):
                 return ToolResult(success=False, error={"message": "No Teamwork credential is configured. Use teamwork_connect to enroll first."})
             try:
@@ -390,6 +689,84 @@ class TeamworkBind:
             if self.coordinator.get_capability("teamwork.session_id") is None:
                 return ToolResult(success=False, error={"message": "Binding did not take effect; nothing is being shared."})
             return ToolResult(success=True, output={"project": project, "sharing": "enabled for subsequent prompts in this session"})
+
+    async def _resolve_project_from_git_remote(self):
+        """Local-first auto-bind for an omitted project_id (A7).
+
+        The canonical repository_url stored in connection.json at enrollment is
+        matched against this directory's git remote across saved connections.
+        Network `discover` is retained only as a confirm/diagnose fallback: a
+        harness credential can never see a project other than its own, so it
+        cannot move a session between projects -- it can only confirm the one
+        the credential already holds.
+        """
+        from amplifier_core import ToolResult
+        identity = await asyncio.to_thread(lambda: git_remote.repository_identity(git_remote.origin_url()))
+        if not identity:
+            return ToolResult(success=False, error={"message": "This directory has no usable GitHub remote. Pass project_id."})
+        matches = await asyncio.to_thread(self._saved_connections_matching, identity)
+        if len(matches) == 1:
+            saved = matches[0]
+            return saved["project_id"], saved
+        if len(matches) > 1:
+            candidates = ", ".join(sorted(saved["project_id"] for saved in matches))
+            return ToolResult(success=False, error={
+                "message": "Several saved connections match this repository: " + candidates + ". Pass project_id."})
+        discovered = await self._discover_project(identity)
+        if discovered is _DISCOVER_UNAVAILABLE:
+            return ToolResult(success=False, error={
+                "message": "Project discovery is not available on this service yet. Pass project_id."})
+        if discovered:
+            return discovered, None
+        return ToolResult(success=False, error={
+            "message": "No Teamwork project you can reach is linked to this repository. Link it in Teamwork, or pass project_id."})
+
+    def _saved_connections_matching(self, identity):
+        """Mode-0600 connection.json files under the native enrollment directory only."""
+        home = Path("~/.config/amplifier-teamwork/native").expanduser()
+        matches = []
+        if not home.is_dir():
+            return matches
+        for connection_file in sorted(home.glob("*/connection.json")):
+            try:
+                if os.name != "nt" and connection_file.stat().st_mode & 0o077:
+                    continue
+                saved = json.loads(connection_file.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if saved.get("repository_url") == identity and saved.get("project_id") and saved.get("token"):
+                matches.append(saved)
+        return matches
+
+    async def _discover_project(self, identity):
+        """Network confirm/diagnose only; the currently configured credential
+        can only ever see its own project (see module docstring above)."""
+        base = self.config.get("base_url")
+        token = self.config.get("token")
+        if not base or not token:
+            return None
+
+        def call():
+            headers = {"Content-Type": "application/json", "Authorization": "Bearer " + token,
+                       "Origin": service_origin(base)}
+            request = urllib.request.Request(base + "/api/projects/discover",
+                                             json.dumps({"repository_url": identity}).encode(), headers)
+            with urllib.request.build_opener(NoRedirect()).open(request, timeout=HTTP_TIMEOUT) as response:
+                return json.load(response)
+
+        try:
+            result = await asyncio.to_thread(call)
+        except urllib.error.HTTPError as error:
+            if error.code in (401, 403):
+                # An EasyAuth-gated origin, or one that has not yet rolled out
+                # this endpoint's bearer auth, refuses the request before any
+                # project lookup happens -- distinct from "reached the
+                # service, no match found".
+                return _DISCOVER_UNAVAILABLE
+            return None
+        except Exception:
+            return None
+        return (result or {}).get("selected_project_id") or None
 
 
 async def mount(coordinator, config=None):

@@ -1,6 +1,147 @@
 # Validation evidence and limits
 
-## Live service and provider run (2026-09-09)
+## Hard cutover to the Azure web origin + Entra SSO + auto-bind (2026-09-10)
+
+This PR changes the default `base_url` to the Amplifier Online web origin
+(`https://amplifier-teamwork-web.livelysea-7d934004.westus2.azurecontainerapps.io`),
+adds Entra (`az login`) enrollment alongside the member-code path, adds local
+git-remote auto-bind for `teamwork_bind`, and retires `team.amplifier.run`.
+
+### Reconciliation with what the service actually shipped (2026-09-10)
+
+The service shipped "SSO phase 1" with a different shape than this plan
+assumed, verified live against the new default origin minutes before this
+note was written: EasyAuth now gates everything except a short allowlist
+(`/api/login`, `/api/harnesses`, `/api/harnesses/`, `/api/v1`, `/api/v1/`,
+`/welcome`). Through the new default origin, `GET /api/config`,
+`POST /api/projects/discover`, and `/api/me` all return 401 from EasyAuth
+before the service's own code runs; `/api/harnesses` and `/api/login` are
+reachable (403, needing a cookie); `/api/v1/...` is reachable (403, needing a
+bearer). **The service does not yet validate Entra bearer JWTs on
+`/api/harnesses`, and `/api/config` does not yet advertise
+`api_app_id`/`tenant_id`.** What does exist today: a signed-in member can
+mint a harness credential in the portal (Account menu → Manage my harnesses
+→ `POST /api/harnesses` with all three scopes → token shown once for
+copy/paste).
+
+In response, this PR adds a third enrollment method -- pasting that
+portal-minted credential directly into the consent form -- ahead of the
+Entra sign-in path in the dispatch order, and hardens both the sign-in path
+and `teamwork_bind`'s network fallback to tolerate `/api/config` and
+`/api/projects/discover` returning 401/403 (from EasyAuth or from the
+endpoint not yet existing) as "not available" rather than a hard failure.
+See `docs/PROTOCOL.md`'s "Entra (Microsoft sign-in) enrollment" section for
+the current three-method dispatch order.
+
+**A fresh, authorized live session against the new default origin, exercising
+all three enrollment methods end to end (a real portal-credential mint and
+paste, a real member-code mint, and -- once the service validates Entra
+bearer JWTs -- a real `az login` mint) has not been run as part of this PR.**
+It is a required manual step before this bundle is tagged and released -- see
+the cutover order in the plan
+(`docs/plans/2026-09-10-hard-cutover-sso-autobind.md`, section 2, step 3-4) --
+and it cannot be attested here without fabricating evidence. What follows below
+is the complete local, mocked, and structural evidence gathered for this PR;
+it establishes the code paths are correct in isolation, not that a live
+portal-credential mint, member-code mint, or `az login` mint has ever
+succeeded end to end against the running service.
+
+### Reliability review follow-up (2026-09-10)
+
+A follow-up review of the portal-credential path found one blocker: the
+verification call (`publish` with `{"operations": []}`) had been coded to
+treat *any* non-401/403 response as a valid credential, which would have
+persisted an unverified token on a transient 5xx, a 404, or an unrelated 422.
+**Empirically re-checked against the live web origin** (reading an
+already-enrolled native connection file's token in-process, never printed):
+a genuinely valid token scoped to the requested project returns `422
+invalid_request` ("Supply 1-20 operations") for this exact zero-operation
+call -- not 2xx -- because the endpoint validates auth and project scope
+before it ever inspects the operations list. An invalid token returns `401`
+regardless of project; a valid token against the *wrong* project returns
+`404`. Verification now treats exactly `422` (or an outright `2xx`, should
+that ever change) as confirmed, `401`/`403` as an explicit rejection, and
+anything else -- `404`, `5xx`, or a transport failure -- as "could not
+verify," writing nothing to disk in that last case.
+
+A related risk was also addressed: `_fetch_service_config` had swallowed
+every failure fetching `/api/config` identically, so a genuine service
+outage or a typo'd `base_url` would have been misreported as "Microsoft
+sign-in enrollment is not enabled" instead of "service unreachable." It now
+narrows to 401/403 (still tolerated as "SSO not offered," matching EasyAuth
+gating) while any other failure raises a clear, retryable error naming only
+the service host.
+
+Separately, when a pasted credential targets a project that already has a
+saved connection, the form now says so explicitly and explains how to
+rotate (revoke the old harness, delete the saved file, reconnect) rather
+than silently keeping the old credential with no indication anything
+happened.
+
+### Local evidence for this PR
+
+All 152 unit tests pass (`tests/`), covering: the new `DEFAULT_BASE_URL`
+constant; local git-remote reading and canonical repository identity
+(`git_remote.py`, no network); the Entra token helper (`entra.py`, with
+`azure.identity` itself stubbed -- no real `az` CLI call is made in any test);
+the consent form copy and repository preview, including the portal-credential
+field; the full Entra enrollment flow (mint-then-reserve ordering,
+409/401/403 handling, conflict revocation and reuse) against a fixture HTTP
+opener; the portal-credential enrollment path (verifies via the least
+side-effecting authenticated call -- now checked against the empirically
+confirmed 422 success shape, 401/403 rejection, and 5xx/404/timeout
+"could not verify" cases, each writing nothing to disk -- stores the
+connection with `harness_id: null`, never calls `/api/login` or touches
+`entra`, and explicitly reports an existing saved connection instead of
+silently reusing it); `/api/config` reachability handling (401/403 tolerated,
+enrollment proceeds via the member-code fallback; a genuine connection
+error surfaces a clear, host-only "service unreachable" message instead);
+the retired-host inert hint (mount stays inert, no HTTP call, notice fires
+once); and `teamwork_bind`'s local-first auto-bind (single match, ambiguous
+match, network-discover fallback and its own 401/403 tolerance, no-git-remote
+case) against a fixture native connection directory. `scripts/validate_bundle.py`
+passes (schema, composition, isolated local prepare, standalone replay).
+
+**The dual-environment reproduction below predates the branch rebase onto
+main's agent-registration/work-queue commits and the portal-credential work
+in this same section; it recorded 111 tests at the time.** The underlying
+point -- that the suite must be proven green with genuinely no `azure`
+package importable, not just with `azure-identity` coincidentally installed
+-- still holds and was re-verified at 152 tests (see the top-level report for
+this PR). It was reproduced in two environments, to guard against the
+`sys.modules["azure.identity"]` stub only working because a real
+`azure-identity` package (and therefore a real `azure` parent module) was
+already importable:
+
+1. The Amplifier CLI's own Python environment (`azure-identity` genuinely
+   installed, via `amplifier_module_provider_azure_openai`) -- `Ran 111 tests
+   in 10.590s / OK` (at the time; 152 as of this PR).
+2. A throwaway venv holding only `amplifier-core==1.6.1` (installed from
+   PyPI) and the stdlib, with **no `azure` namespace package at all**
+   (`import azure` raises `ModuleNotFoundError`) -- `Ran 111 tests in
+   10.393s / OK` (at the time; 152 as of this PR).
+
+The second environment is what actually exercises the "azure.identity is not
+installed" and "azure.identity is installed but unusable" branches
+faithfully: `entra.py`'s `import azure.identity` first imports the parent
+`azure` package, so a test stub that patches only `sys.modules["azure.identity"]`
+silently passes on a host where `azure` happens to already be importable, and
+would instead raise `ModuleNotFoundError: No module named 'azure'` on a truly
+clean host -- masking exactly the failure `EntraUnavailable` exists to catch
+cleanly. `tests/test_entra.py`'s stub now seeds both `sys.modules["azure"]`
+and `sys.modules["azure.identity"]` for this reason.
+
+None of this exercises a real Entra tenant, a
+real Azure Container Apps deployment, or a real GitHub repository beyond
+string-level canonicalization.
+
+## Live service and provider run (2026-09-09, pre-cutover)
+
+**This section predates the hard cutover above and describes the retired
+`team.amplifier.run` origin and the member-code-only enrollment flow. It is
+kept as historical evidence of the underlying delivery/receipt mechanism,
+which this PR does not change; it does not establish anything about the new
+default origin, Entra enrollment, or auto-bind.**
 
 An authorized operator run against the default hosted service (`https://team.amplifier.run`) with a real LLM provider, from a fresh `amplifier bundle update` of the `@main` behavior at merge commit `882f6b9`, observed:
 
