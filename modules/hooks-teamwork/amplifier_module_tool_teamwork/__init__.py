@@ -34,6 +34,11 @@ SCOPES = ["context:read", "session:write", "shared:write"]
 # that turns a normal cold start into a spurious enrollment failure.
 HTTP_TIMEOUT = 75
 
+# Distinguishes "the discover endpoint refused the request" (EasyAuth gating,
+# or a service that has not rolled out bearer auth on it yet) from "reached
+# the service, no matching project" -- the two need different messages.
+_DISCOVER_UNAVAILABLE = object()
+
 
 class ConsentError(ValueError):
     """Self-authored message safe to render in the private form; never service text."""
@@ -677,6 +682,9 @@ class TeamworkBind:
             return ToolResult(success=False, error={
                 "message": "Several saved connections match this repository: " + candidates + ". Pass project_id."})
         discovered = await self._discover_project(identity)
+        if discovered is _DISCOVER_UNAVAILABLE:
+            return ToolResult(success=False, error={
+                "message": "Project discovery is not available on this service yet. Pass project_id."})
         if discovered:
             return discovered, None
         return ToolResult(success=False, error={
@@ -717,6 +725,14 @@ class TeamworkBind:
 
         try:
             result = await asyncio.to_thread(call)
+        except urllib.error.HTTPError as error:
+            if error.code in (401, 403):
+                # An EasyAuth-gated origin, or one that has not yet rolled out
+                # this endpoint's bearer auth, refuses the request before any
+                # project lookup happens -- distinct from "reached the
+                # service, no match found".
+                return _DISCOVER_UNAVAILABLE
+            return None
         except Exception:
             return None
         return (result or {}).get("selected_project_id") or None

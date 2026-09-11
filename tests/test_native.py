@@ -723,6 +723,25 @@ class AutoBindTests(unittest.IsolatedAsyncioTestCase):
         hook = root.handlers[0][1].__self__
         self.assertEqual(hook.connection['project_id'], 'discovered-project')
 
+    async def test_bind_discover_401_is_tolerated_with_a_clear_message(self):
+        root = Coordinator()
+        with tempfile.TemporaryDirectory() as home:
+            self._native_dir(home)  # empty: no saved connection matches
+
+            class Opener:
+                def open(self, request, **kwargs):
+                    raise urllib.error.HTTPError(request.full_url, 401, 'Unauthorized', {}, io.BytesIO(b'{}'))
+
+            with patch.dict(os.environ, {"HOME": home}, clear=False), \
+                 patch('amplifier_module_tool_teamwork.git_remote.origin_url',
+                       return_value='git@github.com:owner/repo.git'), \
+                 patch('urllib.request.build_opener', return_value=Opener()):
+                tool = TeamworkBind(root, {'base_url': BASE, 'token': 'discover-token'})
+                result = await tool.execute({})
+        self.assertFalse(result.success)
+        self.assertIn('not available', str(result).lower())
+        self.assertFalse(root.handlers)
+
     async def test_bind_without_a_git_remote_asks_for_a_project_id(self):
         root = Coordinator()
         with patch('amplifier_module_tool_teamwork.git_remote.origin_url', return_value=None):
