@@ -550,4 +550,90 @@ class NativeToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(root.handlers)
 
 
+class AutoBindTests(unittest.IsolatedAsyncioTestCase):
+    """teamwork_bind with an omitted project_id: local-first, network as fallback (A7)."""
+
+    def _native_dir(self, home):
+        directory = Path(home) / ".config" / "amplifier-teamwork" / "native"
+        directory.mkdir(parents=True)
+        return directory
+
+    def _write_connection(self, directory, name, data):
+        folder = directory / name
+        folder.mkdir()
+        path = folder / "connection.json"
+        path.write_text(json.dumps(data))
+        path.chmod(0o600)
+        return path
+
+    async def test_bind_without_project_uses_a_saved_connection_matching_the_git_remote(self):
+        root = Coordinator()
+        with tempfile.TemporaryDirectory() as home:
+            native = self._native_dir(home)
+            self._write_connection(native, "match", {
+                "base_url": BASE, "project_id": "auto-project", "token": "auto-token",
+                "repository_url": "https://github.com/owner/repo",
+            })
+            with patch.dict(os.environ, {"HOME": home}, clear=False), \
+                 patch('amplifier_module_tool_teamwork.git_remote.origin_url',
+                       return_value='git@github.com:owner/repo.git'):
+                tool = TeamworkBind(root, {})
+                result = await tool.execute({})
+        self.assertTrue(result.success)
+        self.assertEqual(result.output['project'], 'auto-project')
+        hook = root.handlers[0][1].__self__
+        self.assertEqual(hook.connection['project_id'], 'auto-project')
+        self.assertEqual(hook.connection['token'], 'auto-token')
+
+    async def test_bind_reports_candidates_when_two_saved_connections_match(self):
+        root = Coordinator()
+        with tempfile.TemporaryDirectory() as home:
+            native = self._native_dir(home)
+            self._write_connection(native, "a", {
+                "base_url": BASE, "project_id": "proj-a", "token": "t",
+                "repository_url": "https://github.com/owner/repo",
+            })
+            self._write_connection(native, "b", {
+                "base_url": BASE, "project_id": "proj-b", "token": "t",
+                "repository_url": "https://github.com/owner/repo",
+            })
+            with patch.dict(os.environ, {"HOME": home}, clear=False), \
+                 patch('amplifier_module_tool_teamwork.git_remote.origin_url',
+                       return_value='git@github.com:owner/repo.git'):
+                tool = TeamworkBind(root, {})
+                result = await tool.execute({})
+        self.assertFalse(result.success)
+        self.assertIn('proj-a', str(result))
+        self.assertIn('proj-b', str(result))
+        self.assertFalse(root.handlers)
+
+    async def test_bind_falls_back_to_discover_when_no_saved_connection_matches(self):
+        root = Coordinator()
+        with tempfile.TemporaryDirectory() as home:
+            self._native_dir(home)  # empty: no saved connection matches
+
+            class Opener:
+                def open(self, request, **kwargs):
+                    return Response({'selected_project_id': 'discovered-project'})
+
+            with patch.dict(os.environ, {"HOME": home}, clear=False), \
+                 patch('amplifier_module_tool_teamwork.git_remote.origin_url',
+                       return_value='git@github.com:owner/repo.git'), \
+                 patch('urllib.request.build_opener', return_value=Opener()):
+                tool = TeamworkBind(root, {'base_url': BASE, 'token': 'discover-token'})
+                result = await tool.execute({})
+        self.assertTrue(result.success)
+        self.assertEqual(result.output['project'], 'discovered-project')
+        hook = root.handlers[0][1].__self__
+        self.assertEqual(hook.connection['project_id'], 'discovered-project')
+
+    async def test_bind_without_a_git_remote_asks_for_a_project_id(self):
+        root = Coordinator()
+        with patch('amplifier_module_tool_teamwork.git_remote.origin_url', return_value=None):
+            result = await TeamworkBind(root, {'base_url': BASE, 'token': 'token'}).execute({})
+        self.assertFalse(result.success)
+        self.assertIn('project_id', str(result))
+        self.assertFalse(root.handlers)
+
+
 if __name__ == '__main__': unittest.main()

@@ -519,12 +519,12 @@ class TeamworkBind:
         "Bind this Amplifier session to a Teamwork project, or move it to a different one. "
         "Uses the service URL and harness credential already configured on this machine; "
         "never ask for or pass credentials. Sharing begins with the next prompt. "
-        "Use teamwork_connect instead when no credential is configured yet."
+        "Use teamwork_connect instead when no credential is configured yet. "
+        "Omit project_id to bind the project linked to this working directory's git remote."
     )
     input_schema = {
         "type": "object",
         "properties": {"project_id": {"type": "string", "description": "Exact project id to bind this session to."}},
-        "required": ["project_id"],
         "additionalProperties": False,
     }
 
@@ -537,21 +537,28 @@ class TeamworkBind:
     async def execute(self, input):
         from amplifier_core import ToolResult
         project = str((input or {}).get("project_id", "")).strip()
-        if not project:
-            return ToolResult(success=False, error={"message": "A project id is required."})
         configured_base = self.config.get("base_url")
         if configured_base and urlsplit(configured_base).hostname in RETIRED_HOSTS:
             return ToolResult(success=False, error={"message": RETIRED_MESSAGE})
         async with self.lock:
+            saved_connection = None
+            if not project:
+                resolved = await self._resolve_project_from_git_remote()
+                if isinstance(resolved, ToolResult):
+                    return resolved
+                project, saved_connection = resolved
             rebind = self.coordinator.get_capability("teamwork.rebind")
             if rebind is not None:
                 # Already sharing: move this session without re-registering handlers.
                 try:
-                    rebind(project)
+                    rebind(project, saved_connection)
                 except Exception:
                     return ToolResult(success=False, error={"message": "Could not bind that project."})
                 return ToolResult(success=True, output={"project": project, "sharing": "rebound; effective from the next prompt"})
-            settings = {key: self.config[key] for key in ("base_url", "token", "connection_file") if self.config.get(key)}
+            if saved_connection is not None:
+                settings = {key: saved_connection[key] for key in ("base_url", "token", "harness_id") if saved_connection.get(key)}
+            else:
+                settings = {key: self.config[key] for key in ("base_url", "token", "connection_file") if self.config.get(key)}
             if not settings.get("token") and not settings.get("connection_file"):
                 return ToolResult(success=False, error={"message": "No Teamwork credential is configured. Use teamwork_connect to enroll first."})
             try:
@@ -561,6 +568,73 @@ class TeamworkBind:
             if self.coordinator.get_capability("teamwork.session_id") is None:
                 return ToolResult(success=False, error={"message": "Binding did not take effect; nothing is being shared."})
             return ToolResult(success=True, output={"project": project, "sharing": "enabled for subsequent prompts in this session"})
+
+    async def _resolve_project_from_git_remote(self):
+        """Local-first auto-bind for an omitted project_id (A7).
+
+        The canonical repository_url stored in connection.json at enrollment is
+        matched against this directory's git remote across saved connections.
+        Network `discover` is retained only as a confirm/diagnose fallback: a
+        harness credential can never see a project other than its own, so it
+        cannot move a session between projects -- it can only confirm the one
+        the credential already holds.
+        """
+        from amplifier_core import ToolResult
+        identity = await asyncio.to_thread(lambda: git_remote.repository_identity(git_remote.origin_url()))
+        if not identity:
+            return ToolResult(success=False, error={"message": "This directory has no usable GitHub remote. Pass project_id."})
+        matches = await asyncio.to_thread(self._saved_connections_matching, identity)
+        if len(matches) == 1:
+            saved = matches[0]
+            return saved["project_id"], saved
+        if len(matches) > 1:
+            candidates = ", ".join(sorted(saved["project_id"] for saved in matches))
+            return ToolResult(success=False, error={
+                "message": "Several saved connections match this repository: " + candidates + ". Pass project_id."})
+        discovered = await self._discover_project(identity)
+        if discovered:
+            return discovered, None
+        return ToolResult(success=False, error={
+            "message": "No Teamwork project you can reach is linked to this repository. Link it in Teamwork, or pass project_id."})
+
+    def _saved_connections_matching(self, identity):
+        """Mode-0600 connection.json files under the native enrollment directory only."""
+        home = Path("~/.config/amplifier-teamwork/native").expanduser()
+        matches = []
+        if not home.is_dir():
+            return matches
+        for connection_file in sorted(home.glob("*/connection.json")):
+            try:
+                if os.name != "nt" and connection_file.stat().st_mode & 0o077:
+                    continue
+                saved = json.loads(connection_file.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if saved.get("repository_url") == identity and saved.get("project_id") and saved.get("token"):
+                matches.append(saved)
+        return matches
+
+    async def _discover_project(self, identity):
+        """Network confirm/diagnose only; the currently configured credential
+        can only ever see its own project (see module docstring above)."""
+        base = self.config.get("base_url")
+        token = self.config.get("token")
+        if not base or not token:
+            return None
+
+        def call():
+            headers = {"Content-Type": "application/json", "Authorization": "Bearer " + token,
+                       "Origin": service_origin(base)}
+            request = urllib.request.Request(base + "/api/projects/discover",
+                                             json.dumps({"repository_url": identity}).encode(), headers)
+            with urllib.request.build_opener(NoRedirect()).open(request, timeout=20) as response:
+                return json.load(response)
+
+        try:
+            result = await asyncio.to_thread(call)
+        except Exception:
+            return None
+        return (result or {}).get("selected_project_id") or None
 
 
 async def mount(coordinator, config=None):
