@@ -1065,6 +1065,22 @@ class Mirror(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.mirror_ops(client)), 1)
         self.assertEqual(resumed.state["mirrored"]["msg-1"], "inbound-msg-1")
 
+    async def test_mirror_gives_up_after_bounded_attempts_not_forever(self):
+        # A persistent non-403/409 failure must not turn into a lifetime retry:
+        # exactly MIRROR_MAX_ATTEMPTS tries, one notice, then silence.
+        hook, client = self.build(fail_status=422)
+        result = await hook.on_submit("prompt:submit", {"prompt": "1"})
+        for turn in range(2, 6):
+            result = await hook.on_submit("prompt:submit", {"prompt": str(turn)})
+        self.assertEqual(len(self.mirror_ops(client)), 5)
+        self.assertEqual(hook.state["mirrored"]["msg-1"], {"status": "gave_up", "reason": 422})
+        self.assertIn("after 5 attempts", result.user_message)
+        self.assertNotIn("msg-1", hook.state.get("mirror_attempts", {}))
+        # A sixth turn makes no further attempt: it already gave up.
+        sixth = await hook.on_submit("prompt:submit", {"prompt": "6"})
+        self.assertEqual(len(self.mirror_ops(client)), 5)
+        self.assertNotIn("after 5 attempts", sixth.user_message or "")
+
 
 if __name__ == '__main__':
     unittest.main()

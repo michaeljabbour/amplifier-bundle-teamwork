@@ -78,6 +78,12 @@ PRESENCE_SUMMARY = 200
 # Filing is bounded per turn so a burst of inbound mail cannot stretch one prompt.
 # What is left over is filed on a later turn: a report delivered late is still true.
 REPORT_BATCH = 5
+# A message the mirror cannot yet publish (transport failure, an unrecognised
+# status, a service outage) is retried once per turn -- but not forever. Past
+# this many attempts it stops being retried and the local queue is named as the
+# durable copy, rather than silently retrying every turn for the life of the
+# session.
+MIRROR_MAX_ATTEMPTS = 5
 
 
 def verbosity(config):
@@ -575,7 +581,11 @@ class TeamworkHook:
         time this runs. A 403 disables mirroring for the rest of this session
         (not just its notice, which is said once); a 409 means another turn or
         process already mirrored the same message, so it counts as success;
-        anything else leaves the message unmirrored, retried on a later turn.
+        anything else leaves the message unmirrored and is retried on a later
+        turn, up to `MIRROR_MAX_ATTEMPTS` -- past that it stops being retried,
+        is recorded as given up (rather than as mirrored, which it never was),
+        and is named once. The report itself is never at risk: it is already
+        durable in the local queue regardless of any of this.
         """
         mid = record.get("id")
         mirrored = self.state.setdefault("mirrored", {})
@@ -599,7 +609,17 @@ class TeamworkHook:
                 return ("This project's service does not yet allow mirroring inbound reports "
                         "centrally (it needs the shared-write permission); reports stay filed "
                         "locally only.")
-            # 404 / other / transport: leave unmirrored, retried on a later turn.
+            # 404 / other / transport: bounded retry, then give up rather than
+            # trying forever, every turn, for the life of the session.
+            attempts = self.state.setdefault("mirror_attempts", {})
+            attempts[mid] = attempts.get(mid, 0) + 1
+            if attempts[mid] >= MIRROR_MAX_ATTEMPTS:
+                mirrored[mid] = {"status": "gave_up", "reason": error.status or "transport"}
+                del attempts[mid]
+                self.journal.save(self.sid, self.state)
+                return ("Could not mirror inbound report %s to the shared project after %d attempts; "
+                        "it stays filed locally only." % (mid, MIRROR_MAX_ATTEMPTS))
+            self.journal.save(self.sid, self.state)
             return None
         mirrored[mid] = operation["id"]
         self.journal.save(self.sid, self.state)
