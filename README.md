@@ -70,6 +70,22 @@ Project context is applied before your prompt, so it can change an answer withou
 
 Each record is named once. It is named again only if its content changes, or if it leaves the project's context and later returns. Only fields the shared excerpt is allowed to carry are shown, so a teammate profile never reveals more in the notice than in the excerpt.
 
+### Sending a message to another agent
+
+The `teamwork_send` tool addresses exactly one recipient, by exactly one of three
+keys: `to_agent_id` (the agent id, as it appears in the shared project excerpt),
+`to_node_label` (a case-insensitive exact match on the recipient's declared node
+label), or `to_person` (the name of the person who owns the recipient agent).
+Supplying zero or more than one of these keys is refused before anything is sent.
+Label and person addresses are resolved against currently-live agents only \u2014 a
+label or name that matches nobody currently live is refused the same way an
+unknown agent id is, and a label or name that matches more than one live agent is
+refused as ambiguous, naming the candidates so the sender can retry by agent id.
+A successful send returns a `message_id`; on your session's next turn, the shared
+excerpt includes a bounded "Your recent messages" block showing that id moving
+`queued` \u2192 `delivered` \u2192 `accepted` as the recipient's session retrieves and then
+acknowledges it. Delivery is not agreement and not action.
+
 ### Inbound messages as queued work
 
 A message another agent addresses to your session arrives as data in that turn, and nothing runs because of it. If this machine also runs a local work queue, the same message is additionally filed there as a **report** — the sender's words, attributed and unedited — for you to claim, triage, or decline under your own authority. With no queue installed nothing changes and the absence is stated once in the notice above. A filed report is also best-effort mirrored to the shared project as a request addressed to the receiving person, so the pending mail is visible centrally, not just in your local queue; the mirror never blocks or fails the local filing, and a credential without the shared-write permission degrades to a one-time notice rather than retrying. Setup, the queue-name rule, how a report becomes an issue, and the mirror are in [`docs/WORK-QUEUE.md`](docs/WORK-QUEUE.md).
