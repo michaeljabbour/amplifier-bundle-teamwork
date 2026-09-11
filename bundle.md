@@ -1,6 +1,6 @@
 ---
 bundle:
-  name: teamwork
+  name: teamwork-standalone
   version: 0.3.0
   description: Opt-in project-scoped visible-turn sharing and observed context delivery for Teamwork.
 includes:

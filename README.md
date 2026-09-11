@@ -27,7 +27,7 @@ The URI must point to the actual `.yaml` behavior file (or a repository director
 `@main` is resolved once and then served from Amplifier's bundle cache; it does not follow the branch. After this repository changes upstream, refresh the cache and start a new session:
 
 ```sh
-amplifier bundle update teamwork-behavior -y
+amplifier bundle update teamwork -y
 ```
 
 A session that is already running keeps the tool set it started with, so `teamwork_connect` appears only in sessions started after the update.
@@ -37,7 +37,7 @@ A session that is already running keeps the tool set it started with, so `teamwo
 1. Start a normal new Amplifier session with your existing bundle/provider, in a checkout with a `github.com` `origin` remote if you have one.
 2. Ask: **Connect this session to Teamwork.** Amplifier invokes `teamwork_connect`, which opens a private local browser form.
 3. The form supports three enrollment methods, tried in this order for whatever you fill in and submit:
-   1. **Portal credential (current default path).** In Teamwork's web portal, open Account menu → Manage my harnesses, mint a harness credential (shown once), and paste it into the form's **Credential from the portal** field along with the exact project ID. This never touches `/api/login` or `az`; it is verified with the service directly and, if accepted, stored the same as any other enrollment. If it is rejected, or if the service cannot confirm it, the form re-renders asking to try again. If a connection is already saved for that project, the new credential is not used -- an existing saved connection is never overwritten -- and the form tells you so explicitly, with how to rotate it.
+   1. **Portal credential (current default path).** In Teamwork's web portal, open Account menu → Harnesses & agents, mint a harness credential (shown once), and paste it into the form's **Credential from the portal** field along with the exact project ID. This never touches `/api/login` or `az`; it is verified with the service directly and, if accepted, stored the same as any other enrollment. If it is rejected, or if the service cannot confirm it, the form re-renders asking to try again. If a connection is already saved for that project, the new credential is not used -- an existing saved connection is never overwritten -- and the form tells you so explicitly, with how to rotate it.
    2. **Microsoft sign-in (`az login`), when the service advertises it.** If you have run `az login` and left both the credential and member-code fields blank, the form offers Microsoft sign-in. When this directory has a usable GitHub remote, the form shows the exact repository URL that will be sent and the project ID becomes optional -- Teamwork resolves the project from that repository. **This path requires the service to advertise Entra bearer support (`api_app_id`) via `/api/config`, which is pending server-side work; until then, sign-in enrollment is not offered and the form falls back to the credential or member-code fields instead.**
    3. **Private member code (fallback, always available).** Enter the exact project ID you joined, your name/email and private member code, and confirm sharing. Never paste the code into chat.
    On later sessions, select the same project and leave the credential/login fields blank to reuse its saved connection.

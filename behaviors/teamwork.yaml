@@ -1,5 +1,5 @@
 bundle:
-  name: teamwork-behavior
+  name: teamwork
   version: 0.3.0
   description: Share opted-in visible turns and consume attributed project context with durable delivery receipts.
 hooks:
