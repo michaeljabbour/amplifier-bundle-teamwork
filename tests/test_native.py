@@ -20,6 +20,7 @@ from amplifier_module_tool_teamwork import (announce, connect, ConsentAborted, C
                                             private_browser_connect, TeamworkConnect, TeamworkBind, mount)
 from amplifier_module_hooks_teamwork import sha
 from amplifier_module_hooks_teamwork import service_url
+from amplifier_module_tool_teamwork.page import form_page
 
 BASE = "https://team.example.invalid"
 FORM = {"project": "selected", "name": "Fixture", "code": "private-fixture-code", "consent": "yes"}
@@ -35,6 +36,40 @@ class DefaultsTests(unittest.TestCase):
             service_url.validate_service_url(service_url.DEFAULT_BASE_URL),
             service_url.DEFAULT_BASE_URL,
         )
+
+
+class ConsentCopyTests(unittest.TestCase):
+    def test_consent_copy_names_shared_write_publishing(self):
+        page = form_page("nonce", "csrf", "style-nonce", BASE, 15)
+        self.assertIn("shared:write", page)
+        self.assertIn("publish shared knowledge and work requests", page)
+
+    def test_sso_form_shows_the_detected_repository_and_makes_project_optional(self):
+        page = form_page("nonce", "csrf", "style-nonce", BASE, 15,
+                          sso=True, repository="https://github.com/owner/repo")
+        self.assertIn("<dt>Repository</dt><dd>https://github.com/owner/repo</dd>", page)
+        self.assertIn("<dt>Sign-in</dt><dd>Your Microsoft account (az login)</dd>", page)
+        self.assertIn("member-code fallback only", page)
+        project_input = re.search(r'<input id="project"[^>]*>', page)
+        self.assertIsNotNone(project_input)
+        self.assertNotIn("required", project_input.group())
+
+    def test_non_sso_form_still_requires_a_project_id(self):
+        page = form_page("nonce", "csrf", "style-nonce", BASE, 15)
+        project_input = re.search(r'<input id="project"[^>]*>', page)
+        self.assertIsNotNone(project_input)
+        self.assertIn("required", project_input.group())
+        self.assertNotIn("<dt>Sign-in</dt>", page)
+        self.assertNotIn("<dt>Repository</dt>", page)
+
+    def test_form_never_renders_a_member_code(self):
+        for kwargs in ({}, {"sso": True, "repository": "https://github.com/owner/repo"}):
+            with self.subTest(kwargs=kwargs):
+                page = form_page("nonce", "csrf", "style-nonce", BASE, 15, **kwargs)
+                code_input = re.search(r'<input id="code"[^>]*>', page)
+                self.assertIsNotNone(code_input)
+                self.assertNotIn("value=", code_input.group())
+                self.assertIn('type="password"', code_input.group())
 
 
 class Response:

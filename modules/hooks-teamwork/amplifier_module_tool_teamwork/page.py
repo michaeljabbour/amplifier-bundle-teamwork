@@ -82,10 +82,19 @@ def _note(kind, heading, detail):
     )
 
 
-def form_page(nonce, csrf, style_nonce, service, minutes, values=None, error=None, field=None, hint=None):
-    """Consent form. `values` echoes only the project/name the user typed here; never the code."""
+def form_page(nonce, csrf, style_nonce, service, minutes, values=None, error=None, field=None, hint=None,
+              sso=False, repository=None):
+    """Consent form. `values` echoes only the project/name the user typed here; never the code.
+
+    `sso=True` shows the Microsoft sign-in row and relabels the member-code
+    fields as a fallback. `repository` (when a git remote was detected) shows
+    the exact URL that will be sent, before consent, and makes the project
+    field optional once SSO can resolve it from that repository instead.
+    """
     values = values or {}
     banner = _note("bad", error, hint or "Correct the highlighted field and submit again. Nothing has been shared yet.") if error else ""
+    project_optional = sso and repository
+    code_label = "member-code fallback only" if sso else "first enrollment only"
 
     def text(name, label, optional, help_text, kind="text", extra=""):
         invalid = ' aria-invalid="true"' if field == name else ""
@@ -97,31 +106,41 @@ def form_page(nonce, csrf, style_nonce, service, minutes, values=None, error=Non
             + value + invalid + extra + '><p class="help">' + html.escape(help_text) + "</p></div>"
         )
 
+    facts = (
+        "<div><dt>Service</dt><dd>" + html.escape(service) + "</dd></div>"
+        "<div><dt>Shares</dt><dd>Your visible prompts and Amplifier's final responses</dd></div>"
+        "<div><dt>Receives</dt><dd>Bounded, attributed project context</dd></div>"
+        "<div><dt>Grants</dt><dd>context:read, session:write and shared:write, for this project only</dd></div>"
+    )
+    if sso:
+        facts += "<div><dt>Sign-in</dt><dd>Your Microsoft account (az login)</dd></div>"
+    if repository:
+        facts += "<div><dt>Repository</dt><dd>" + html.escape(repository) + "</dd></div>"
+
     return _shell(style_nonce, "Connect Teamwork", (
         "<h1>Connect this session to a project</h1>"
         '<p class="lede">Sharing is off until you submit this form. It applies to this one session '
         "and starts with your next prompt.</p>"
-        '<dl class="facts">'
-        "<div><dt>Service</dt><dd>" + html.escape(service) + "</dd></div>"
-        "<div><dt>Shares</dt><dd>Your visible prompts and Amplifier's final responses</dd></div>"
-        "<div><dt>Receives</dt><dd>Bounded, attributed project context</dd></div>"
-        "<div><dt>Grants</dt><dd>context:read and session:write, for this project only</dd></div>"
-        "</dl>"
+        '<dl class="facts">' + facts + "</dl>"
         + banner
         + '<form method="post" action="/' + nonce + '">'
         + '<input type="hidden" name="csrf" value="' + html.escape(csrf, quote=True) + '">'
-        + text("project", "Project ID", "required", "Exactly as it appears in Teamwork, for example design/review.",
-               extra=' required maxlength="200" autocomplete="off" autocapitalize="off" spellcheck="false" autofocus')
-        + text("name", "Name or email", "first enrollment only",
+        + text("project", "Project ID", "optional — detected from the repository" if project_optional else "required",
+               "Leave blank to use the project linked to this repository." if project_optional
+               else "Exactly as it appears in Teamwork, for example design/review.",
+               extra=('' if project_optional else ' required')
+               + ' maxlength="200" autocomplete="off" autocapitalize="off" spellcheck="false" autofocus')
+        + text("name", "Name or email", code_label,
                "Leave blank if this project is already enrolled on this machine.",
                extra=' autocomplete="username"')
-        + text("code", "Private member code", "first enrollment only",
+        + text("code", "Private member code", code_label,
                "Sent straight to the service and never written to disk.",
                kind="password", extra=' autocomplete="off"')
         + '<div class="consent"' + (' data-invalid="true"' if field == "consent" else "")
         + '><input id="consent" name="consent" type="checkbox" value="yes" required>'
         '<label for="consent">Share subsequent visible prompts and final responses in this session with this '
-        "project, and receive its bounded context.</label></div>"
+        "project, publish shared knowledge and work requests to it on my behalf, and receive its bounded "
+        "context.</label></div>"
         '<div class="actions"><button class="primary" type="submit">Connect and enable sharing</button>'
         '<button class="ghost" type="submit" name="action" value="cancel" formnovalidate>Cancel</button></div>'
         "</form>"
