@@ -41,6 +41,30 @@ class Client:
         return {"stored": True}
 
 
+
+class DescribeAttribution(unittest.TestCase):
+    """An author id is a correct attribution that no reader can read (teamwork-uw8)."""
+
+    def message(self, sender="person-alex"):
+        return {"key": "message:m1:1", "id": "m1", "record_type": "message",
+                "content": {"id": "m1", "body": "Can you look at the relay timeouts?",
+                            "created_by": sender, "from_person_id": sender}}
+
+    def test_a_sender_id_is_resolved_against_people_delivered_in_the_same_page(self):
+        line = describe(self.message(), people={"person-alex": "Alex Stone"})
+        self.assertIn("Alex Stone", line)
+        self.assertNotIn("person-alex", line)
+
+    def test_an_unknown_sender_is_still_attributed_by_id_rather_than_dropped(self):
+        # A real attribution is worth more than a legible guess, and dropping it
+        # would be worse than both.
+        line = describe(self.message(), people={"somebody-else": "Blair"})
+        self.assertIn("person-alex", line)
+
+    def test_no_people_map_behaves_exactly_as_before(self):
+        self.assertEqual(describe(self.message()), describe(self.message(), people={}))
+
+
 class HookTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
