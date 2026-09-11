@@ -416,6 +416,35 @@ class PortalCredentialTests(unittest.TestCase):
         self.assertEqual(list(Path(home).rglob('connection.json')), [])
 
 
+class ServiceConfigTests(unittest.TestCase):
+    """_fetch_service_config narrows: auth-layer rejection tolerated, other failures surfaced."""
+
+    def test_connection_error_reaching_config_is_a_clear_retryable_error(self):
+        class Opener:
+            def open(self, request, **kwargs):
+                raise urllib.error.URLError('Connection refused')
+        with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', return_value=Opener()), \
+             patch('amplifier_module_tool_teamwork.entra.available', return_value=True):
+            with self.assertRaises(ConsentError) as raised:
+                connect({'project': 'selected', 'consent': 'yes'}, BASE, Path(home))
+        self.assertIn('unreachable', str(raised.exception).lower())
+        self.assertIn(urllib.parse.urlsplit(BASE).hostname, str(raised.exception))
+        self.assertEqual(list(Path(home).rglob('connection.json')), [])
+
+    def test_config_401_still_proceeds_to_the_member_code_fallback(self):
+        class Opener:
+            def open(self, request, **kwargs):
+                if request.full_url.endswith('/api/config'):
+                    raise urllib.error.HTTPError(request.full_url, 401, 'Unauthorized', {}, io.BytesIO(b'{}'))
+                raise AssertionError('unexpected endpoint ' + request.full_url)
+        with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', return_value=Opener()), \
+             patch('amplifier_module_tool_teamwork.entra.available', return_value=True):
+            with self.assertRaises(ConsentError) as raised:
+                connect({'project': 'selected', 'consent': 'yes'}, BASE, Path(home))
+        self.assertEqual(raised.exception.field, 'code')
+        self.assertIn('not enabled', str(raised.exception).lower())
+
+
 class BrowserTests(unittest.TestCase):
     def drive(self, act, timeout=5, home='/unused'):
         """Run the private form and let `act(url, origin)` play the browser's part."""

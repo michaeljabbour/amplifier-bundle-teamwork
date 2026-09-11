@@ -165,19 +165,27 @@ def _mint_member(form, base, home, project, repository):
 
 
 def _fetch_service_config(base):
-    """GET /api/config, tolerating any failure as 'unavailable' rather than raising.
-
-    Advertised as unauthenticated in the plan, but under EasyAuth-at-the-gateway
-    this can itself come back 401/403 -- or simply time out on a cold origin --
-    before the service's own code ever sees the request. None of that should
-    abort enrollment: it only means SSO cannot be offered here, so the
-    api_app_id check falls back exactly as an explicitly unconfigured service
-    would.
+    """GET /api/config. A 401/403 (EasyAuth-at-the-gateway) means SSO is not
+    offered here -- treated identically to an explicitly unconfigured
+    service. Any OTHER failure (DNS, TLS, connection refused, timeout, 5xx)
+    is a service reachability problem, not an SSO-configuration signal, and
+    must not be misdiagnosed as "SSO not enabled": it is surfaced as a clear,
+    retryable error naming only the host, never the full URL or any path.
     """
     try:
         config, _ = _http(base, "/api/config")
-    except Exception:
-        return {}
+    except urllib.error.HTTPError as error:
+        if error.code in (401, 403):
+            return {}
+        raise ConsentError(
+            "Teamwork service unreachable at " + (urlsplit(base).hostname or base) + ".", "code",
+            "Check the configured Teamwork service URL and your connection, then try again.",
+        ) from error
+    except Exception as error:
+        raise ConsentError(
+            "Teamwork service unreachable at " + (urlsplit(base).hostname or base) + ".", "code",
+            "Check the configured Teamwork service URL and your connection, then try again.",
+        ) from error
     return config or {}
 
 
