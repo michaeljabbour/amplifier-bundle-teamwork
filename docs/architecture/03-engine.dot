@@ -1,0 +1,96 @@
+// 03-engine -- the hook block from 01-architecture, exploded across the session lifecycle.
+// Shapes/colours as 01-architecture. Full prose: docs/architecture/ARCHITECTURE.md
+
+digraph teamwork_hook_engine {
+  rankdir=LR; compound=true;
+  graph [fontname="Helvetica", labelloc="t",
+         label=<<B>hooks-teamwork &mdash; the lifecycle engine</B><BR/>
+                <FONT POINT-SIZE="11">Two publication paths on purpose: a strictly-ordered durable outbox for the record,<BR/>
+                and direct best-effort sends for anything a late replay would turn into a lie.</FONT>>];
+  node [fontname="Helvetica", fontsize=10, style="filled"];
+  edge [fontname="Helvetica", fontsize=9];
+
+  ev_start [label="session:start", shape=Mdiamond, fillcolor="#f5f5f5"];
+  ev_sub   [label="prompt:submit", shape=Mdiamond, fillcolor="#f5f5f5"];
+  ev_comp  [label="prompt:complete", shape=Mdiamond, fillcolor="#f5f5f5"];
+  ev_end   [label="session:end", shape=Msquare, fillcolor="#f5f5f5"];
+
+  subgraph cluster_durable {
+    label="Durable path  ·  strictly ordered, stops at first failure"; style="filled";
+    fillcolor="#d5e8d4"; penwidth=2; color="#5a8a56";
+    ensure  [label="ensure_session\nsession.upsert", shape=parallelogram, fillcolor="#fff2cc"];
+    turnrec [label="finish\nturn.upsert  prompt + response", shape=parallelogram, fillcolor="#fff2cc"];
+    ack     [label="acknowledgements\nreceipt", shape=parallelogram, fillcolor="#fff2cc"];
+    ob      [label="outbox sqlite", shape=cylinder, fillcolor="#bfe3bd"];
+  }
+
+  subgraph cluster_best {
+    label="Best-effort path  ·  never queued, a stale replay is a lie"; style="filled";
+    fillcolor="#ffe6cc"; penwidth=2; color="#d79b00";
+    announce [label="register_agent\nagent.upsert", shape=parallelogram, fillcolor="#fff2cc"];
+    sense    [label="report_presence\npresence.upsert  active / idle", shape=parallelogram, fillcolor="#fff2cc"];
+    mirror   [label="mirror\nrequest.upsert", shape=parallelogram, fillcolor="#fff2cc"];
+  }
+
+  subgraph cluster_deliver {
+    label="Delivery  ·  the observed boundary"; style="filled"; fillcolor="#e1d5e7";
+    penwidth=2; color="#7b5c91";
+    retrieve [label="retrieve\ncursor · 410 resets baseline", shape=parallelogram, fillcolor="#fff2cc"];
+    render   [label="render\nseat every kind, then fill", shape=parallelogram, fillcolor="#fff2cc"];
+    add      [label="context.add_message", shape=hexagon, fillcolor="#ffe6cc", penwidth=3, color="#d79b00"];
+    influence[label="influence\nname what arrived, once", shape=parallelogram, fillcolor="#fff2cc"];
+  }
+
+  subgraph cluster_filing {
+    label="Filing  ·  optional dependency"; style="filled"; fillcolor="#cdb6dd";
+    penwidth=2; color="#7b5c91";
+    ready [label="Queue.ready\nbind name · prove readable", shape=parallelogram, fillcolor="#fff2cc"];
+    add2  [label="Queue.file\nadd, then read back on doubt", shape=parallelogram, fillcolor="#fff2cc"];
+  }
+
+  ev_start -> ensure   [label="1"];
+  ensure   -> ob       [label="2  queue"];
+  ob       -> ack      [label="flush in order", style=dotted];
+  ev_start -> announce [label="3  direct", style=dashed, color="#d79b00"];
+
+  ev_sub -> sense    [label="4  active + subject", style=dashed, color="#d79b00"];
+  ev_sub -> retrieve [label="5"];
+  retrieve -> render [label="6"];
+  render  -> add     [label="7", penwidth=3];
+  add     -> ack     [label="8  ONLY after success", penwidth=3, color="#d79b00"];
+  add     -> influence [label="9  notice"];
+  ev_sub  -> ready   [label="10  if a message arrived", style=dashed];
+  ready   -> add2    [label="11"];
+  add2    -> mirror  [label="12", style=dashed, color="#7b5c91"];
+
+  ev_comp -> turnrec  [label="13  visible pair"];
+  turnrec -> ob       [label="14  queue"];
+  ev_comp -> announce [label="15  refresh", style=dashed, color="#d79b00"];
+  ev_comp -> sense    [label="16  idle, keeps last subject", style=dashed, color="#d79b00"];
+  ev_end  -> ensure   [label="17  status completed/abandoned"];
+
+  e1 [shape=note, fillcolor="#ffffcc",
+      label="Why two paths: the outbox is strictly ordered and\nstops at its first failure. A record the server does not\nknow would wedge every later publish behind it."];
+  e2 [shape=note, fillcolor="#ffffcc",
+      label="Presence is the session's own prompt subject,\ncleaned and bounded — never the model's\nnarrative of its own work."];
+  e3 [shape=note, fillcolor="#ffffcc",
+      label="No tool here can CREATE work.\nA session must never invent work for\nanyone, including its owner."];
+  e4 [shape=note, fillcolor="#ffffcc",
+      label="Child sessions (coordinator.parent_id) are\nexcluded BEFORE credentials are read."];
+  ob -> e1 [style=dotted, arrowhead=none];
+  sense -> e2 [style=dotted, arrowhead=none];
+  add2 -> e3 [style=dotted, arrowhead=none];
+  ev_start -> e4 [style=dotted, arrowhead=none];
+
+  doc_note [shape=note, fillcolor="#f5f5f5",
+            label="Full design: docs/architecture/ARCHITECTURE.md\nWire contract: docs/PROTOCOL.md"];
+
+  subgraph cluster_legend {
+    label="Legend"; style="filled"; fillcolor="#ffffff"; penwidth=1; color="#666666";
+    g1 [label="deterministic code", shape=parallelogram, fillcolor="#fff2cc"];
+    g2 [label="durable store", shape=cylinder, fillcolor="#ffffff"];
+    g3 [label="observed boundary", shape=hexagon, fillcolor="#ffe6cc", penwidth=3];
+    g4 [label="solid = durable / delivery\ndashed = best-effort\ndotted = invariant", shape=plaintext, fillcolor="#ffffff"];
+    g1 -> g2 -> g3 -> g4 [style=invis];
+  }
+}

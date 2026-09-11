@@ -1,0 +1,92 @@
+// 02-data-flow -- one inbound agent-to-agent message, end to end, numbered 1..14.
+// Shapes/colours as 01-architecture. Full prose: docs/architecture/ARCHITECTURE.md
+
+digraph teamwork_inbound_flow {
+  rankdir=LR; compound=true;
+  graph [fontname="Helvetica", labelloc="t",
+         label=<<B>Inbound message &rarr; report &rarr; queued work</B><BR/>
+                <FONT POINT-SIZE="11">Delivery without execution. The receipt is written only after an OBSERVED acceptance,<BR/>
+                and filing happens downstream of it &mdash; never before, never instead.</FONT>>];
+  node [fontname="Helvetica", fontsize=10, style="filled"];
+  edge [fontname="Helvetica", fontsize=9];
+
+  start [label="Agent A\nteamwork_send", shape=Mdiamond, fillcolor="#f5f5f5"];
+
+  subgraph cluster_svc {
+    label="Teamwork service"; style="filled"; fillcolor="#e1d5e7"; penwidth=2; color="#7b5c91";
+    validate [label="stamp sender from the CREDENTIAL\nfrom_person_id · from_harness_id · sent_at",
+              shape=parallelogram, fillcolor="#fff2cc"];
+    scope    [label="deliver to the addressed\nagent and no other", shape=parallelogram, fillcolor="#fff2cc"];
+  }
+
+  subgraph cluster_b {
+    label="Agent B  ·  prompt:submit"; style="filled"; fillcolor="#d5e8d4"; penwidth=2; color="#5a8a56";
+    flush    [label="flush outbox", shape=parallelogram, fillcolor="#fff2cc"];
+    retrieve [label="retrieve /context\ncursor + page", shape=parallelogram, fillcolor="#fff2cc"];
+    render   [label="render excerpt\nbounded 10 KB, seats every kind", shape=parallelogram, fillcolor="#fff2cc"];
+    add      [label="context.add_message", shape=hexagon, fillcolor="#ffe6cc", penwidth=3, color="#d79b00"];
+    receipt  [label="commit receipt\nharness_input_accepted", shape=parallelogram, fillcolor="#fff2cc"];
+    model    [label="model runs the turn\nteammate data, not instructions", shape=box, fillcolor="#bfe3bd"];
+    unfiled  [label="unfiled(): messages for ME\nread from CACHE, not the excerpt",
+              shape=parallelogram, fillcolor="#fff2cc"];
+    file     [label="file report\nsender's words, unedited", shape=parallelogram, fillcolor="#fff2cc"];
+    queue    [label="local queue\nopen · claimable", shape=cylinder, fillcolor="#cdb6dd"];
+    mirror   [label="mirror  request.upsert\nid = inbound-<message-id>", shape=parallelogram, fillcolor="#fff2cc"];
+  }
+
+  subgraph cluster_later {
+    label="Receiving side, in its own time"; style="filled"; fillcolor="#d5e8d4";
+    penwidth=2; color="#5a8a56";
+    triage [label="triage\n(a person, later)", shape=ellipse, fillcolor="#bfe3bd"];
+    issue  [label="separate item\nlinked discovered-from", shape=cylinder, fillcolor="#cdb6dd"];
+    done   [label="claimed · resolved · declined", shape=Msquare, fillcolor="#bfe3bd"];
+  }
+
+  start    -> validate [label="1  message.upsert\n{to_agent_id, body}"];
+  validate -> scope    [label="2  store"];
+  scope    -> flush    [label="3  next turn begins"];
+  flush    -> retrieve [label="4"];
+  retrieve -> render   [label="5  items[]"];
+  render   -> add      [label="6  rendered excerpt", penwidth=3];
+  add      -> receipt  [label="7  ONLY on success", penwidth=3, color="#d79b00"];
+  receipt  -> model    [label="8  turn proceeds"];
+  retrieve -> unfiled  [label="9  cache", style=dashed];
+  unfiled  -> file     [label="10  at most 5 per turn", style=dashed];
+  file     -> queue    [label="11  add"];
+  file     -> mirror   [label="12  best-effort", style=dashed, color="#7b5c91"];
+  queue    -> triage   [label="13  claimed when ready", penwidth=2, color="#5a8a56"];
+  triage   -> issue    [label="14  our words, our scope"];
+  triage   -> done;
+
+  i1 [shape=note, fillcolor="#ffffcc",
+      label="7 is the whole contract.\nA receipt that precedes acceptance\nasserts a delivery nobody observed."];
+  i2 [shape=note, fillcolor="#ffffcc",
+      label="Interrupted between 6 and 7?\nacceptance_unknown — kept locally,\nnever presented as delivered."];
+  i3 [shape=note, fillcolor="#ffffcc",
+      label="9 reads the CACHE, not the excerpt.\nA message that lost the byte budget\nis still a teammate's request."];
+  i4 [shape=note, fillcolor="#ffffcc",
+      label="An ambiguous add is resolved by READ-BACK,\nnever by retry. Absence that cannot be proven\nis acceptance_unknown, not 'not filed'."];
+  i5 [shape=note, fillcolor="#ffffcc",
+      label="12 needs shared:write. A 403 disables\nmirroring for the session; the report is\nalready durable either way."];
+  i6 [shape=note, fillcolor="#ffffcc",
+      label="14 never edits the report.\nVerified: description byte-identical\nbefore and after triage."];
+  add -> i1 [style=dotted, arrowhead=none];
+  receipt -> i2 [style=dotted, arrowhead=none];
+  unfiled -> i3 [style=dotted, arrowhead=none];
+  file -> i4 [style=dotted, arrowhead=none];
+  mirror -> i5 [style=dotted, arrowhead=none];
+  issue -> i6 [style=dotted, arrowhead=none];
+
+  doc_note [shape=note, fillcolor="#f5f5f5",
+            label="Full design: docs/architecture/ARCHITECTURE.md\nParticipant view: docs/WORK-QUEUE.md"];
+
+  subgraph cluster_legend {
+    label="Legend"; style="filled"; fillcolor="#ffffff"; penwidth=1; color="#666666";
+    m1 [label="deterministic code", shape=parallelogram, fillcolor="#fff2cc"];
+    m2 [label="LLM turn", shape=box, fillcolor="#bfe3bd"];
+    m3 [label="durable store", shape=cylinder, fillcolor="#ffffff"];
+    m4 [label="the observed boundary", shape=hexagon, fillcolor="#ffe6cc", penwidth=3];
+    m5 [label="solid = delivery path\ndashed = filing / best-effort\ndotted = invariant", shape=plaintext, fillcolor="#ffffff"];
+    m1 -> m2 -> m3 -> m4 -> m5 [style=invis];
+  }
+}
