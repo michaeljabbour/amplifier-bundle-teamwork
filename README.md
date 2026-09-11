@@ -242,6 +242,33 @@ The script asks for the member code without saving it, enrolls a separate projec
 
 By default enrollment uses the Amplifier Online web origin (`https://amplifier-teamwork-web.livelysea-7d934004.westus2.azurecontainerapps.io`). You may explicitly select a trusted custom HTTPS service URL, but that does **not** establish that the service is Teamwork-compatible. Deceptive URLs containing userinfo, a query, or a fragment are rejected. HTTP is for literal loopback test hosts only (`localhost`, `127.0.0.1`, or `::1`), never a production service.
 
+#### `--origin`, and why you almost certainly do not need it
+
+Enrollment sends an `Origin` header, because the member plane (`/api/login`, `/api/harnesses`) is same-origin gated. That header is derived from `--base-url`, so it is correct whenever the URL you enrol against is the one the service treats as its public web origin.
+
+**The default is that URL**, and it serves both planes — measured against the deployment above:
+
+| request to the default `--base-url` | answer |
+| --- | --- |
+| `POST /api/login` with a wrong member code | `401 unauthorized` (the origin was accepted; only the credential was wrong) |
+| `POST /api/harnesses` without a session cookie | `401` |
+| `POST /api/v1/projects/<p>/context` with a bogus bearer | `401` |
+
+So leave `--base-url` alone and there is nothing to configure.
+
+`--origin` exists for one case: a deployment that answers the API on a **different host** from its public web app, when you point `--base-url` at the API host. There, the derived origin is the API host, the service wants the web host, and `/api/login` answers **`403 invalid_origin` — "Same-origin request required"** *before it ever looks at your credential*, so no member code can get past it. Measured 3 of 3, with a deliberately invalid credential so the header was the only variable; the same request with the web origin reached credential checking and returned `401`.
+
+```sh
+python3 setup_teamwork.py \
+  --base-url https://<api-host> \
+  --origin   https://<web-host> \
+  ...
+```
+
+`--origin` is validated exactly like `--base-url`: an unambiguous HTTP(S) origin, HTTPS unless it is a literal loopback host.
+
+The harness plane is not affected either way — it authenticates with a bearer token and sends no `Origin` at all.
+
 ### 4. Start a new opted-in session
 
 Setup prints the exact file URI to use. Copy that URI into a **new** session, for example:
