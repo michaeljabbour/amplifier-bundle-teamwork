@@ -140,7 +140,7 @@ def describe(record, limit=140):
 
 
 class SyncError(Exception):
-    def __init__(self, status=0): self.status = status
+    def __init__(self, status=0, body=None): self.status, self.body = status, body
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -161,7 +161,20 @@ class HTTPClient:
         try:
             with urllib.request.build_opener(NoRedirect()).open(req, timeout=30) as response: return json.load(response)
         except urllib.error.HTTPError as error:
-            status = error.code; error.close(); raise SyncError(status) from None
+            status = error.code
+            # Read and parse the body BEFORE closing the response -- error.close()
+            # discards it, and the server's error payload (e.g. ambiguous_recipient's
+            # candidates) is otherwise lost. Bounded and best-effort: a non-JSON or
+            # oversized body degrades to no body, never to a raised exception here.
+            body = None
+            try:
+                raw = error.read(8192)
+                body = json.loads(raw.decode("utf-8", errors="replace"))
+            except Exception:
+                body = None
+            finally:
+                error.close()
+            raise SyncError(status, body) from None
         except (OSError, ValueError): raise SyncError() from None
 
 
@@ -432,6 +445,9 @@ class TeamworkHook:
                     self.state["cache"][key] = {"record": record, "delivery_id": page["delivery_id"]}
             self.state["cursor"] = page["next_cursor"]
             self.state["partial"] = page["has_more"] or page["truncated"]
+            # Delivery status for this session's own outbound mail -- server-bounded,
+            # never part of the cache, and never acknowledged (it isn't a delivery).
+            self.state["outbound"] = page.get("message_status", [])
             self.journal.save(self.sid, self.state)
             if not page["has_more"]: break
 
@@ -479,6 +495,10 @@ class TeamworkHook:
         # Seating is a fairness rule, not a reading order: restore type order.
         chosen.sort(key=lambda s: RENDER_ORDER.get(s["record"]["record_type"], 9))
         output = header(len(chosen)) + "".join(self.part(source) for source in chosen)
+        outbound = self.state.get("outbound") or []
+        if outbound:
+            output += "\nYour recent messages:\n"
+            output += "".join("  %s -> %s: %s\n" % (m["id"], m.get("to_agent_id"), m["state"]) for m in outbound)
         return output, chosen
 
     def influence(self, sources):
@@ -744,7 +764,7 @@ class TeamworkHook:
             try:
                 await self.flush(); await self.retrieve()
                 rendered, sources = self.render()
-                if sources:
+                if sources or self.state.get("outbound"):
                     inj = {"id": uid(), "rendered_text": rendered, "content_sha256": sha(rendered)}
                     turn = self.state["turn"]; turn["prepared_injection"] = inj
                     self.journal.save(self.sid, self.state)
@@ -1044,36 +1064,52 @@ class SendTool:
 
     @property
     def description(self):
-        return ("Send a message to another agent in this shared project. Address one agent by its "
-                "agent id, which appears in the shared project excerpt. The message is delivered when "
-                "that agent next runs -- it may be a teammate's laptop that is currently asleep, so do "
-                "not wait on a reply. Delivery is not agreement and not action.")
+        return ("Send a message to another agent in this shared project. Address exactly one recipient: "
+                "by agent id (as it appears in the shared project excerpt), by node label, or by person "
+                "name. The message is delivered when that agent next runs -- it may be a teammate's "
+                "laptop that is currently asleep, so do not wait on a reply. Delivery is not agreement "
+                "and not action.")
 
     @property
     def input_schema(self):
         return {"type": "object",
-                "properties": {"to_agent_id": {"type": "string", "description": "The agent to address."},
+                "properties": {"to_agent_id": {"type": "string", "description": "The agent to address, by id."},
+                               "to_node_label": {"type": "string", "description": "The agent to address, by its declared node label."},
+                               "to_person": {"type": "string", "description": "The agent to address, by the name of the person who owns it."},
                                "body": {"type": "string", "description": "What to say. Plain text, 4000 characters."}},
-                "required": ["to_agent_id", "body"]}
+                "description": "Address exactly one of to_agent_id, to_node_label, or to_person.",
+                "required": ["body"]}
 
     async def execute(self, input):
         from amplifier_core.models import ToolResult
-        to_agent, body = input.get("to_agent_id"), input.get("body")
-        if not to_agent or not body:
-            return ToolResult(success=False, error={"message": "to_agent_id and body are both required"})
+        body = input.get("body")
+        recipient = {k: input[k] for k in ("to_agent_id", "to_node_label", "to_person") if input.get(k)}
+        if not body or len(recipient) != 1:
+            return ToolResult(success=False, error={"message": "body and exactly one of to_agent_id, to_node_label, to_person are required"})
+        mid = uid()
         try:
             await asyncio.to_thread(
                 self.hook.client.request, "publish",
-                {"operations": [{"op": "message.upsert", "id": uid(), "expected_version": 0,
-                                 "data": {"to_agent_id": to_agent, "body": body}}]}, uid())
+                {"operations": [{"op": "message.upsert", "id": mid, "expected_version": 0,
+                                 "data": {**recipient, "body": body}}]}, uid())
         except SyncError as error:
             # Named plainly rather than retried: the model asked to send now.
+            candidates = None
+            if error.status == 409 and isinstance(error.body, dict):
+                candidates = (error.body.get("error") or {}).get("candidates")
+            if candidates:
+                lines = ["Not sent: more than one agent answers to that name:"]
+                lines += ["  %s \u2014 %s (%s)" % (c.get("agent_id"), c.get("node_label"), c.get("owner")) for c in candidates]
+                lines.append("Retry with to_agent_id.")
+                return ToolResult(success=False, error={"message": "\n".join(lines)})
             reason = ("that agent is not in this project" if error.status == 404
+                      else "more than one agent answers to that name; address it by agent id" if error.status == 409
                       else "the project service refused the message (HTTP %s)" % error.status
                       if error.status else "the project service could not be reached")
             return ToolResult(success=False, error={"message": "Not sent: " + reason})
         return ToolResult(success=True, output={
-            "queued_for": to_agent,
+            "message_id": mid,
+            "queued_for": next(iter(recipient.values())),
             "note": "Delivered to the project. It reaches that agent when it next runs, which may not be soon."})
 
 
