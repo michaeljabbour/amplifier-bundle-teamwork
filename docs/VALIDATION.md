@@ -46,9 +46,41 @@ it establishes the code paths are correct in isolation, not that a live
 portal-credential mint, member-code mint, or `az login` mint has ever
 succeeded end to end against the running service.
 
+### Reliability review follow-up (2026-09-10)
+
+A follow-up review of the portal-credential path found one blocker: the
+verification call (`publish` with `{"operations": []}`) had been coded to
+treat *any* non-401/403 response as a valid credential, which would have
+persisted an unverified token on a transient 5xx, a 404, or an unrelated 422.
+**Empirically re-checked against the live web origin** (reading an
+already-enrolled native connection file's token in-process, never printed):
+a genuinely valid token scoped to the requested project returns `422
+invalid_request` ("Supply 1-20 operations") for this exact zero-operation
+call -- not 2xx -- because the endpoint validates auth and project scope
+before it ever inspects the operations list. An invalid token returns `401`
+regardless of project; a valid token against the *wrong* project returns
+`404`. Verification now treats exactly `422` (or an outright `2xx`, should
+that ever change) as confirmed, `401`/`403` as an explicit rejection, and
+anything else -- `404`, `5xx`, or a transport failure -- as "could not
+verify," writing nothing to disk in that last case.
+
+A related risk was also addressed: `_fetch_service_config` had swallowed
+every failure fetching `/api/config` identically, so a genuine service
+outage or a typo'd `base_url` would have been misreported as "Microsoft
+sign-in enrollment is not enabled" instead of "service unreachable." It now
+narrows to 401/403 (still tolerated as "SSO not offered," matching EasyAuth
+gating) while any other failure raises a clear, retryable error naming only
+the service host.
+
+Separately, when a pasted credential targets a project that already has a
+saved connection, the form now says so explicitly and explains how to
+rotate (revoke the old harness, delete the saved file, reconnect) rather
+than silently keeping the old credential with no indication anything
+happened.
+
 ### Local evidence for this PR
 
-All 146 unit tests pass (`tests/`), covering: the new `DEFAULT_BASE_URL`
+All 152 unit tests pass (`tests/`), covering: the new `DEFAULT_BASE_URL`
 constant; local git-remote reading and canonical repository identity
 (`git_remote.py`, no network); the Entra token helper (`entra.py`, with
 `azure.identity` itself stubbed -- no real `az` CLI call is made in any test);
@@ -56,23 +88,26 @@ the consent form copy and repository preview, including the portal-credential
 field; the full Entra enrollment flow (mint-then-reserve ordering,
 409/401/403 handling, conflict revocation and reuse) against a fixture HTTP
 opener; the portal-credential enrollment path (verifies via the least
-side-effecting authenticated call, stores the connection with
-`harness_id: null`, never calls `/api/login` or touches `entra`, is rejected
-cleanly on 401, and reuses an existing saved connection without any network
-call); tolerance of `/api/config` returning 401 (enrollment proceeds via the
-member-code fallback rather than raising); the retired-host inert hint (mount
-stays inert, no HTTP call, notice fires once); and `teamwork_bind`'s
-local-first auto-bind (single match, ambiguous match, network-discover
-fallback and its own 401/403 tolerance, no-git-remote case) against a fixture
-native connection directory. `scripts/validate_bundle.py` passes (schema,
-composition, isolated local prepare, standalone replay).
+side-effecting authenticated call -- now checked against the empirically
+confirmed 422 success shape, 401/403 rejection, and 5xx/404/timeout
+"could not verify" cases, each writing nothing to disk -- stores the
+connection with `harness_id: null`, never calls `/api/login` or touches
+`entra`, and explicitly reports an existing saved connection instead of
+silently reusing it); `/api/config` reachability handling (401/403 tolerated,
+enrollment proceeds via the member-code fallback; a genuine connection
+error surfaces a clear, host-only "service unreachable" message instead);
+the retired-host inert hint (mount stays inert, no HTTP call, notice fires
+once); and `teamwork_bind`'s local-first auto-bind (single match, ambiguous
+match, network-discover fallback and its own 401/403 tolerance, no-git-remote
+case) against a fixture native connection directory. `scripts/validate_bundle.py`
+passes (schema, composition, isolated local prepare, standalone replay).
 
 **The dual-environment reproduction below predates the branch rebase onto
 main's agent-registration/work-queue commits and the portal-credential work
 in this same section; it recorded 111 tests at the time.** The underlying
 point -- that the suite must be proven green with genuinely no `azure`
 package importable, not just with `azure-identity` coincidentally installed
--- still holds and was re-verified at 146 tests (see the top-level report for
+-- still holds and was re-verified at 152 tests (see the top-level report for
 this PR). It was reproduced in two environments, to guard against the
 `sys.modules["azure.identity"]` stub only working because a real
 `azure-identity` package (and therefore a real `azure` parent module) was
@@ -80,11 +115,11 @@ already importable:
 
 1. The Amplifier CLI's own Python environment (`azure-identity` genuinely
    installed, via `amplifier_module_provider_azure_openai`) -- `Ran 111 tests
-   in 10.590s / OK` (at the time; 146 as of this PR).
+   in 10.590s / OK` (at the time; 152 as of this PR).
 2. A throwaway venv holding only `amplifier-core==1.6.1` (installed from
    PyPI) and the stdlib, with **no `azure` namespace package at all**
    (`import azure` raises `ModuleNotFoundError`) -- `Ran 111 tests in
-   10.393s / OK` (at the time; 146 as of this PR).
+   10.393s / OK` (at the time; 152 as of this PR).
 
 The second environment is what actually exercises the "azure.identity is not
 installed" and "azure.identity is installed but unusable" branches
