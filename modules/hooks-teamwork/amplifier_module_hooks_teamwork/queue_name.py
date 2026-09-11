@@ -55,13 +55,27 @@ def normalise(project_id):
     return candidate
 
 
-def bind(project_id, registry_path):
+def owner(project_id, service=None):
+    """Which project a tracker name belongs to.
+
+    A project id is only unique WITHIN a service. Two teamwork deployments can
+    both call a project ``teamwork`` while being entirely different projects with
+    different members, so identity here is the service and the id together.
+    Keying on the id alone would hand both the same local queue and file one
+    team's inbound requests into the other's backlog -- the exact failure the
+    join exists to prevent, arriving by a different door.
+    """
+    return project_id if not service else str(service).rstrip("/") + "/" + project_id
+
+
+def bind(project_id, registry_path, service=None):
     """The remembered part: claim the name, or refuse if another project holds it.
 
     Returns the tracker project name. Raises QueueNameConflict when a DIFFERENT
     teamwork project already owns it -- never quietly shares a queue.
     """
     name = normalise(project_id)
+    mine = owner(project_id, service)
     path = Path(registry_path).expanduser()
     registry = {}
     if path.exists():
@@ -75,14 +89,14 @@ def bind(project_id, registry_path):
                 "project owns %r" % (path, name)
             ) from None
     held = registry.get(name)
-    if held and held != project_id:
+    if held and held != mine:
         raise QueueNameConflict(
             "Tracker project %r is already bound to teamwork project %r, so %r cannot "
             "use it. Choose an explicit queue name for one of them rather than sharing "
-            "a backlog." % (name, held, project_id)
+            "a backlog." % (name, held, mine)
         )
-    if held != project_id:
-        registry[name] = project_id
+    if held != mine:
+        registry[name] = mine
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(registry, indent=2, sort_keys=True) + "\n")
         path.chmod(0o600)

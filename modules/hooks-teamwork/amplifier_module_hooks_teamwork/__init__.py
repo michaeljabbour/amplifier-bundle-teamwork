@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from . import reports
 from .service_url import validate_service_url
 
 # The old default origin, severed in the hard cutover: everyone re-enrolls
@@ -74,6 +75,9 @@ SUMMARY_NAMED = 5
 # Presence says what a session is doing, not what it said. Kept short on purpose:
 # a longer field invites pasting the prompt, which is what the turn record is for.
 PRESENCE_SUMMARY = 200
+# Filing is bounded per turn so a burst of inbound mail cannot stretch one prompt.
+# What is left over is filed on a later turn: a report delivered late is still true.
+REPORT_BATCH = 5
 
 
 def verbosity(config):
@@ -188,9 +192,17 @@ class Journal:
 
 class TeamworkHook:
     def __init__(self, coordinator, connection, journal, client=None, level=VERBOSITY_DEFAULT, complaint=None,
-                 node_label=None, responsibility=None, skills=None):
+                 node_label=None, responsibility=None, skills=None, filing=None):
         self.coordinator, self.connection, self.journal = coordinator, connection, journal
         self.level = level
+        # The local work queue an inbound message is filed into, or None when this
+        # machine runs none. Optional by design: a session without one receives its
+        # messages exactly as before and says so, rather than failing.
+        self.filing = filing
+        # The last absence explanation shown. Held so an unavailable queue is named
+        # once rather than at every turn, while the probe itself keeps retrying --
+        # a report filed two turns late is still true, unlike a replayed heartbeat.
+        self.queue_said = None
         # Supplied, never discovered: a hostname can carry an employer, a project
         # codename, or a person's name. Absent means the server applies its default.
         self.node_label = node_label
@@ -245,6 +257,14 @@ class TeamworkHook:
         self.sid = str(uuid.uuid5(uuid.NAMESPACE_URL, self.connection["base_url"] + "/" + self.connection["project_id"] + "/" + sha(self.connection["token"]) + "/" + self.native))
         self.state = self.journal.load(self.sid)
         self.entered = False
+        if self.filing is not None:
+            # A different project is a different queue. Re-resolving rather than
+            # carrying the old name over is what stops one project's inbound
+            # requests being filed into another project's backlog.
+            self.filing.project_id = self.connection["project_id"]
+            self.filing.service = self.connection["base_url"]
+            self.filing.name = None
+        self.queue_said = None
         return self.sid
 
     def clean(self, value):
@@ -489,6 +509,111 @@ class TeamworkHook:
             lines.append("  +" + str(len(extra)) + " more (" + ", ".join(kinds) + ")")
         return "\n".join(lines)
 
+    def people(self):
+        """Cached person records by id. Used for attribution and nothing else."""
+        found = {}
+        for source in self.state.get("cache", {}).values():
+            record = source["record"]
+            content = record.get("content") or {}
+            if record.get("record_type") == "person" and content.get("id"):
+                found[content["id"]] = content
+        return found
+
+    def unfiled(self):
+        """Messages addressed to this session that the local queue has not taken.
+
+        Read from the cache rather than from the rendered excerpt. The excerpt has
+        a byte budget and drops records to stay inside it, and a message that lost
+        that competition is exactly as much a teammate's request as one that won it
+        -- filing only what happened to be displayed would lose work silently.
+        """
+        filed = self.state.setdefault("filed", {})
+        pending = []
+        for source in self.state.get("cache", {}).values():
+            record = source["record"]
+            if record.get("record_type") != "message" or record.get("id") in filed:
+                continue
+            # The service already delivers a message only to its addressee. Checking
+            # again here means a server that ever stopped doing so could not make
+            # this session file somebody else's mail into its own queue.
+            if (record.get("content") or {}).get("to_agent_id") == self.sid:
+                pending.append(record)
+        pending.sort(key=lambda record: (record.get("content") or {}).get("sent_at") or "")
+        return pending
+
+    def file_reports(self):
+        """File newly arrived messages as reports. Returns a line to show, or None.
+
+        Never raises into the turn and never runs unbounded: at most REPORT_BATCH
+        messages per turn, each with its own timeout, and whatever is left is filed
+        on a later turn. Delivery to the model already happened above and does not
+        depend on any of this.
+        """
+        pending = self.unfiled()
+        if not pending or self.filing is None:
+            return None
+        if self.filing.name is None:
+            try:
+                self.filing.ready()
+            except reports.QueueUnavailable as reason:
+                # Said once per distinct reason, not once per turn. The probe keeps
+                # retrying, so a queue created mid-session starts working.
+                said, self.queue_said = self.queue_said, str(reason)
+                if said == str(reason):
+                    return None
+                return ("%d inbound message(s) reached this turn but no local work queue took them: %s. "
+                        "They remain in the shared project; nothing was queued on this machine."
+                        % (len(pending), reason))
+        self.queue_said = None
+        people = self.people()
+        filed, refused, unknown = [], [], []
+        for record in pending[:REPORT_BATCH]:
+            name = reports.sender(record, people)[0]
+            body = (record.get("content") or {}).get("body") or ""
+            if len(body.encode()) > reports.BODY_LIMIT:
+                # Refused rather than shortened. A truncated body is no longer the
+                # sender's words, and filing it as though it were is the one thing
+                # this path must never do.
+                self.state["filed"][record["id"]] = "refused: message body exceeds the filing limit"
+                refused.append(record["id"])
+                continue
+            try:
+                item = self.filing.file(
+                    record["id"], reports.title(record, name),
+                    reports.description(record, self.connection["project_id"], self.sid, name))
+            except reports.FilingUnknown as reason:
+                # The same shape as acceptance_unknown, for the same reason: a blind
+                # retry would duplicate a teammate's request and dropping it would
+                # lose one. Carry the ambiguity and name it.
+                self.state["filed"][record["id"]] = "acceptance_unknown: " + str(reason)
+                unknown.append(record["id"])
+                continue
+            except reports.QueueUnavailable as reason:
+                self.queue_said = str(reason)
+                self.journal.save(self.sid, self.state)
+                return ("Could not file %d inbound message(s) into %s: %s. They stay in the shared "
+                        "project and will be filed on a later turn."
+                        % (len(pending), self.filing.name, reason))
+            self.state["filed"][record["id"]] = item
+            filed.append(item)
+        self.journal.save(self.sid, self.state)
+        lines = []
+        if filed:
+            lines.append("Filed into the local queue %s as reports \u2014 the sender's words, unedited; "
+                         "nothing was executed:" % self.filing.name)
+            lines += ["  " + item for item in filed]
+            lines.append("  Triage decides what becomes work: a separate item linked discovered-from the report.")
+        if refused:
+            lines.append("  %d message(s) were too large to file whole and were not shortened: %s"
+                         % (len(refused), ", ".join(refused)))
+        if unknown:
+            lines.append("  %d message(s) may or may not have been filed and were not retried; "
+                         "check %s by hand: %s" % (len(unknown), self.filing.name, ", ".join(unknown)))
+        remaining = len(pending) - len(filed) - len(refused) - len(unknown)
+        if remaining > 0:
+            lines.append("  +%d more will be filed on the next turn." % remaining)
+        return "\n".join(lines) or None
+
     async def on_submit(self, event, data):
         async with self.lock:
             self.ensure_session()
@@ -508,25 +633,25 @@ class TeamworkHook:
             try:
                 await self.flush(); await self.retrieve()
                 rendered, sources = self.render()
-                if not sources: return hook_result()
-                inj = {"id": uid(), "rendered_text": rendered, "content_sha256": sha(rendered)}
-                turn = self.state["turn"]; turn["prepared_injection"] = inj
-                self.journal.save(self.sid, self.state)
-                context = self.coordinator.get("context")
-                if context is None: raise SyncError()
-                # Source-verified Amplifier context API. This successful await is
-                # the acknowledged boundary, not an assumed provider submission.
-                await context.add_message({"role": "user", "content": rendered})
-                turn["boundary"] = "harness_input_accepted"; turn["injections"] = [inj]
-                notice = self.influence(sources)
-                groups = {}
-                for source in sources:
-                    record = source["record"]
-                    groups.setdefault(source["delivery_id"], []).append({"key": record["key"], "content_sha256": record["content_sha256"], "representation": "derived"})
-                receipts = [("acknowledgements", {"session_id": self.sid, "turn_id": turn["id"], "delivery_id": did, "hook_run_id": turn["hook_run_id"], "boundary": "before_turn", "delivery_method": "harness_input_accepted", "items": items, "injection": inj, "delivered_at": now()}, uid()) for did, items in groups.items()]
-                self.journal.save(self.sid, self.state, receipts)
-                delivery_durable = True
-                await self.flush()
+                if sources:
+                    inj = {"id": uid(), "rendered_text": rendered, "content_sha256": sha(rendered)}
+                    turn = self.state["turn"]; turn["prepared_injection"] = inj
+                    self.journal.save(self.sid, self.state)
+                    context = self.coordinator.get("context")
+                    if context is None: raise SyncError()
+                    # Source-verified Amplifier context API. This successful await is
+                    # the acknowledged boundary, not an assumed provider submission.
+                    await context.add_message({"role": "user", "content": rendered})
+                    turn["boundary"] = "harness_input_accepted"; turn["injections"] = [inj]
+                    notice = self.influence(sources)
+                    groups = {}
+                    for source in sources:
+                        record = source["record"]
+                        groups.setdefault(source["delivery_id"], []).append({"key": record["key"], "content_sha256": record["content_sha256"], "representation": "derived"})
+                    receipts = [("acknowledgements", {"session_id": self.sid, "turn_id": turn["id"], "delivery_id": did, "hook_run_id": turn["hook_run_id"], "boundary": "before_turn", "delivery_method": "harness_input_accepted", "items": items, "injection": inj, "delivered_at": now()}, uid()) for did, items in groups.items()]
+                    self.journal.save(self.sid, self.state, receipts)
+                    delivery_durable = True
+                    await self.flush()
             except Exception as error:
                 if not delivery_durable and self.state.get("turn", {}).get("prepared_injection"):
                     self.state["turn"]["boundary"] = "acceptance_unknown"
@@ -534,7 +659,16 @@ class TeamworkHook:
                 if isinstance(error, SyncError) and error.status == 410:
                     notice = RETIRED_MESSAGE
                 logger.warning("Teamwork sync pending; no unobserved delivery is acknowledged (HTTP %s; 0 means transport/input failure)", getattr(error, "status", 0))
-            return hook_result(notice)
+            # Outside the delivery path on purpose, and last. A message arrived from
+            # the project whether or not the excerpt reached the model, so where it
+            # lives locally does not depend on that; and nothing here may disturb the
+            # receipt above, which is only written after an observed acceptance.
+            filed = None
+            try:
+                filed = await asyncio.to_thread(self.file_reports)
+            except Exception:
+                logger.warning("Teamwork could not file inbound messages locally; delivery is unaffected", exc_info=True)
+            return hook_result("\n".join([line for line in (notice, filed) if line]) or None)
 
     def finish(self, response, response_state="final"):
         turn = self.state.get("turn")
@@ -863,10 +997,20 @@ async def mount(coordinator, config=None):
         return None
     journal_path = Path(config.get("journal_path") or home / ("outbox-" + sha(connection["token"])[:16] + ".sqlite3")).expanduser()
     level, complaint = verbosity(config)
+    # Optional by design. Constructing it costs nothing and touches nothing: the
+    # command is not looked for until a message actually arrives, so a machine with
+    # no tracker pays no probe and sees no error.
+    filing = None
+    if config.get("file_inbound_reports", True):
+        filing = reports.Queue(
+            connection["project_id"],
+            Path(config.get("queue_registry_path") or home / "queue-names.json").expanduser(),
+            command=config.get("work_tracker_command") or reports.COMMAND,
+            root=config.get("work_tracker_root"), service=connection["base_url"])
     hook = TeamworkHook(coordinator, connection, Journal(journal_path), level=level, complaint=complaint,
                         node_label=config.get("node_label"),
                         responsibility=config.get("responsibility"),
-                        skills=config.get("skills"))
+                        skills=config.get("skills"), filing=filing)
     for name, handler in (("session:start", hook.on_start), ("prompt:submit", hook.on_submit), ("prompt:complete", hook.on_complete), ("session:end", hook.on_end)):
         coordinator.hooks.register(name, handler, priority=50, name="teamwork-" + name.replace(":", "-"))
     send = SendTool(hook)

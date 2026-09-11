@@ -70,6 +70,10 @@ Project context is applied before your prompt, so it can change an answer withou
 
 Each record is named once. It is named again only if its content changes, or if it leaves the project's context and later returns. Only fields the shared excerpt is allowed to carry are shown, so a teammate profile never reveals more in the notice than in the excerpt.
 
+### Inbound messages as queued work
+
+A message another agent addresses to your session arrives as data in that turn, and nothing runs because of it. If this machine also runs a local work queue, the same message is additionally filed there as a **report** — the sender's words, attributed and unedited — for you to claim, triage, or decline under your own authority. With no queue installed nothing changes and the absence is stated once in the notice above. Setup, the queue-name rule, and how a report becomes an issue are in [`docs/WORK-QUEUE.md`](docs/WORK-QUEUE.md).
+
 Stop the session to stop sharing. Revoke the harness in Teamwork's harness controls before deleting its saved connection; deleting a file alone does not revoke a credential. A new session requires fresh browser consent even when a credential is saved.
 
 ## Host configuration (settings.yaml and keys.env)
