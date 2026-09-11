@@ -305,6 +305,12 @@ def _mint_credential(form, base, home, project, repository, token):
 
     Requires an explicit project id: unlike SSO's mint response, a manually
     pasted credential carries no `projects` list to auto-pick from.
+
+    An existing saved connection for this project is never overwritten (see
+    AGENTS.md). Unlike the SSO/member-code paths -- where reuse is silent
+    because the user did not just hand over something new -- a pasted
+    credential IS something new, so silently keeping the old one would be a
+    surprise. This is reported explicitly, with how to rotate.
     """
     if not project:
         raise ConsentError("Enter the project ID you joined.", "project",
@@ -312,7 +318,13 @@ def _mint_credential(form, base, home, project, repository, token):
     directory = _safe_directory(home, base, project)
     path = directory / "connection.json"
     if path.exists():
-        return _reuse_saved_connection(path, base, project)
+        _reuse_saved_connection(path, base, project)  # validates private/readable/matching; raises on mismatch
+        raise ConsentError(
+            "A connection for this project is already saved on this machine; the pasted credential was not used.",
+            "credential",
+            "To use a different credential, revoke the old harness in Teamwork, delete the saved connection "
+            "file for this project, then reconnect.",
+        )
     _verify_portal_credential(base, project, token)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:

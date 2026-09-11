@@ -354,12 +354,12 @@ class PortalCredentialTests(unittest.TestCase):
             }))
             saved_path.chmod(0o600)
             with patch('urllib.request.build_opener', side_effect=AssertionError('network touched')):
-                path, project = connect(
-                    {'project': 'portal-project', 'credential': 'new-token', 'consent': 'yes'}, BASE, home_path)
-            self.assertEqual(path, saved_path)
-            self.assertEqual(project, 'portal-project')
-            self.assertEqual(json.loads(path.read_text())['token'], 'existing-token')
-
+                with self.assertRaises(ConsentError) as raised:
+                    connect(
+                        {'project': 'portal-project', 'credential': 'new-token', 'consent': 'yes'}, BASE, home_path)
+            self.assertIn('already saved', str(raised.exception).lower())
+            self.assertIn('delete', raised.exception.hint.lower())
+            self.assertEqual(json.loads(saved_path.read_text())['token'], 'existing-token')
 
     def test_valid_credential_returns_422_from_the_real_endpoint_and_is_verified(self):
         """Empirically confirmed against the live web origin: a valid token
