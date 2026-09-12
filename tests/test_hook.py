@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "modules/hooks-team
 from amplifier_module_hooks_teamwork import (HTTPClient, Journal, TeamworkHook, SyncError, sha, NoRedirect,
                                              mount, resolve_connection, describe, PERSON_FIELDS, verbosity,
                                              PRESENCE_SUMMARY, TasksTool, ClaimTool, ProgressTool,
-                                             RETIRED_MESSAGE, SendTool)
+                                             RETIRED_MESSAGE, SendTool, WaitTool)
 
 
 class Context:
@@ -321,6 +321,92 @@ class HookTests(unittest.IsolatedAsyncioTestCase):
             "original-source-hash",
         )
 
+
+    async def test_the_local_queue_observation_is_published_and_sanitized(self):
+        class Filing:
+            def status(self):
+                return {"queue_status": "ready", "ready_count": 2,
+                        "observed_at": "2026-09-11T10:00:00Z",
+                        "queue_path": "/private/work/queue.db"}
+
+        hook = TeamworkHook(Coordinator(self.context), self.connection, self.journal, self.client,
+                            filing=Filing())
+        await hook.on_start("session:start", {})
+        cards = [op for endpoint, body, _ in self.client.requests if endpoint == "publish"
+                 for op in body["operations"] if op["op"] == "agent.upsert"]
+        self.assertEqual(cards[-1]["data"]["queue"],
+                         {"queue_status": "ready", "ready_count": 2,
+                          "observed_at": "2026-09-11T10:00:00Z"})
+
+    async def test_a_machine_with_no_queue_publishes_no_queue_field(self):
+        # Omitted means "not shared", never "no tracker here". Inventing an
+        # absence is as wrong as inventing a presence.
+        await self.hook.on_start("session:start", {})
+        cards = [op for endpoint, body, _ in self.client.requests if endpoint == "publish"
+                 for op in body["operations"] if op["op"] == "agent.upsert"]
+        self.assertNotIn("queue", cards[-1]["data"])
+
+    async def test_a_probe_that_raises_never_reaches_the_turn(self):
+        class Exploding:
+            def status(self):
+                raise RuntimeError("tracker exploded")
+
+        hook = TeamworkHook(Coordinator(self.context), self.connection, self.journal, self.client,
+                            filing=Exploding())
+        await hook.on_start("session:start", {})
+        self.assertEqual(hook.agent_status, "registered")
+
+    async def test_a_declared_wait_publishes_its_reason(self):
+        await self.hook.on_start("session:start", {})
+        result = await WaitTool(self.hook).execute({"reason": "Waiting for Alex to approve the rollout"})
+        operation = self.presences()[-1][1]["operations"][0]
+        self.assertEqual(operation["data"]["state"], "waiting")
+        self.assertEqual(operation["data"]["reason"], "Waiting for Alex to approve the rollout")
+        self.assertTrue(result.success)
+
+    async def test_a_wait_without_a_reason_is_refused_and_publishes_nothing(self):
+        await self.hook.on_start("session:start", {})
+        before = len(self.presences())
+        result = await WaitTool(self.hook).execute({"reason": "   "})
+        self.assertFalse(result.success)
+        self.assertEqual(len(self.presences()), before)
+
+    async def test_a_reason_is_bounded_before_it_is_sent(self):
+        await self.hook.on_start("session:start", {})
+        await WaitTool(self.hook).execute({"reason": "y" * 500})
+        self.assertEqual(len(self.presences()[-1][1]["operations"][0]["data"]["reason"]), 200)
+
+    async def test_the_wait_tool_is_mounted_beside_the_others(self):
+        class Hooks:
+            def __init__(self): self.handlers = []
+            def register(self, *args, **kwargs): self.handlers.append((args, kwargs))
+
+        class Root:
+            parent_id = None
+            session_id = "wait-session"
+            def __init__(self): self.hooks = Hooks(); self.capabilities = {}; self.tools = {}
+            def register_capability(self, name, value): self.capabilities[name] = value
+            async def mount(self, point, value, name): self.tools[name] = value
+
+        root = Root()
+        with tempfile.TemporaryDirectory() as directory:
+            await mount(root, {"share_visible_turns": True,
+                               "base_url": "https://team.example.invalid",
+                               "project_id": "configured-project",
+                               "token": "fixture-token",
+                               "journal_path": str(Path(directory) / "queue.sqlite3")})
+        self.assertIn("teamwork_wait", root.tools)
+
+    async def test_the_next_prompt_clears_a_declared_wait(self):
+        await self.hook.on_start("session:start", {})
+        await WaitTool(self.hook).execute({"reason": "Waiting for Alex to approve the rollout"})
+        await self.hook.on_submit("prompt:submit", {"prompt": "carry on without it"})
+        latest = self.presences()[-1][1]["operations"][0]["data"]
+        self.assertEqual(latest["state"], "active")
+        self.assertNotIn("reason", latest)
+        # And the reason is gone from the session too, so a later wait cannot
+        # silently republish the resolved one.
+        self.assertIsNone(self.hook.waiting_reason)
 
 
 class RebindTests(unittest.IsolatedAsyncioTestCase):

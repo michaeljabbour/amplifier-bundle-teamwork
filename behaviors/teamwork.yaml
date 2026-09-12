@@ -1,6 +1,6 @@
 bundle:
   name: teamwork
-  version: 0.3.0
+  version: 0.4.0
   description: Share opted-in visible turns and consume attributed project context with durable delivery receipts.
 hooks:
   - module: hooks-teamwork

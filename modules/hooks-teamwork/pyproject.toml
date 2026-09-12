@@ -1,6 +1,6 @@
 [project]
 name = "amplifier-module-hooks-teamwork"
-version = "0.3.0"
+version = "0.4.0"
 description = "Opt-in project-scoped Teamwork session sharing and context receipts"
 requires-python = ">=3.11"
 license = { text = "MIT" }

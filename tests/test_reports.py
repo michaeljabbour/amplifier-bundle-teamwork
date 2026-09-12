@@ -11,7 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "modules/hooks-team
 
 from amplifier_module_hooks_teamwork import Journal, TeamworkHook
 from amplifier_module_hooks_teamwork.reports import (BODY_LIMIT, FilingUnknown, Queue, QueueUnavailable,
-                                                     description, mirror_operation, sender, title)
+                                                     description, mirror_operation, sanitize_outbound,
+                                                     sender, title)
 
 BODY = "Can you look at the relay timeouts before Thursday? We saw three drops."
 
@@ -303,6 +304,79 @@ class Filing(unittest.IsolatedAsyncioTestCase):
         # Filing is also bounded per turn, so the remainder lands on the next one.
         await hook.on_submit("prompt:submit", {"prompt": "again"})
         self.assertEqual(sorted(hook.state["filed"]), sorted(record["id"] for record in crowd))
+
+
+class Outbound(unittest.TestCase):
+    """One chokepoint, allow-listed. A field nobody thought about is dropped."""
+
+    def test_only_allow_listed_keys_survive(self):
+        payload = {"queue_status": "ready", "ready_count": 3, "observed_at": "2026-09-11T10:00:00Z",
+                   "queue_path": "/private/work/queue.db",
+                   "command": "amplifier-work-tracker list --project secret-codename",
+                   "hostname": "someones-laptop.local", "token": "tok-abc123"}
+        self.assertEqual(sanitize_outbound(payload),
+                         {"queue_status": "ready", "ready_count": 3,
+                          "observed_at": "2026-09-11T10:00:00Z"})
+
+    def test_values_are_bounded_and_wrong_types_are_dropped(self):
+        result = sanitize_outbound({"queue_status": "x" * 200, "ready_count": "seven",
+                                    "integration": None, "reason_code": "y" * 400})
+        self.assertEqual(result, {"queue_status": "x" * 40, "reason_code": "y" * 120})
+
+    def test_a_negative_or_boolean_count_is_not_a_count(self):
+        self.assertEqual(sanitize_outbound({"ready_count": -1}), {})
+        self.assertEqual(sanitize_outbound({"ready_count": True}), {})
+
+    def test_a_non_dict_payload_publishes_nothing(self):
+        self.assertEqual(sanitize_outbound("ready"), {})
+        self.assertEqual(sanitize_outbound(None), {})
+
+
+class QueueStatus(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        self.registry = Path(self.tmp.name) / "queues.json"
+
+    def queue(self, script=None, command=None):
+        return Queue("teamwork", self.registry, command=command or stub(self.tmp.name, script))
+
+    def test_a_readable_queue_is_ready_with_a_count_and_a_time(self):
+        script = ("print(json.dumps({'items': [{'id': 'tw-1', 'status': 'open'},"
+                  " {'id': 'tw-2', 'status': 'closed'}], 'truncated': False}))\n")
+        result = self.queue(script).status()
+        self.assertEqual(result["queue_status"], "ready")
+        self.assertEqual(result["ready_count"], 1)
+        self.assertEqual(result["integration"], "amplifier-work-tracker")
+        self.assertTrue(result["observed_at"])
+
+    def test_no_tracker_is_unavailable_with_a_reason_and_no_count(self):
+        result = self.queue(command=str(Path(self.tmp.name) / "absent")).status()
+        self.assertEqual(result["queue_status"], "unavailable")
+        self.assertNotIn("ready_count", result)
+        self.assertIn("installed", result["reason_code"])
+
+    def test_a_failed_probe_after_a_good_one_is_stale_not_ready(self):
+        # A queue that answered once and cannot be reached now is not "connected"
+        # and not "gone": it is a last-known reading, carrying the time it was read.
+        marker = Path(self.tmp.name) / "broken"
+        script = ("import os\n"
+                  "if os.path.exists(%r):\n"
+                  "    sys.stderr.write('the tracker is busy\\n'); sys.exit(1)\n"
+                  "print(json.dumps({'items': [{'id': 'tw-1', 'status': 'open'}], 'truncated': False}))\n"
+                  % str(marker))
+        queue = self.queue(script)
+        first = queue.status()
+        marker.write_text("x")
+        second = queue.status()
+        self.assertEqual(first["queue_status"], "ready")
+        self.assertEqual(second["queue_status"], "stale")
+        self.assertEqual(second["observed_at"], first["observed_at"])
+        self.assertEqual(second["ready_count"], 1)
+
+    def test_unreadable_output_is_unavailable_rather_than_invented(self):
+        result = self.queue("print('not json at all')\n").status()
+        self.assertEqual(result["queue_status"], "unavailable")
+        self.assertIn("could not read", result["reason_code"])
 
 
 if __name__ == "__main__":
