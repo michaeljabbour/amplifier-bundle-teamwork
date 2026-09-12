@@ -348,6 +348,25 @@ class TeamworkHook:
             return []
         return [n for n in names if isinstance(n, str)][:60]
 
+    def queue_observation(self):
+        """This machine's local work queue, bounded and sanitized, or nothing.
+
+        Probed at most once per registration and never on the turn's critical
+        path. A machine with no tracker pays one failed lookup and reports
+        `unavailable`, which is an answer rather than an error. Everything
+        published here leaves through the single outbound sanitizer, so a queue
+        name, a path or a command line cannot reach the service by accident.
+        """
+        if self.filing is None:
+            return {}
+        try:
+            observation = self.filing.status()
+        except Exception:
+            logger.warning("Teamwork could not observe the local work queue; sharing is unaffected",
+                           exc_info=True)
+            return {}
+        return reports.sanitize_outbound(observation)
+
     def register_agent(self):
         """Announce this session as an addressable agent. Best effort, never queued.
 
@@ -370,6 +389,9 @@ class TeamworkHook:
         capabilities = self.observed_capabilities()
         if capabilities:
             data["capabilities"] = capabilities
+        queue = self.queue_observation()
+        if queue:
+            data["queue"] = queue
         try:
             self.client.request("publish", {"operations": [
                 {"op": "agent.upsert", "id": self.sid, "expected_version": self.agent_version,

@@ -322,6 +322,40 @@ class HookTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+    async def test_the_local_queue_observation_is_published_and_sanitized(self):
+        class Filing:
+            def status(self):
+                return {"queue_status": "ready", "ready_count": 2,
+                        "observed_at": "2026-09-11T10:00:00Z",
+                        "queue_path": "/private/work/queue.db"}
+
+        hook = TeamworkHook(Coordinator(self.context), self.connection, self.journal, self.client,
+                            filing=Filing())
+        await hook.on_start("session:start", {})
+        cards = [op for endpoint, body, _ in self.client.requests if endpoint == "publish"
+                 for op in body["operations"] if op["op"] == "agent.upsert"]
+        self.assertEqual(cards[-1]["data"]["queue"],
+                         {"queue_status": "ready", "ready_count": 2,
+                          "observed_at": "2026-09-11T10:00:00Z"})
+
+    async def test_a_machine_with_no_queue_publishes_no_queue_field(self):
+        # Omitted means "not shared", never "no tracker here". Inventing an
+        # absence is as wrong as inventing a presence.
+        await self.hook.on_start("session:start", {})
+        cards = [op for endpoint, body, _ in self.client.requests if endpoint == "publish"
+                 for op in body["operations"] if op["op"] == "agent.upsert"]
+        self.assertNotIn("queue", cards[-1]["data"])
+
+    async def test_a_probe_that_raises_never_reaches_the_turn(self):
+        class Exploding:
+            def status(self):
+                raise RuntimeError("tracker exploded")
+
+        hook = TeamworkHook(Coordinator(self.context), self.connection, self.journal, self.client,
+                            filing=Exploding())
+        await hook.on_start("session:start", {})
+        self.assertEqual(hook.agent_status, "registered")
+
 
 class RebindTests(unittest.IsolatedAsyncioTestCase):
     """Moving a session between projects must not carry credentials or turns across."""
