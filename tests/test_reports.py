@@ -332,5 +332,52 @@ class Outbound(unittest.TestCase):
         self.assertEqual(sanitize_outbound(None), {})
 
 
+class QueueStatus(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        self.registry = Path(self.tmp.name) / "queues.json"
+
+    def queue(self, script=None, command=None):
+        return Queue("teamwork", self.registry, command=command or stub(self.tmp.name, script))
+
+    def test_a_readable_queue_is_ready_with_a_count_and_a_time(self):
+        script = ("print(json.dumps({'items': [{'id': 'tw-1', 'status': 'open'},"
+                  " {'id': 'tw-2', 'status': 'closed'}], 'truncated': False}))\n")
+        result = self.queue(script).status()
+        self.assertEqual(result["queue_status"], "ready")
+        self.assertEqual(result["ready_count"], 1)
+        self.assertEqual(result["integration"], "amplifier-work-tracker")
+        self.assertTrue(result["observed_at"])
+
+    def test_no_tracker_is_unavailable_with_a_reason_and_no_count(self):
+        result = self.queue(command=str(Path(self.tmp.name) / "absent")).status()
+        self.assertEqual(result["queue_status"], "unavailable")
+        self.assertNotIn("ready_count", result)
+        self.assertIn("installed", result["reason_code"])
+
+    def test_a_failed_probe_after_a_good_one_is_stale_not_ready(self):
+        # A queue that answered once and cannot be reached now is not "connected"
+        # and not "gone": it is a last-known reading, carrying the time it was read.
+        marker = Path(self.tmp.name) / "broken"
+        script = ("import os\n"
+                  "if os.path.exists(%r):\n"
+                  "    sys.stderr.write('the tracker is busy\\n'); sys.exit(1)\n"
+                  "print(json.dumps({'items': [{'id': 'tw-1', 'status': 'open'}], 'truncated': False}))\n"
+                  % str(marker))
+        queue = self.queue(script)
+        first = queue.status()
+        marker.write_text("x")
+        second = queue.status()
+        self.assertEqual(first["queue_status"], "ready")
+        self.assertEqual(second["queue_status"], "stale")
+        self.assertEqual(second["observed_at"], first["observed_at"])
+        self.assertEqual(second["ready_count"], 1)
+
+    def test_unreadable_output_is_unavailable_rather_than_invented(self):
+        result = self.queue("print('not json at all')\n").status()
+        self.assertEqual(result["queue_status"], "unavailable")
+        self.assertIn("could not read", result["reason_code"])
+
+
 if __name__ == "__main__":
     unittest.main()
