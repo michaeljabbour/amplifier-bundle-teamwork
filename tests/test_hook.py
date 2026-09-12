@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "modules/hooks-team
 from amplifier_module_hooks_teamwork import (HTTPClient, Journal, TeamworkHook, SyncError, sha, NoRedirect,
                                              mount, resolve_connection, describe, PERSON_FIELDS, verbosity,
                                              PRESENCE_SUMMARY, TasksTool, ClaimTool, ProgressTool,
-                                             RETIRED_MESSAGE, SendTool)
+                                             RETIRED_MESSAGE, SendTool, WaitTool)
 
 
 class Context:
@@ -355,6 +355,47 @@ class HookTests(unittest.IsolatedAsyncioTestCase):
                             filing=Exploding())
         await hook.on_start("session:start", {})
         self.assertEqual(hook.agent_status, "registered")
+
+    async def test_a_declared_wait_publishes_its_reason(self):
+        await self.hook.on_start("session:start", {})
+        result = await WaitTool(self.hook).execute({"reason": "Waiting for Alex to approve the rollout"})
+        operation = self.presences()[-1][1]["operations"][0]
+        self.assertEqual(operation["data"]["state"], "waiting")
+        self.assertEqual(operation["data"]["reason"], "Waiting for Alex to approve the rollout")
+        self.assertTrue(result.success)
+
+    async def test_a_wait_without_a_reason_is_refused_and_publishes_nothing(self):
+        await self.hook.on_start("session:start", {})
+        before = len(self.presences())
+        result = await WaitTool(self.hook).execute({"reason": "   "})
+        self.assertFalse(result.success)
+        self.assertEqual(len(self.presences()), before)
+
+    async def test_a_reason_is_bounded_before_it_is_sent(self):
+        await self.hook.on_start("session:start", {})
+        await WaitTool(self.hook).execute({"reason": "y" * 500})
+        self.assertEqual(len(self.presences()[-1][1]["operations"][0]["data"]["reason"]), 200)
+
+    async def test_the_wait_tool_is_mounted_beside_the_others(self):
+        class Hooks:
+            def __init__(self): self.handlers = []
+            def register(self, *args, **kwargs): self.handlers.append((args, kwargs))
+
+        class Root:
+            parent_id = None
+            session_id = "wait-session"
+            def __init__(self): self.hooks = Hooks(); self.capabilities = {}; self.tools = {}
+            def register_capability(self, name, value): self.capabilities[name] = value
+            async def mount(self, point, value, name): self.tools[name] = value
+
+        root = Root()
+        with tempfile.TemporaryDirectory() as directory:
+            await mount(root, {"share_visible_turns": True,
+                               "base_url": "https://team.example.invalid",
+                               "project_id": "configured-project",
+                               "token": "fixture-token",
+                               "journal_path": str(Path(directory) / "queue.sqlite3")})
+        self.assertIn("teamwork_wait", root.tools)
 
 
 class RebindTests(unittest.IsolatedAsyncioTestCase):
