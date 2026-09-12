@@ -40,6 +40,41 @@ BODY_LIMIT = 65536
 # arrived without duplicating the filing limit's own headroom.
 MIRROR_BODY_LIMIT = 500
 
+# The single chokepoint every outbound payload this bundle sends passes through.
+#
+# An ALLOW-LIST, never a denylist: the failure mode of a denylist is publishing a
+# field nobody thought about, and on this path the fields nobody thought about are
+# filesystem paths, command lines, host names and queue names -- exactly the things
+# a coordination layer must never leak. A key that is not here does not travel,
+# and adding one is a deliberate edit with a test attached.
+OUTBOUND_ALLOWED = {
+    "queue_status": (str, 40),
+    "observed_at": (str, 64),
+    "ready_count": (int, 10 ** 6),
+    "integration": (str, 40),
+    "reason_code": (str, 120),
+}
+
+
+def sanitize_outbound(payload):
+    """Return the publishable subset of `payload`. Unknown keys are dropped."""
+    if not isinstance(payload, dict):
+        return {}
+    result = {}
+    for key, value in payload.items():
+        rule = OUTBOUND_ALLOWED.get(key)
+        if rule is None:
+            continue
+        kind, limit = rule
+        if kind is int:
+            # bool is an int in Python and a count it is not.
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                continue
+            result[key] = min(value, limit)
+        elif isinstance(value, str):
+            result[key] = value[:limit]
+    return result
+
 
 class QueueUnavailable(Exception):
     """No queue to file into. A reportable state, never an error for the turn."""

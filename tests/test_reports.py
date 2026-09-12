@@ -11,7 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "modules/hooks-team
 
 from amplifier_module_hooks_teamwork import Journal, TeamworkHook
 from amplifier_module_hooks_teamwork.reports import (BODY_LIMIT, FilingUnknown, Queue, QueueUnavailable,
-                                                     description, mirror_operation, sender, title)
+                                                     description, mirror_operation, sanitize_outbound,
+                                                     sender, title)
 
 BODY = "Can you look at the relay timeouts before Thursday? We saw three drops."
 
@@ -303,6 +304,32 @@ class Filing(unittest.IsolatedAsyncioTestCase):
         # Filing is also bounded per turn, so the remainder lands on the next one.
         await hook.on_submit("prompt:submit", {"prompt": "again"})
         self.assertEqual(sorted(hook.state["filed"]), sorted(record["id"] for record in crowd))
+
+
+class Outbound(unittest.TestCase):
+    """One chokepoint, allow-listed. A field nobody thought about is dropped."""
+
+    def test_only_allow_listed_keys_survive(self):
+        payload = {"queue_status": "ready", "ready_count": 3, "observed_at": "2026-09-11T10:00:00Z",
+                   "queue_path": "/private/work/queue.db",
+                   "command": "amplifier-work-tracker list --project secret-codename",
+                   "hostname": "someones-laptop.local", "token": "tok-abc123"}
+        self.assertEqual(sanitize_outbound(payload),
+                         {"queue_status": "ready", "ready_count": 3,
+                          "observed_at": "2026-09-11T10:00:00Z"})
+
+    def test_values_are_bounded_and_wrong_types_are_dropped(self):
+        result = sanitize_outbound({"queue_status": "x" * 200, "ready_count": "seven",
+                                    "integration": None, "reason_code": "y" * 400})
+        self.assertEqual(result, {"queue_status": "x" * 40, "reason_code": "y" * 120})
+
+    def test_a_negative_or_boolean_count_is_not_a_count(self):
+        self.assertEqual(sanitize_outbound({"ready_count": -1}), {})
+        self.assertEqual(sanitize_outbound({"ready_count": True}), {})
+
+    def test_a_non_dict_payload_publishes_nothing(self):
+        self.assertEqual(sanitize_outbound("ready"), {})
+        self.assertEqual(sanitize_outbound(None), {})
 
 
 if __name__ == "__main__":
