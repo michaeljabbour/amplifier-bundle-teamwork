@@ -397,6 +397,17 @@ class HookTests(unittest.IsolatedAsyncioTestCase):
                                "journal_path": str(Path(directory) / "queue.sqlite3")})
         self.assertIn("teamwork_wait", root.tools)
 
+    async def test_the_next_prompt_clears_a_declared_wait(self):
+        await self.hook.on_start("session:start", {})
+        await WaitTool(self.hook).execute({"reason": "Waiting for Alex to approve the rollout"})
+        await self.hook.on_submit("prompt:submit", {"prompt": "carry on without it"})
+        latest = self.presences()[-1][1]["operations"][0]["data"]
+        self.assertEqual(latest["state"], "active")
+        self.assertNotIn("reason", latest)
+        # And the reason is gone from the session too, so a later wait cannot
+        # silently republish the resolved one.
+        self.assertIsNone(self.hook.waiting_reason)
+
 
 class RebindTests(unittest.IsolatedAsyncioTestCase):
     """Moving a session between projects must not carry credentials or turns across."""

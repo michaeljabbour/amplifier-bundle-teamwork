@@ -425,6 +425,11 @@ class TeamworkHook:
         """
         if self.presence_status == "unavailable" or not self.entered:
             return
+        # Any non-waiting report resolves the wait. The turn starting IS the
+        # resolution as far as this session can honestly observe -- it is running
+        # again -- and a wait that outlives the waiting is worse than none.
+        if state != "waiting":
+            self.waiting_reason = None
         # An idle session reports no NEW subject, which is not the same as having
         # had none. Blanking it would empty the field almost whenever anyone looks,
         # since a session is idle far more often than it is running; "idle, last on
