@@ -75,6 +75,7 @@ SUMMARY_NAMED = 5
 # Presence says what a session is doing, not what it said. Kept short on purpose:
 # a longer field invites pasting the prompt, which is what the turn record is for.
 PRESENCE_SUMMARY = 200
+WAIT_REASON = 200
 # Filing is bounded per turn so a burst of inbound mail cannot stretch one prompt.
 # What is left over is filed on a later turn: a report delivered late is still true.
 REPORT_BATCH = 5
@@ -249,6 +250,10 @@ class TeamworkHook:
         self.presence_version = 0
         self.presence_status = "unreported"
         self.presence_summary = ""
+        # What this session says it is waiting for, while it is waiting. Declared,
+        # never inferred: a slow provider call is not a person blocking anything,
+        # and publishing it as one would make "waiting" meaningless.
+        self.waiting_reason = None
         # Said once, on the first notice, so a misconfiguration is not silent.
         self.complaint = complaint
         self.client = client or HTTPClient(connection)
@@ -348,6 +353,25 @@ class TeamworkHook:
             return []
         return [n for n in names if isinstance(n, str)][:60]
 
+    def queue_observation(self):
+        """This machine's local work queue, bounded and sanitized, or nothing.
+
+        Probed at most once per registration and never on the turn's critical
+        path. A machine with no tracker pays one failed lookup and reports
+        `unavailable`, which is an answer rather than an error. Everything
+        published here leaves through the single outbound sanitizer, so a queue
+        name, a path or a command line cannot reach the service by accident.
+        """
+        if self.filing is None:
+            return {}
+        try:
+            observation = self.filing.status()
+        except Exception:
+            logger.warning("Teamwork could not observe the local work queue; sharing is unaffected",
+                           exc_info=True)
+            return {}
+        return reports.sanitize_outbound(observation)
+
     def register_agent(self):
         """Announce this session as an addressable agent. Best effort, never queued.
 
@@ -370,6 +394,9 @@ class TeamworkHook:
         capabilities = self.observed_capabilities()
         if capabilities:
             data["capabilities"] = capabilities
+        queue = self.queue_observation()
+        if queue:
+            data["queue"] = queue
         try:
             self.client.request("publish", {"operations": [
                 {"op": "agent.upsert", "id": self.sid, "expected_version": self.agent_version,
@@ -398,6 +425,11 @@ class TeamworkHook:
         """
         if self.presence_status == "unavailable" or not self.entered:
             return
+        # Any non-waiting report resolves the wait. The turn starting IS the
+        # resolution as far as this session can honestly observe -- it is running
+        # again -- and a wait that outlives the waiting is worse than none.
+        if state != "waiting":
+            self.waiting_reason = None
         # An idle session reports no NEW subject, which is not the same as having
         # had none. Blanking it would empty the field almost whenever anyone looks,
         # since a session is idle far more often than it is running; "idle, last on
@@ -405,10 +437,12 @@ class TeamworkHook:
         if summary:
             self.presence_summary = self.clean(summary)[:PRESENCE_SUMMARY]
         try:
+            data = {"session_id": self.sid, "state": state, "summary": self.presence_summary}
+            if state == "waiting" and self.waiting_reason:
+                data["reason"] = self.waiting_reason
             self.client.request("publish", {"operations": [
                 {"op": "presence.upsert", "id": self.sid, "expected_version": self.presence_version,
-                 "data": {"session_id": self.sid, "state": state,
-                          "summary": self.presence_summary}}]}, uid())
+                 "data": data}]}, uid())
         except SyncError as error:
             # Never fatal: sharing does not depend on being legible.
             self.presence_status = "unavailable"
@@ -420,6 +454,10 @@ class TeamworkHook:
 
     async def sense(self, state, summary=""):
         await asyncio.to_thread(self.report_presence, state, summary)
+
+    async def declare_wait(self, reason):
+        self.waiting_reason = reason
+        await asyncio.to_thread(self.report_presence, "waiting")
 
     async def announce(self):
         await asyncio.to_thread(self.register_agent)
@@ -1125,6 +1163,51 @@ class SendTool:
             "note": "Delivered to the project. It reaches that agent when it next runs, which may not be soon."})
 
 
+class WaitTool:
+    """Say that this session is waiting on a person, and what for.
+
+    A DECLARATION, not an action: it messages nobody, assigns nobody, creates no
+    dependency and does not claim anyone has agreed to anything. The installed
+    orchestrator may or may not emit an approval event on this host -- a constant
+    existing upstream is not evidence of a producer -- so this is the path that
+    always works, and a host event, where one exists, only corroborates it.
+    """
+
+    def __init__(self, hook):
+        self.hook = hook
+
+    @property
+    def name(self):
+        return "teamwork_wait"
+
+    @property
+    def description(self):
+        return ("Declare that this session is now waiting on a person -- for a decision, an approval "
+                "or an answer -- and say what for. It notifies nobody and assigns nobody; it only makes "
+                "the wait visible to teammates, and it clears by itself at the next prompt.")
+
+    @property
+    def input_schema(self):
+        return {"type": "object",
+                "properties": {"reason": {"type": "string",
+                                          "description": "What this session is waiting for, in a short phrase (200 characters)."}},
+                "required": ["reason"]}
+
+    async def execute(self, input):
+        from amplifier_core.models import ToolResult
+        reason = (input.get("reason") or "").strip()
+        if not reason:
+            return ToolResult(success=False, error={"message":
+                "reason is required: say what this session is waiting for"})
+        await self.hook.declare_wait(reason[:WAIT_REASON])
+        if self.hook.presence_status != "waiting":
+            return ToolResult(success=False, error={"message":
+                "Not declared: this project's service did not accept the waiting state. Nothing else changed."})
+        return ToolResult(success=True, output={
+            "state": "waiting", "reason": reason[:WAIT_REASON],
+            "note": "Visible to teammates until this session's next prompt. Nobody was notified."})
+
+
 async def mount(coordinator, config=None):
     # Delegated prompts are internal work, not the opted-in human conversation.
     if getattr(coordinator, "parent_id", None):
@@ -1174,7 +1257,7 @@ async def mount(coordinator, config=None):
         coordinator.hooks.register(name, handler, priority=50, name="teamwork-" + name.replace(":", "-"))
     send = SendTool(hook)
     await coordinator.mount("tools", send, name=send.name)
-    for tool in (TasksTool(hook), ClaimTool(hook), ProgressTool(hook)):
+    for tool in (TasksTool(hook), ClaimTool(hook), ProgressTool(hook), WaitTool(hook)):
         await coordinator.mount("tools", tool, name=tool.name)
     coordinator.register_capability("teamwork.session_id", hook.sid)
     coordinator.register_capability("teamwork.rebind", hook.rebind)

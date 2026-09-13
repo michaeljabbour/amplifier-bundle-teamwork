@@ -22,6 +22,7 @@ reaching past it to Beads is how a coordination layer stops coordinating.
 
 import json
 import subprocess
+from datetime import datetime, timezone
 
 from .queue_name import QueueNameConflict, bind
 
@@ -39,6 +40,41 @@ BODY_LIMIT = 65536
 # the local queue keeps the whole body. An excerpt is enough to identify what
 # arrived without duplicating the filing limit's own headroom.
 MIRROR_BODY_LIMIT = 500
+
+# The single chokepoint every outbound payload this bundle sends passes through.
+#
+# An ALLOW-LIST, never a denylist: the failure mode of a denylist is publishing a
+# field nobody thought about, and on this path the fields nobody thought about are
+# filesystem paths, command lines, host names and queue names -- exactly the things
+# a coordination layer must never leak. A key that is not here does not travel,
+# and adding one is a deliberate edit with a test attached.
+OUTBOUND_ALLOWED = {
+    "queue_status": (str, 40),
+    "observed_at": (str, 64),
+    "ready_count": (int, 10 ** 6),
+    "integration": (str, 40),
+    "reason_code": (str, 120),
+}
+
+
+def sanitize_outbound(payload):
+    """Return the publishable subset of `payload`. Unknown keys are dropped."""
+    if not isinstance(payload, dict):
+        return {}
+    result = {}
+    for key, value in payload.items():
+        rule = OUTBOUND_ALLOWED.get(key)
+        if rule is None:
+            continue
+        kind, limit = rule
+        if kind is int:
+            # bool is an int in Python and a count it is not.
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                continue
+            result[key] = min(value, limit)
+        elif isinstance(value, str):
+            result[key] = value[:limit]
+    return result
 
 
 class QueueUnavailable(Exception):
@@ -177,6 +213,10 @@ class Queue:
         self.command = command
         self.root = root
         self.name = None
+        # The last reading that actually succeeded. Held so a probe that fails
+        # now reports a dated truth ("last readable at T") instead of either a
+        # confident "connected" or a flat "gone", neither of which is what we know.
+        self.last_status = None
 
     def run(self, verb, args, timeout):
         command = [self.command, verb]
@@ -218,6 +258,33 @@ class Queue:
         self.run("list", ["--project", name, "--limit", "1", "--json"], PROBE_TIMEOUT)
         self.name = name
         return name
+
+    def status(self):
+        """One bounded look at this machine's queue: ready, stale, or unavailable.
+
+        HARNESS_OBSERVED, never verified -- our word about what the CLI told us,
+        stamped with when it told us, so a reader judges the age instead of
+        trusting a bare "connected". Nothing is created here: a machine with no
+        queue reports `unavailable` and a reason, which is a complete answer.
+        """
+        observed = datetime.now(timezone.utc).isoformat()
+        try:
+            if self.name is None:
+                self.ready()
+            page = json.loads(self.run("list", ["--project", self.name, "--limit", str(VERIFY_LIMIT), "--json"],
+                                       PROBE_TIMEOUT))
+        except QueueUnavailable as reason:
+            code = str(reason)
+        except ValueError:
+            code = "the work tracker returned output this bundle could not read"
+        else:
+            ready = [i for i in (page.get("items") or []) if (i.get("status") or "open") in ("open", "ready")]
+            self.last_status = {"queue_status": "ready", "observed_at": observed,
+                                "ready_count": len(ready), "integration": COMMAND}
+            return dict(self.last_status)
+        if self.last_status:
+            return dict(self.last_status, queue_status="stale", reason_code=code[:120])
+        return {"queue_status": "unavailable", "observed_at": observed, "reason_code": code[:120]}
 
     def find(self, message_id):
         """Has this message already been filed? Used only to resolve an ambiguous write.

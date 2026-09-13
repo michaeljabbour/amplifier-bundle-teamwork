@@ -2,18 +2,18 @@ digraph teamwork_standalone {
     rankdir=LR
     fontname="Helvetica"
     fontsize=12
-    label="teamwork-standalone v0.3.0 — bundle repo"
+    label="teamwork-standalone v0.4.0 — bundle repo"
     labelloc=t
     labeljust=c
     nodesep=0.6
     ranksep=0.7
     bgcolor="white"
-    source_hash="924d3d3b1adaec8e16d0bb4909327b8821f710ef4117e92448934773bf1b78e9"
+    source_hash="30fb5d353524ac29c5bdc5ec9f74e894803983af7f8f5dc972e371d5d6945a7a"
 
     node [fontname="Helvetica", fontsize=11, style="filled,rounded"]
     edge [fontname="Helvetica", fontsize=9]
 
-    root_teamwork_standalone [label="teamwork-standalone v0.3.0\n0 tools · 0 agents\n~71 tok aggregate", shape=box, fillcolor="#80cbc4", style="filled,rounded,bold", penwidth=2]
+    root_teamwork_standalone [label="teamwork-standalone v0.4.0\n0 tools · 0 agents\n~71 tok aggregate", shape=box, fillcolor="#80cbc4", style="filled,rounded,bold", penwidth=2]
 
     subgraph cluster_behaviors {
         label="Behaviors"
@@ -30,7 +30,7 @@ digraph teamwork_standalone {
         fillcolor="#f9f9f9"
         color="#999999"
 
-        mod_hooks_teamwork [label="hooks-teamwork", shape=box, fillcolor="#bbdefb", style="filled,rounded"]
+        mod_hooks_teamwork [label="hooks-teamwork\n5 tool · ~302 tok", shape=box, fillcolor="#bbdefb", style="filled,rounded"]
     }
 
     subgraph cluster_legend {

@@ -86,6 +86,14 @@ excerpt includes a bounded "Your recent messages" block showing that id moving
 `queued` \u2192 `delivered` \u2192 `accepted` as the recipient's session retrieves and then
 acknowledges it. Delivery is not agreement and not action.
 
+### Saying this session is waiting on a person
+
+The `teamwork_wait` tool declares that this session is now waiting on a person --
+for a decision, an approval or an answer -- and says what for, in at most 200
+characters. It notifies nobody and assigns nobody; it only makes the wait visible
+to teammates. A wait with no reason is refused, and the declaration clears by
+itself at this session's next prompt, so a wait can never outlive the waiting.
+
 ### Inbound messages as queued work
 
 A message another agent addresses to your session arrives as data in that turn, and nothing runs because of it. If this machine also runs a local work queue, the same message is additionally filed there as a **report** — the sender's words, attributed and unedited — for you to claim, triage, or decline under your own authority. With no queue installed nothing changes and the absence is stated once in the notice above. A filed report is also best-effort mirrored to the shared project as a request addressed to the receiving person, so the pending mail is visible centrally, not just in your local queue; the mirror never blocks or fails the local filing, and a credential without the shared-write permission degrades to a one-time notice rather than retrying. Setup, the queue-name rule, how a report becomes an issue, and the mirror are in [`docs/WORK-QUEUE.md`](docs/WORK-QUEUE.md).
