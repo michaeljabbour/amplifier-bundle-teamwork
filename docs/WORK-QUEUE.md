@@ -8,6 +8,43 @@ in your own backlog until you decide what to do with it.
 
 Nothing runs because a stranger asked. Delivery is not agreement and not action.
 
+## What is tracked where
+
+Three places, three different jobs. Putting something in the wrong one is how a
+team ends up either blind or buried.
+
+| | **The shared project** | **Your local queue** | **Git** |
+| --- | --- | --- | --- |
+| Answers | *what can the team do now, and what is blocked?* | *what am I doing next?* | *what changed?* |
+| Unit | a capability, delivered or not | an item you claim, hold and resolve | a commit |
+| Audience | everyone on the project | you and anything pulling your queue | reviewers |
+| Private by default | no — this is the point | **yes** | no |
+
+**A merged pull request is not a task and not progress.** It is *evidence that
+something was delivered*. The task is the capability — "a teammate can be asked a
+question and answer it" — and a PR is what makes that task done, not the thing
+being tracked. A progress note listing merged PRs tells the team what you touched
+while leaving them to work out what they can now do, which is the wrong way round.
+
+So state delivery the way a person would use it:
+
+> **Works now:** a question addressed to a teammate reaches them.
+> **Does not yet:** they cannot answer from where they are told.
+
+not
+
+> ~~Merged #44.~~
+
+**What goes on the shared project:** what the portal and the bundle can now do;
+what they still cannot; decisions and the reasoning behind them; a pivot, when the
+plan changed and why; and questions addressed to a named person.
+
+**What stays in your local queue:** the engineering items themselves — the
+claiming, the holding, the intermediate findings, the things you tried that did not
+work. This is deliberately private. A shared project filled with another
+participant's task churn is one nobody reads. Publishing from the queue to the
+project is an explicit act, covered under *Publishing selected local work* below.
+
 ## Reports and issues are different objects
 
 This is [amplifier-work-tracker][wt]'s own distinction, and the whole consent
