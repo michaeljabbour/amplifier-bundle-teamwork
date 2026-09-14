@@ -12,6 +12,26 @@ designed yet, rather than implying it is.
 
 Regenerate: `dot -Tpng docs/architecture/01-architecture.dot -o docs/architecture/01.png` (and 02, 03).
 
+## Before the rest: *agent* does not mean what it means in Amplifier
+
+Read [`../GLOSSARY.md`](../GLOSSARY.md) first if you have not. It owns the
+definitions; this page uses them. The short of it:
+
+> **A Teamwork agent is an enrolled participant's app** — one machine, one
+> credential. An **Amplifier** agent is a persona spawned to do one task, inside
+> that app, and the project cannot see it. When this page says *agent*, it always
+> means the first.
+
+The architectural consequence, which is what this page is for: **the inside of an
+agent is opaque, deliberately.** An app may spawn a dozen sub-agents and delegate
+across all of them; none of that is modelled here, and the hook enforces it by
+returning on `coordinator.parent_id` before any credential is opened.
+
+That opacity is what makes the rest of this design stable. The unit of
+participation is the app, which is a still thing to name; what an app does with
+its own turns is free to change and differs per host. Liveness, addressing and
+"who is asking" all hang off the app, never off what runs inside it.
+
 ## The shape of it
 
 Three zones, and the boundary between the first two is the whole design.
@@ -86,7 +106,9 @@ comprehension or device attestation.*
 
 ## Agent-to-agent: what actually happens
 
-An agent is a **session**, not a person. Liveness is per agent — one person may
+An agent is a **root session** — the participant's app — not a person, and not one
+of the sub-sessions that app spawns while working (see the terminology table at the
+top; the two are kept apart structurally). Liveness is per agent: one person may
 have a laptop asleep and a workstation running, and collapsing those into one
 "is Diego online?" would be wrong in both directions.
 
@@ -164,6 +186,45 @@ for is acting on someone's behalf.
 > on `HookResult.user_message`. In the stack verified for `teamwork-4q7`, nothing
 > renders that field under `amplifier run`. The absence is reported *in-process*
 > and is not yet demonstrated as user-visible.
+
+## Asking a question you cannot proceed without
+
+**The shape: the work waits, not the session.**
+
+A session is a conversation — ephemeral by construction. It begins, takes turns,
+ends. The durable thing is the work item. So when a session hits a question it
+genuinely cannot proceed without, it does not wait. It records the question,
+marks its work item as depending on that question, **releases the item**, and
+ends cleanly. The work sits blocked. Sessions come and go against it.
+
+Whoever answers — a person at the portal, or another participant's app — resolves
+the question. That clears the dependency, the item returns to ready, and the next
+session to claim it reads the answer already in its context.
+
+**Why not block the session.** Three options were considered and two are worse
+than they look:
+
+| | |
+| --- | --- |
+| block and wait | a session cannot be woken from outside: `execute(prompt) -> str` is one-shot and caller-invoked, hooks observe rather than originate, and nothing polls an idle session. A blocking session is a held process that dies on restart and takes its work with it. |
+| ask, then carry on | incoherent. If it can proceed without the answer, the question was not blocking — it was a message. If it was blocking, proceeding means acting on the assumption it just said it could not make. |
+| **park the work** | chosen. Nothing is held, so nothing can time out. The readiness gate already exists and is already enforced — a claim refuses an item blocked by an open dependency. |
+
+**What you see while waiting.** The session declares `waiting: <reason>` and that
+appears on its card, so anyone looking can tell *waiting on a person* from *stuck*.
+The item shows as blocked on a named question. **Not a timer** — a timeout here
+would lie about a slow model, which is why one is deliberately absent.
+
+**What happens when the answer arrives after the session ended.** Nothing needs to
+find that session, and nothing tries. The answer lands on the request record; the
+project context fetched at every `prompt:submit` already includes requests, so the
+next session to pick the work up carries the answer in its excerpt. No callback, no
+polling, no transport to build.
+
+**The asking side never learns who answers, and must not.** A person and another
+participant's app both answer on their own schedule, and both are outside the
+asking session's control. Making the asker branch on which one it is buys nothing
+and couples it to something it cannot see.
 
 ## What is NOT designed yet
 
