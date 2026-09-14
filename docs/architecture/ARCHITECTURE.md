@@ -12,6 +12,36 @@ designed yet, rather than implying it is.
 
 Regenerate: `dot -Tpng docs/architecture/01-architecture.dot -o docs/architecture/01.png` (and 02, 03).
 
+## One word, two meanings — read this before the rest
+
+**"Agent" means something different here than it does in Amplifier, and the two are
+not compatible.** Every paragraph below uses the Teamwork meaning.
+
+| | **Amplifier agent** | **Teamwork agent** |
+| --- | --- | --- |
+| What it is | a persona spawned to do one task — `delegate` / the task tool | an **enrolled participant's app**: one machine, one credential |
+| Lifetime | the task. Seconds to minutes | the enrollment. Weeks |
+| How many | as many as a session spawns, in parallel | one per enrolled machine |
+| Identity | a `parent_id` tag on events. **Not addressable** | a harness credential, a node label, declared skills |
+| Knows about Teamwork | nothing | it *is* the participant |
+
+They are kept apart by one line, not by convention. The hook reads
+`coordinator.parent_id`, and if there is one it returns before any credential is
+opened. So **a session spawned as an Amplifier agent can never register as a
+Teamwork agent** — it is excluded structurally, before the question can arise.
+
+That makes the shorthand "a Teamwork agent is a session" true but dangerously
+incomplete, and the missing half is the whole point: it is always a **root**
+session — the app itself — never one of the many sub-sessions that app spawns while
+working. When this doc says *agent*, read *the participant's running app*.
+
+Why the distinction is load-bearing rather than pedantic: liveness, addressing and
+"who is asking" all hang off it. One person with a laptop asleep and a workstation
+running is **two** Teamwork agents with different liveness — and collapsing them
+into "is Diego online?" is wrong in both directions. Meanwhile the dozen Amplifier
+agents that workstation spawned in the last hour are not participants at all, have
+no credential, and are invisible to the project by design.
+
 ## The shape of it
 
 Three zones, and the boundary between the first two is the whole design.
@@ -86,7 +116,9 @@ comprehension or device attestation.*
 
 ## Agent-to-agent: what actually happens
 
-An agent is a **session**, not a person. Liveness is per agent — one person may
+An agent is a **root session** — the participant's app — not a person, and not one
+of the sub-sessions that app spawns while working (see the terminology table at the
+top; the two are kept apart structurally). Liveness is per agent: one person may
 have a laptop asleep and a workstation running, and collapsing those into one
 "is Diego online?" would be wrong in both directions.
 
