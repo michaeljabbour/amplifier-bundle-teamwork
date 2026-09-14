@@ -11,7 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "modules/hooks-team
 
 from amplifier_module_hooks_teamwork import Journal, TeamworkHook
 from amplifier_module_hooks_teamwork.reports import (BODY_LIMIT, FilingUnknown, Queue, QueueUnavailable,
-                                                     description, mirror_operation, sanitize_outbound,
+                                                     description, mirror_operation, projection_operation,
+                                                     sanitize_outbound,
                                                      sender, title)
 
 BODY = "Can you look at the relay timeouts before Thursday? We saw three drops."
@@ -434,6 +435,40 @@ class SelectedItems(unittest.TestCase):
     def test_an_unreadable_queue_raises_rather_than_reporting_an_empty_backlog(self):
         with self.assertRaises(QueueUnavailable):
             self.queue("print('not json at all')\n").items(["tw-1"])
+
+
+class Projection(unittest.TestCase):
+    ITEM = {"id": "tw-42", "title": "  Cut the relay timeout to 5s  ", "version": 7,
+            "description": "internal notes that stay local", "assignee": "someone"}
+
+    def test_a_new_projection_creates_work_with_an_external_locator(self):
+        op = projection_operation(self.ITEM, "teamwork", "person-alex", existing_version=None)
+        self.assertEqual(op["op"], "work.upsert")
+        self.assertEqual(op["id"], "worktracker-tw-42")
+        self.assertEqual(op["expected_version"], 0)
+        self.assertEqual(op["data"]["title"], "Cut the relay timeout to 5s")
+        self.assertEqual(op["data"]["status"], "requested")
+        self.assertEqual(op["data"]["requested_person_id"], "person-alex")
+        self.assertEqual(op["data"]["evidence_refs"], [
+            {"kind": "external", "uri": "worktracker://teamwork/tw-42",
+             "label": "Local work item tw-42", "revision": "7"}])
+
+    def test_the_local_body_is_not_published_only_that_it_is_a_projection(self):
+        data = projection_operation(self.ITEM, "teamwork", "person-alex", existing_version=None)["data"]
+        self.assertNotIn("internal notes", data["description"])
+        self.assertIn("custody", data["description"].lower())
+
+    def test_reprojection_refreshes_only_the_locator(self):
+        # A person may have retitled the shared record. Reprojection must not
+        # quietly put the tracker's words back over theirs.
+        op = projection_operation(self.ITEM, "teamwork", "person-alex", existing_version=3)
+        self.assertEqual(op["expected_version"], 3)
+        self.assertEqual(set(op["data"]), {"evidence_refs"})
+
+    def test_an_untitled_item_is_labelled_rather_than_left_blank(self):
+        op = projection_operation({"id": "tw-7"}, "teamwork", "person-alex", existing_version=None)
+        self.assertEqual(op["data"]["title"], "(untitled local item)")
+        self.assertEqual(op["data"]["evidence_refs"][0]["revision"], "")
 
 
 if __name__ == "__main__":

@@ -224,6 +224,38 @@ def mirror_operation(record, sender_name, requested_person_id, project_id, base_
     }
 
 
+PROJECTION_NOTE = ("Projected from a local work tracker by the Amplifier Teamwork harness. Custody, "
+                   "claim and execution stay in that tracker; this record is the shared commitment, "
+                   "not the work item itself, and completing it here completes nothing there.")
+
+
+def projection_operation(item, queue_name, requested_person_id, existing_version=None):
+    """One `work.upsert` publishing one SELECTED local item as shared work.
+
+    The shared id is derived from the local id, so republishing the same item is
+    the same record rather than a second one. Custody does not move: what crosses
+    is a title, a status word and an opaque locator carried as `external`
+    evidence -- not a link, because there is nothing at the other end a reader
+    could open.
+
+    On REPROJECTION only the locator is refreshed. A person may have retitled the
+    shared record since, and putting the tracker's words back over theirs would
+    make the portal a mirror of a backlog nobody else can see.
+    """
+    item_id = str(item.get("id") or "").strip()
+    ref = {"kind": "external", "uri": "worktracker://%s/%s" % (queue_name, item_id),
+           "label": "Local work item %s" % item_id,
+           "revision": str(item.get("version") or item.get("updated_at") or "")}
+    if existing_version:
+        data = {"evidence_refs": [ref]}
+    else:
+        title = " ".join(str(item.get("title") or "").split())[:TITLE_LIMIT] or "(untitled local item)"
+        data = {"title": title, "status": "requested", "description": PROJECTION_NOTE,
+                "requested_person_id": requested_person_id, "evidence_refs": [ref]}
+    return {"op": "work.upsert", "id": "worktracker-" + item_id,
+            "expected_version": existing_version or 0, "data": sanitize_outbound(data)}
+
+
 class Queue:
     """The local work queue for one bound teamwork project, if there is one."""
 
