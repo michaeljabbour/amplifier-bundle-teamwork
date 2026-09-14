@@ -59,7 +59,15 @@ OUTBOUND_ALLOWED = {
     "ready_count": (int, 10 ** 6),
     "integration": (str, 40),
     "reason_code": (str, 120),
+    "title": (str, 1000),
+    "status": (str, 40),
+    "description": (str, 4000),
+    "requested_person_id": (str, 128),
 }
+
+# The only nested shape that travels, and the only keys it may carry. A locator
+# is an id and a label; a path is neither.
+REF_ALLOWED = {"kind": 40, "uri": 2048, "label": 200, "revision": 128}
 
 
 def sanitize_outbound(payload):
@@ -68,6 +76,17 @@ def sanitize_outbound(payload):
         return {}
     result = {}
     for key, value in payload.items():
+        if key == "evidence_refs":
+            if not isinstance(value, list):
+                continue
+            refs = []
+            for ref in value[:30]:
+                if not isinstance(ref, dict):
+                    continue
+                refs.append({k: ref[k][:limit] for k, limit in REF_ALLOWED.items()
+                             if isinstance(ref.get(k), str)})
+            result[key] = refs
+            continue
         rule = OUTBOUND_ALLOWED.get(key)
         if rule is None:
             continue

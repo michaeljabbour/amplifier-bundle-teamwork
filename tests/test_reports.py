@@ -331,6 +331,27 @@ class Outbound(unittest.TestCase):
         self.assertEqual(sanitize_outbound("ready"), {})
         self.assertEqual(sanitize_outbound(None), {})
 
+    def test_projection_fields_are_allow_listed_and_bounded(self):
+        payload = {"title": "t" * 2000, "status": "requested", "description": "d" * 8000,
+                   "requested_person_id": "person-alex", "queue_name": "someones-private-queue",
+                   "local_path": "/private/work"}
+        result = sanitize_outbound(payload)
+        self.assertEqual(set(result), {"title", "status", "description", "requested_person_id"})
+        self.assertEqual(len(result["title"]), 1000)
+        self.assertEqual(len(result["description"]), 4000)
+
+    def test_evidence_refs_keep_only_the_locator_fields(self):
+        result = sanitize_outbound({"evidence_refs": [
+            {"kind": "external", "uri": "worktracker://teamwork/tw-1", "label": "Local work item tw-1",
+             "revision": "7", "absolute_path": "/private/work/queue.db"}]})
+        self.assertEqual(result["evidence_refs"], [
+            {"kind": "external", "uri": "worktracker://teamwork/tw-1",
+             "label": "Local work item tw-1", "revision": "7"}])
+
+    def test_a_malformed_evidence_list_publishes_no_evidence(self):
+        self.assertEqual(sanitize_outbound({"evidence_refs": "worktracker://teamwork/tw-1"}), {})
+        self.assertEqual(sanitize_outbound({"evidence_refs": ["tw-1"]}), {"evidence_refs": []})
+
 
 class QueueStatus(unittest.TestCase):
     def setUp(self):
