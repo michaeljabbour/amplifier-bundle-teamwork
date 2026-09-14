@@ -59,5 +59,21 @@ class BundleVersionTests(unittest.TestCase):
         self.assertGreaterEqual(_version(behavior), (0, 4, 0))
 
 
+class ProjectionDocsTests(unittest.TestCase):
+    """A wire contract nobody wrote down is a contract nobody can hold us to."""
+
+    def test_the_projection_contract_is_documented_on_both_pages(self):
+        queue_doc = (ROOT / "docs/WORK-QUEUE.md").read_text(encoding="utf-8")
+        protocol = (ROOT / "docs/PROTOCOL.md").read_text(encoding="utf-8")
+        for phrase in ("teamwork_publish_work", "custody"):
+            self.assertIn(phrase, queue_doc)
+        for phrase in ("external", "worktracker://", "expected_version"):
+            self.assertIn(phrase, protocol)
+
+    def test_the_docs_say_projection_is_never_automatic(self):
+        queue_doc = (ROOT / "docs/WORK-QUEUE.md").read_text(encoding="utf-8")
+        self.assertIn("never automatic", queue_doc.lower())
+
+
 if __name__ == "__main__":
     unittest.main()

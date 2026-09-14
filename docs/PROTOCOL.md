@@ -37,3 +37,11 @@ An `agent.upsert` may carry a bounded `queue` object: `queue_status` (exactly on
 ### Declared waiting
 
 A `presence.upsert` with `state: "waiting"` must carry a non-empty `reason` of at most 200 characters; the service refuses a waiting state without one. The reason lives on the presence record, which expires the same way presence always has, and it is dropped the moment the session reports any other state — a wait that outlives the waiting is worse than no wait at all. The `teamwork_wait` tool is the only producer: it declares, and it notifies nobody, assigns nobody and creates no dependency. Host approval events, where an orchestrator emits them, corroborate a declaration; they are not required for one.
+
+### Projected work
+
+A projected item is a `work.upsert` carrying one `external` evidence reference: `{"kind": "external", "uri": "worktracker://<queue>/<item-id>", "label": …, "revision": …}`. `external` is a distinct evidence kind from `artifact` precisely because `artifact` requires an http(s) URL that a reader may follow, and this locator has nothing behind it — a view renders it as text, never as a link.
+
+The shared record id is derived from the local id (`worktracker-<item-id>`), so republishing the same item is the same record rather than a second one. Concurrency is the service's ordinary `expected_version` rule: the session writes at the version it read, a record a person has since edited answers `409 version_conflict`, and the tool reports "re-read it and retry" for that item while the rest of the batch proceeds. Nothing is ever overwritten to resolve a conflict.
+
+Projection bookkeeping — when it was last projected, at which source revision, by whom — is kept in the service's `_sync` side-index and exposed read-only through `GET /api/project-view`. It is deliberately not on the work record: writing it there would bump `version` on every reprojection and make every reader's `expected_version` stale for a fact no person edited.
