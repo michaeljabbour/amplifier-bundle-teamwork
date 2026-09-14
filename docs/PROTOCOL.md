@@ -38,6 +38,10 @@ An `agent.upsert` may carry a bounded `queue` object: `queue_status` (exactly on
 
 A `presence.upsert` with `state: "waiting"` must carry a non-empty `reason` of at most 200 characters; the service refuses a waiting state without one. The reason lives on the presence record, which expires the same way presence always has, and it is dropped the moment the session reports any other state — a wait that outlives the waiting is worse than no wait at all. The `teamwork_wait` tool is the only producer: it declares, and it notifies nobody, assigns nobody and creates no dependency. Host approval events, where an orchestrator emits them, corroborate a declaration; they are not required for one.
 
+**Why it is declared and not detected.** No runtime signal exists on this host that says a turn is blocked on a person. The kernel emits nothing for it, and the installed orchestrator may or may not raise an approval event — a constant existing upstream is not evidence of a producer. The one alternative, inferring it from elapsed silence, would report `waiting` for a model that is merely slow, which is a lie of exactly the kind the rest of this protocol refuses. So nothing is inferred and no timer exists anywhere in this path.
+
+To detect rather than declare, a runtime would have to emit a signal that says three things at once: that the turn has stopped, that it stopped **pending a person** rather than pending a tool or a provider, and **which** person or decision it stopped on. A bare "turn idle" event is not enough — it cannot separate a blocked turn from a slow one, which is the whole distinction this state exists to carry. Until such a signal exists, a declaration from the session is the only honest producer, and `teamwork_wait` is it.
+
 ### Projected work
 
 A projected item is a `work.upsert` carrying one `external` evidence reference: `{"kind": "external", "uri": "worktracker://<queue>/<item-id>", "label": …, "revision": …}`. `external` is a distinct evidence kind from `artifact` precisely because `artifact` requires an http(s) URL that a reader may follow, and this locator has nothing behind it — a view renders it as text, never as a link.
