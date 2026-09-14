@@ -187,6 +187,45 @@ for is acting on someone's behalf.
 > renders that field under `amplifier run`. The absence is reported *in-process*
 > and is not yet demonstrated as user-visible.
 
+## Asking a question you cannot proceed without
+
+**The shape: the work waits, not the session.**
+
+A session is a conversation — ephemeral by construction. It begins, takes turns,
+ends. The durable thing is the work item. So when a session hits a question it
+genuinely cannot proceed without, it does not wait. It records the question,
+marks its work item as depending on that question, **releases the item**, and
+ends cleanly. The work sits blocked. Sessions come and go against it.
+
+Whoever answers — a person at the portal, or another participant's app — resolves
+the question. That clears the dependency, the item returns to ready, and the next
+session to claim it reads the answer already in its context.
+
+**Why not block the session.** Three options were considered and two are worse
+than they look:
+
+| | |
+| --- | --- |
+| block and wait | a session cannot be woken from outside: `execute(prompt) -> str` is one-shot and caller-invoked, hooks observe rather than originate, and nothing polls an idle session. A blocking session is a held process that dies on restart and takes its work with it. |
+| ask, then carry on | incoherent. If it can proceed without the answer, the question was not blocking — it was a message. If it was blocking, proceeding means acting on the assumption it just said it could not make. |
+| **park the work** | chosen. Nothing is held, so nothing can time out. The readiness gate already exists and is already enforced — a claim refuses an item blocked by an open dependency. |
+
+**What you see while waiting.** The session declares `waiting: <reason>` and that
+appears on its card, so anyone looking can tell *waiting on a person* from *stuck*.
+The item shows as blocked on a named question. **Not a timer** — a timeout here
+would lie about a slow model, which is why one is deliberately absent.
+
+**What happens when the answer arrives after the session ended.** Nothing needs to
+find that session, and nothing tries. The answer lands on the request record; the
+project context fetched at every `prompt:submit` already includes requests, so the
+next session to pick the work up carries the answer in its excerpt. No callback, no
+polling, no transport to build.
+
+**The asking side never learns who answers, and must not.** A person and another
+participant's app both answer on their own schedule, and both are outside the
+asking session's control. Making the asker branch on which one it is buys nothing
+and couples it to something it cannot see.
+
 ## What is NOT designed yet
 
 **How the portal presents work-tracker state.** One direction exists today: a
