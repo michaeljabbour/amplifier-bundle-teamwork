@@ -191,3 +191,42 @@ An earlier isolated live Amplifier CLI run on the same date, documented before t
 The authorized fresh test against a real Teamwork service and provider is recorded above, together with a fresh remote composition of the reviewed behavior include and nested module sources at `@main`; a composition pinned to an exact commit SHA has not been separately exercised. The current local checks cannot establish another participant's installation, a custom orchestrator, an arbitrary custom HTTPS service, or a live external provider/service. A Digital Twin Universe attempt was blocked by host capacity before launch; no container source verification occurred in this task. The temporary Gitea environment was torn down and supplies no release evidence.
 
 The private operator evidence remains outside this public repository. No session or project IDs, local paths, usernames, credentials, fixture payloads, raw logs, participant profiles, or interview transcripts are published here.
+
+## Coordination v2 evidence (phases 2 and 3)
+
+Every figure below was copied from a command run while closing phase 3. A gate that
+was not run is written as not run, never inferred from a green neighbour.
+
+| Gate | Where | Result |
+|---|---|---|
+| Service unit suite | `amplifier-app-teamwork` @ `adf3b5d` | `Ran 369 tests in 3.005s` / `OK (skipped=2)` |
+| Service UI suites | `amplifier-app-teamwork` @ `adf3b5d` | 15 of 17 pass. `test_chat_ui.cjs` and `test_onboarding_ui.cjs` FAIL — **pre-existing**, verified failing identically at the phase-3 branch point `d16b981` and at phase 2's branch point before that. Not a regression, and not fixed here. |
+| Public export check | `amplifier-app-teamwork` @ `adf3b5d` | `Document exports match.`, `exit=0`. The marker went stale when phase 3 touched `public/app.js` and `public/index.html`, and was regenerated in `adf3b5d` after confirming the marker was the sole difference. |
+| Bundle unit suite | `amplifier-bundle-teamwork` @ `774afc9` | `Ran 240 tests in 14.205s` / `OK` |
+| Bundle structure | `amplifier-bundle-teamwork` @ `774afc9` | `PASS: root schema without includes, behavior schema, isolated local composition preserving nonempty session/context and provider settings, app behavior opt-in composition, both local module sources, bounded local prepare, and standalone empty replay. No provider call, enrollment, remote Foundation include, or cache reuse.` |
+| Clean-interpreter suite | `amplifier-core` 1.6.1, azure packages verified absent | `Ran 240 tests in 14.451s` / `OK` |
+
+### Two exit criteria were not met as written
+
+**The bundle count.** Phase 3's exit criteria says 224 tests (216 at phase 2 exit + 8).
+Measured: phase 2 exited at **220**, phase 3 added **20**, giving **240**. The written
+figure is stale in the same way phase 2's bundle ladder was, and is recorded here
+against measurement rather than restated.
+
+**Every `.cjs` printing its PASS line.** Not satisfiable. Two UI suites fail and did so
+before either phase began. They are reported, not repaired, and not counted as passing.
+
+### What these phases do and do not close
+
+| Tracking reference | Standing after phase 3 |
+|---|---|
+| `teamwork-e77` (waiting) | **Contract shipped, live observation outstanding.** The unit suites prove a declared wait is published with its reason and cleared by the next prompt. No real session was observed declaring a wait and resolving it, so this is not closeable on this evidence. |
+| `teamwork-7xb` (profile enrichment) | Untouched and explicitly out of scope for phases 2 and 3 — it belongs to P11. Recorded so a reader does not infer it from "coordination v2 shipped". |
+| Journey 4 (a report is seen, checked, declined or linked) | Covered by `tests/test_triage.py`, `tests/test_triage_ui.cjs`, and the invariant that no agent or session record moves on arrival or triage. |
+| Journey 5 (one project page: epics, owners, dependencies, projected work, freshness) | Covered by `tests/test_project_view.py` and `tests/test_project_view.cjs`, including the assertions that no message body, session id or node label appears. |
+| `teamwork-3w0`, `bc3`, `tk5`, `4q7`, `at1`, `s04` | Unchanged by these phases. |
+| `teamwork-con` (open read for signed-in non-members) | Raised during phase 3 and **parked** for a team decision. The registry stays per-member; `at1` proceeds as originally written until the team rules otherwise. |
+
+No issue is closed by this document. Closure needs the live acceptance named in the
+master plan's closeout section.
+
