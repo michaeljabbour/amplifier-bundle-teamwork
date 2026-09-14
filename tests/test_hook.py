@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "modules/hooks-team
 from amplifier_module_hooks_teamwork import (HTTPClient, Journal, TeamworkHook, SyncError, sha, NoRedirect,
                                              mount, resolve_connection, describe, PERSON_FIELDS, verbosity,
                                              PRESENCE_SUMMARY, TasksTool, ClaimTool, ProgressTool,
-                                             RETIRED_MESSAGE, SendTool, WaitTool)
+                                             RETIRED_MESSAGE, SendTool, WaitTool, PublishWorkTool)
 
 
 class Context:
@@ -1325,6 +1325,68 @@ class MessageStatus(unittest.IsolatedAsyncioTestCase):
         second, _ = hook.render()
         self.assertEqual(len(first), len(second))
         self.assertEqual(first.count(" -> "), 20)
+
+
+class PublishWorkTests(unittest.IsolatedAsyncioTestCase):
+    class Filing:
+        name = "teamwork"
+        def __init__(self): self.asked = []
+        def items(self, item_ids):
+            self.asked.append(list(item_ids))
+            found = [{"id": i, "title": "Cut the relay timeout", "version": 7}
+                     for i in item_ids if i.startswith("tw-")]
+            return found, [i for i in item_ids if not i.startswith("tw-")]
+
+    class Client:
+        def __init__(self, sid): self.sid, self.requests, self.fail = sid, [], None
+        def request(self, endpoint, body, key=None):
+            self.requests.append((endpoint, json.loads(json.dumps(body)), key))
+            if endpoint == "context":
+                return {"next_cursor": "c", "delivery_id": "d", "has_more": False, "truncated": False,
+                        "items": [{"key": "agent:%s" % self.sid, "id": self.sid, "version": 1,
+                                   "record_type": "agent", "change": "upsert", "content_sha256": "h",
+                                   "content": {"id": self.sid, "owner_person_id": "person-alex"}}]}
+            if self.fail:
+                raise SyncError(self.fail)
+            return {"stored": True}
+
+    async def asyncSetUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        self.connection = {"base_url": "https://team.example.invalid", "project_id": "teamwork",
+                           "token": "fixture-token"}
+        journal = Journal(Path(self.tmp.name) / "queue.db")
+        coordinator = Coordinator(Context([]))
+        self.hook = TeamworkHook(coordinator, self.connection, journal, None, filing=self.Filing())
+        self.hook.client = self.Client(self.hook.sid)
+
+    def published(self):
+        return [op for endpoint, body, _ in self.hook.client.requests if endpoint == "publish"
+                for op in body["operations"]]
+
+    async def test_only_the_named_items_are_published(self):
+        result = await PublishWorkTool(self.hook).execute({"item_ids": ["tw-1"]})
+        operations = self.published()
+        self.assertEqual(len(operations), 1)
+        self.assertEqual(operations[0]["id"], "worktracker-tw-1")
+        self.assertEqual(operations[0]["data"]["requested_person_id"], "person-alex")
+        self.assertTrue(result.success)
+        self.assertEqual(result.output["published"], ["worktracker-tw-1"])
+
+    async def test_nothing_is_published_without_an_explicit_selection(self):
+        result = await PublishWorkTool(self.hook).execute({"item_ids": []})
+        self.assertFalse(result.success)
+        self.assertEqual(self.published(), [])
+
+    async def test_an_unknown_local_id_is_reported_and_the_rest_still_publish(self):
+        result = await PublishWorkTool(self.hook).execute({"item_ids": ["tw-1", "nope-9"]})
+        self.assertEqual(result.output["not_found"], ["nope-9"])
+        self.assertEqual([op["id"] for op in self.published()], ["worktracker-tw-1"])
+
+    async def test_a_machine_with_no_queue_says_so_rather_than_publishing_nothing_quietly(self):
+        self.hook.filing = None
+        result = await PublishWorkTool(self.hook).execute({"item_ids": ["tw-1"]})
+        self.assertFalse(result.success)
+        self.assertIn("local work queue", result.error["message"])
 
 
 if __name__ == '__main__':
