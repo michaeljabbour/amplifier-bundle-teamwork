@@ -1389,5 +1389,71 @@ class PublishWorkTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("local work queue", result.error["message"])
 
 
+
+    async def test_a_conflict_is_reported_as_re_read_and_retry(self):
+        class Conflicting(self.Client):
+            def request(self, endpoint, body, key=None):
+                if endpoint == "publish":
+                    self.requests.append((endpoint, json.loads(json.dumps(body)), key))
+                    raise SyncError(409)
+                return super().request(endpoint, body, key)
+
+        self.hook.client = Conflicting(self.hook.sid)
+        result = await PublishWorkTool(self.hook).execute({"item_ids": ["tw-1"]})
+        self.assertTrue(result.success)
+        self.assertEqual(result.output["published"], [])
+        self.assertIn("re-read", result.output["refused"][0]["reason"])
+
+    async def test_reprojection_sends_only_the_locator_at_the_version_it_read(self):
+        class Existing(self.Client):
+            def request(self, endpoint, body, key=None):
+                if endpoint == "context":
+                    page = super().request(endpoint, body, key)
+                    page["items"].append({"key": "work:worktracker-tw-1", "id": "worktracker-tw-1",
+                                          "version": 3, "record_type": "work", "change": "upsert",
+                                          "content_sha256": "h",
+                                          "content": {"id": "worktracker-tw-1", "version": 3,
+                                                      "title": "A title a person rewrote",
+                                                      "status": "accepted"}})
+                    return page
+                return super().request(endpoint, body, key)
+
+        self.hook.client = Existing(self.hook.sid)
+        await PublishWorkTool(self.hook).execute({"item_ids": ["tw-1"]})
+        operation = self.published()[0]
+        self.assertEqual(operation["expected_version"], 3)
+        self.assertEqual(set(operation["data"]), {"evidence_refs"})
+
+
+
+    async def test_a_request_sharing_the_id_does_not_supply_the_work_version(self):
+        # project() returns work AND request records in one list. Without a
+        # record_type filter the version lookup is last-write-wins, so a request
+        # that happens to share a projected work id would decide the version the
+        # reprojection is written at -- and the wrong version is either a spurious
+        # conflict or, worse, a write that lands on a record nobody checked.
+        class Both(self.Client):
+            def request(self, endpoint, body, key=None):
+                if endpoint == "context":
+                    page = super().request(endpoint, body, key)
+                    page["items"].append({"key": "work:worktracker-tw-1", "id": "worktracker-tw-1",
+                                          "version": 3, "record_type": "work", "change": "upsert",
+                                          "content_sha256": "h",
+                                          "content": {"id": "worktracker-tw-1", "version": 3,
+                                                      "title": "A title a person rewrote",
+                                                      "status": "accepted"}})
+                    page["items"].append({"key": "request:worktracker-tw-1", "id": "worktracker-tw-1",
+                                          "version": 9, "record_type": "request", "change": "upsert",
+                                          "content_sha256": "h",
+                                          "content": {"id": "worktracker-tw-1", "version": 9,
+                                                      "title": "An unrelated request", "status": "requested"}})
+                    return page
+                return super().request(endpoint, body, key)
+
+        self.hook.client = Both(self.hook.sid)
+        await PublishWorkTool(self.hook).execute({"item_ids": ["tw-1"]})
+        self.assertEqual(self.published()[0]["expected_version"], 3)
+
+
 if __name__ == '__main__':
     unittest.main()

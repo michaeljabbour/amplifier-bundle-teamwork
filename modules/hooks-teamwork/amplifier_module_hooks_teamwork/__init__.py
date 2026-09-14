@@ -1137,7 +1137,10 @@ class PublishWorkTool(WorkTools):
         if not mine:
             return None, "this session is not registered as an agent yet, so nothing could be attributed to a person"
         found, missing = self.hook.filing.items(item_ids)
-        versions = {w.get("id"): w.get("version", 0) for w in work}
+        # project() returns work AND request records in one list, so filter: a
+        # request sharing a projected work id would otherwise win on last-write
+        # and decide the version this reprojection is written at.
+        versions = {w.get("id"): w.get("version", 0) for w in work if w.get("record_type") == "work"}
         published, refused = [], []
         for item in found:
             work_id = "worktracker-" + str(item.get("id"))
