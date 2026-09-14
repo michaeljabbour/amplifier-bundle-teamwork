@@ -240,3 +240,11 @@ the same shape, and the same reasoning, as the injection path's
 `acceptance_unknown`.
 
 [wt]: https://github.com/microsoft/amplifier-work-tracker
+
+## Publishing selected local work
+
+`teamwork_publish_work` takes a list of local work-tracker item ids and publishes those items — and only those — as shared `work` records. It is never automatic: no turn, hook or heartbeat calls it, and there is no path in this bundle that reads a whole backlog out.
+
+Custody does not move. The local tracker keeps the item, its claim and its lease; what crosses is a title, the status word `requested`, and an opaque locator. Completing the shared record completes nothing locally, and the shared description says so. An item the tracker does not have is named back to the caller rather than dropped, and a local queue that cannot be read is an error, never an empty backlog.
+
+On reprojection only the locator is refreshed. A person may have retitled or reassigned the shared record since, and putting the tracker's words back over theirs would turn the portal into a mirror of a backlog nobody else can see. Nor does reprojection move custody: the item is still claimed, worked and resolved in the local tracker.

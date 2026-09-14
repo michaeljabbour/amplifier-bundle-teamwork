@@ -11,7 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "modules/hooks-team
 
 from amplifier_module_hooks_teamwork import Journal, TeamworkHook
 from amplifier_module_hooks_teamwork.reports import (BODY_LIMIT, FilingUnknown, Queue, QueueUnavailable,
-                                                     description, mirror_operation, sanitize_outbound,
+                                                     description, mirror_operation, projection_operation,
+                                                     sanitize_outbound,
                                                      sender, title)
 
 BODY = "Can you look at the relay timeouts before Thursday? We saw three drops."
@@ -331,6 +332,27 @@ class Outbound(unittest.TestCase):
         self.assertEqual(sanitize_outbound("ready"), {})
         self.assertEqual(sanitize_outbound(None), {})
 
+    def test_projection_fields_are_allow_listed_and_bounded(self):
+        payload = {"title": "t" * 2000, "status": "requested", "description": "d" * 8000,
+                   "requested_person_id": "person-alex", "queue_name": "someones-private-queue",
+                   "local_path": "/private/work"}
+        result = sanitize_outbound(payload)
+        self.assertEqual(set(result), {"title", "status", "description", "requested_person_id"})
+        self.assertEqual(len(result["title"]), 1000)
+        self.assertEqual(len(result["description"]), 4000)
+
+    def test_evidence_refs_keep_only_the_locator_fields(self):
+        result = sanitize_outbound({"evidence_refs": [
+            {"kind": "external", "uri": "worktracker://teamwork/tw-1", "label": "Local work item tw-1",
+             "revision": "7", "absolute_path": "/private/work/queue.db"}]})
+        self.assertEqual(result["evidence_refs"], [
+            {"kind": "external", "uri": "worktracker://teamwork/tw-1",
+             "label": "Local work item tw-1", "revision": "7"}])
+
+    def test_a_malformed_evidence_list_publishes_no_evidence(self):
+        self.assertEqual(sanitize_outbound({"evidence_refs": "worktracker://teamwork/tw-1"}), {})
+        self.assertEqual(sanitize_outbound({"evidence_refs": ["tw-1"]}), {"evidence_refs": []})
+
 
 class QueueStatus(unittest.TestCase):
     def setUp(self):
@@ -377,6 +399,76 @@ class QueueStatus(unittest.TestCase):
         result = self.queue("print('not json at all')\n").status()
         self.assertEqual(result["queue_status"], "unavailable")
         self.assertIn("could not read", result["reason_code"])
+
+
+class SelectedItems(unittest.TestCase):
+    """Selected, by id. There is no path here that reads a whole backlog out."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        self.registry = Path(self.tmp.name) / "queues.json"
+        self.log = Path(self.tmp.name) / "calls.log"
+
+    def queue(self, script):
+        return Queue("teamwork", self.registry, command=stub(self.tmp.name, script))
+
+    def listing(self):
+        return ("open(%r, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+                "print(json.dumps({'items': [{'id': 'tw-1', 'title': 'Cut the relay timeout', 'version': 7},"
+                " {'id': 'tw-2', 'title': 'Private spike', 'version': 2}], 'truncated': False}))\n"
+                % str(self.log))
+
+    def test_only_the_named_items_come_back_in_the_order_asked_for(self):
+        found, missing = self.queue(self.listing()).items(["tw-2", "tw-1"])
+        self.assertEqual([i["id"] for i in found], ["tw-2", "tw-1"])
+        self.assertEqual(missing, [])
+
+    def test_an_unknown_id_is_named_rather_than_silently_dropped(self):
+        found, missing = self.queue(self.listing()).items(["tw-1", "tw-99"])
+        self.assertEqual([i["id"] for i in found], ["tw-1"])
+        self.assertEqual(missing, ["tw-99"])
+
+    def test_the_selection_is_bounded(self):
+        found, missing = self.queue(self.listing()).items(["tw-1"] * 50)
+        self.assertLessEqual(len(found) + len(missing), 20)
+
+    def test_an_unreadable_queue_raises_rather_than_reporting_an_empty_backlog(self):
+        with self.assertRaises(QueueUnavailable):
+            self.queue("print('not json at all')\n").items(["tw-1"])
+
+
+class Projection(unittest.TestCase):
+    ITEM = {"id": "tw-42", "title": "  Cut the relay timeout to 5s  ", "version": 7,
+            "description": "internal notes that stay local", "assignee": "someone"}
+
+    def test_a_new_projection_creates_work_with_an_external_locator(self):
+        op = projection_operation(self.ITEM, "teamwork", "person-alex", existing_version=None)
+        self.assertEqual(op["op"], "work.upsert")
+        self.assertEqual(op["id"], "worktracker-tw-42")
+        self.assertEqual(op["expected_version"], 0)
+        self.assertEqual(op["data"]["title"], "Cut the relay timeout to 5s")
+        self.assertEqual(op["data"]["status"], "requested")
+        self.assertEqual(op["data"]["requested_person_id"], "person-alex")
+        self.assertEqual(op["data"]["evidence_refs"], [
+            {"kind": "external", "uri": "worktracker://teamwork/tw-42",
+             "label": "Local work item tw-42", "revision": "7"}])
+
+    def test_the_local_body_is_not_published_only_that_it_is_a_projection(self):
+        data = projection_operation(self.ITEM, "teamwork", "person-alex", existing_version=None)["data"]
+        self.assertNotIn("internal notes", data["description"])
+        self.assertIn("custody", data["description"].lower())
+
+    def test_reprojection_refreshes_only_the_locator(self):
+        # A person may have retitled the shared record. Reprojection must not
+        # quietly put the tracker's words back over theirs.
+        op = projection_operation(self.ITEM, "teamwork", "person-alex", existing_version=3)
+        self.assertEqual(op["expected_version"], 3)
+        self.assertEqual(set(op["data"]), {"evidence_refs"})
+
+    def test_an_untitled_item_is_labelled_rather_than_left_blank(self):
+        op = projection_operation({"id": "tw-7"}, "teamwork", "person-alex", existing_version=None)
+        self.assertEqual(op["data"]["title"], "(untitled local item)")
+        self.assertEqual(op["data"]["evidence_refs"][0]["revision"], "")
 
 
 if __name__ == "__main__":

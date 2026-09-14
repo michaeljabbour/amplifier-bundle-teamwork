@@ -945,12 +945,16 @@ LEGACY_STATUS = {"Proposed": "requested", "Ready": "requested", "In progress": "
 class WorkTools:
     """See the work assigned to me, claim it, and report movement on it.
 
-    There is deliberately NO tool here that creates work. A session must not be
-    able to invent tasks for anyone, including its own owner: that is a person's
-    decision, made in the portal. It is also why the server grants this session a
-    narrow per-record permission rather than a broad scope -- the credential's
-    power and the model's reach are not the same thing, and making them the same
-    for convenience is how a confused agent becomes a destructive one.
+    No tool here INVENTS work. A session must not be able to conjure tasks for
+    anyone, including its own owner: that is a person's decision, made in the
+    portal. It is also why the server grants this session a narrow per-record
+    permission rather than a broad scope -- the credential's power and the
+    model's reach are not the same thing, and making them the same for
+    convenience is how a confused agent becomes a destructive one.
+
+    `PublishWorkTool` is the one tool here that writes a new shared record, and
+    it is not an exception to that rule: it PROJECTS items that already exist in
+    a local tracker and that the person named explicitly. It originates nothing.
     """
 
     def __init__(self, hook):
@@ -1095,6 +1099,90 @@ class ProgressTool(WorkTools):
             return ToolResult(success=False, error={"message": "Not recorded: " + refusal})
         return ToolResult(success=True, output={"updated": task_id,
                                                 "status": data.get("status", current.get("status"))})
+
+
+class PublishWorkTool(WorkTools):
+    """Publish NAMED local work items as shared commitments. Never automatic.
+
+    Nothing here reads a backlog out. The person running this session names the
+    items, and only those cross -- a title, a status word and a locator. Custody,
+    claim and execution stay in the local tracker; the shared record is the
+    commitment, not the work.
+
+    The layering is deliberate and worth keeping: `Queue.items` is the only thing
+    that knows the local tracker, `reports.projection_operation` is a pure
+    transformation with no I/O, and this tool only orchestrates the two and talks
+    to the client. Any of the three can be replaced without touching the others.
+    """
+
+    @property
+    def name(self):
+        return "teamwork_publish_work"
+
+    @property
+    def description(self):
+        return ("Publish specific local work-tracker items to the shared project, by their local ids, "
+                "so teammates can see what has been committed to. It copies a title and a pointer, "
+                "nothing else -- the items stay in the local queue, owned and claimed there.")
+
+    @property
+    def input_schema(self):
+        return {"type": "object",
+                "properties": {"item_ids": {"type": "array", "items": {"type": "string"},
+                                            "description": "Local work-tracker item ids, chosen deliberately."}},
+                "required": ["item_ids"]}
+
+    def publish_selected(self, item_ids):
+        work, mine = self.project()
+        if not mine:
+            return None, "this session is not registered as an agent yet, so nothing could be attributed to a person"
+        found, missing = self.hook.filing.items(item_ids)
+        # project() returns work AND request records in one list, so filter: a
+        # request sharing a projected work id would otherwise win on last-write
+        # and decide the version this reprojection is written at.
+        versions = {w.get("id"): w.get("version", 0) for w in work if w.get("record_type") == "work"}
+        published, refused = [], []
+        for item in found:
+            work_id = "worktracker-" + str(item.get("id"))
+            operation = reports.projection_operation(item, self.hook.filing.name, mine,
+                                                     existing_version=versions.get(work_id))
+            try:
+                self.hook.client.request("publish", {"operations": [operation]}, uid())
+            except SyncError as error:
+                refused.append({"item_id": item.get("id"), "reason": self.refusal(error)})
+                continue
+            published.append(work_id)
+        return {"published": published, "not_found": missing, "refused": refused}, None
+
+    def refusal(self, error):
+        if error.status == 409:
+            return "the shared record changed while this was being prepared; re-read it and retry"
+        if error.status == 403:
+            return ("this credential may not create shared work (it needs the shared-write permission); "
+                    "nothing was changed")
+        return ("the project service refused it (HTTP %s)" % error.status if error.status
+                else "the project service could not be reached")
+
+    async def execute(self, input):
+        from amplifier_core.models import ToolResult
+        item_ids = input.get("item_ids")
+        if not isinstance(item_ids, list) or not item_ids:
+            return ToolResult(success=False, error={"message":
+                "item_ids is required: name the local items to publish. Nothing is published automatically."})
+        if self.hook.filing is None:
+            return ToolResult(success=False, error={"message":
+                "This machine has no local work queue configured, so there is nothing to publish from."})
+        try:
+            result, refusal = await asyncio.to_thread(self.publish_selected, item_ids)
+        except reports.QueueUnavailable as reason:
+            return ToolResult(success=False, error={"message": "Could not read the local queue: %s" % reason})
+        except SyncError as error:
+            return ToolResult(success=False, error={"message": "Not published: " + self.refusal(error)})
+        if refusal:
+            return ToolResult(success=False, error={"message": "Not published: " + refusal})
+        return ToolResult(success=True, output=dict(result, note=(
+            "Published as shared commitments pointing back at the local items. Custody did not move: "
+            "they are still claimed and worked in the local queue.")))
 
 
 class SendTool:
@@ -1257,7 +1345,7 @@ async def mount(coordinator, config=None):
         coordinator.hooks.register(name, handler, priority=50, name="teamwork-" + name.replace(":", "-"))
     send = SendTool(hook)
     await coordinator.mount("tools", send, name=send.name)
-    for tool in (TasksTool(hook), ClaimTool(hook), ProgressTool(hook), WaitTool(hook)):
+    for tool in (TasksTool(hook), ClaimTool(hook), ProgressTool(hook), WaitTool(hook), PublishWorkTool(hook)):
         await coordinator.mount("tools", tool, name=tool.name)
     coordinator.register_capability("teamwork.session_id", hook.sid)
     coordinator.register_capability("teamwork.rebind", hook.rebind)

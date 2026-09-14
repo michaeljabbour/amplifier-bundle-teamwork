@@ -41,6 +41,11 @@ BODY_LIMIT = 65536
 # arrived without duplicating the filing limit's own headroom.
 MIRROR_BODY_LIMIT = 500
 
+# How many local items one explicit publish call may carry. A bound, not a page
+# size: publishing is a deliberate act about a handful of named items, and a
+# request for fifty is far more likely to be a mistake than an intention.
+PUBLISH_LIMIT = 20
+
 # The single chokepoint every outbound payload this bundle sends passes through.
 #
 # An ALLOW-LIST, never a denylist: the failure mode of a denylist is publishing a
@@ -54,7 +59,15 @@ OUTBOUND_ALLOWED = {
     "ready_count": (int, 10 ** 6),
     "integration": (str, 40),
     "reason_code": (str, 120),
+    "title": (str, 1000),
+    "status": (str, 40),
+    "description": (str, 4000),
+    "requested_person_id": (str, 128),
 }
+
+# The only nested shape that travels, and the only keys it may carry. A locator
+# is an id and a label; a path is neither.
+REF_ALLOWED = {"kind": 40, "uri": 2048, "label": 200, "revision": 128}
 
 
 def sanitize_outbound(payload):
@@ -63,6 +76,17 @@ def sanitize_outbound(payload):
         return {}
     result = {}
     for key, value in payload.items():
+        if key == "evidence_refs":
+            if not isinstance(value, list):
+                continue
+            refs = []
+            for ref in value[:30]:
+                if not isinstance(ref, dict):
+                    continue
+                refs.append({k: ref[k][:limit] for k, limit in REF_ALLOWED.items()
+                             if isinstance(ref.get(k), str)})
+            result[key] = refs
+            continue
         rule = OUTBOUND_ALLOWED.get(key)
         if rule is None:
             continue
@@ -200,6 +224,38 @@ def mirror_operation(record, sender_name, requested_person_id, project_id, base_
     }
 
 
+PROJECTION_NOTE = ("Projected from a local work tracker by the Amplifier Teamwork harness. Custody, "
+                   "claim and execution stay in that tracker; this record is the shared commitment, "
+                   "not the work item itself, and completing it here completes nothing there.")
+
+
+def projection_operation(item, queue_name, requested_person_id, existing_version=None):
+    """One `work.upsert` publishing one SELECTED local item as shared work.
+
+    The shared id is derived from the local id, so republishing the same item is
+    the same record rather than a second one. Custody does not move: what crosses
+    is a title, a status word and an opaque locator carried as `external`
+    evidence -- not a link, because there is nothing at the other end a reader
+    could open.
+
+    On REPROJECTION only the locator is refreshed. A person may have retitled the
+    shared record since, and putting the tracker's words back over theirs would
+    make the portal a mirror of a backlog nobody else can see.
+    """
+    item_id = str(item.get("id") or "").strip()
+    ref = {"kind": "external", "uri": "worktracker://%s/%s" % (queue_name, item_id),
+           "label": "Local work item %s" % item_id,
+           "revision": str(item.get("version") or item.get("updated_at") or "")}
+    if existing_version:
+        data = {"evidence_refs": [ref]}
+    else:
+        title = " ".join(str(item.get("title") or "").split())[:TITLE_LIMIT] or "(untitled local item)"
+        data = {"title": title, "status": "requested", "description": PROJECTION_NOTE,
+                "requested_person_id": requested_person_id, "evidence_refs": [ref]}
+    return {"op": "work.upsert", "id": "worktracker-" + item_id,
+            "expected_version": existing_version or 0, "data": sanitize_outbound(data)}
+
+
 class Queue:
     """The local work queue for one bound teamwork project, if there is one."""
 
@@ -306,6 +362,25 @@ class Queue:
             raise FilingUnknown("this project's queue is larger than %d items, so an already-filed "
                                 "report could not be ruled out" % VERIFY_LIMIT)
         return None
+
+    def items(self, item_ids):
+        """Read the named local items. Selected by id, never the whole backlog.
+
+        Returns `(found, missing)` with `found` in the order asked for, so the
+        caller can name what it could not see instead of quietly publishing less
+        than was requested. An unreadable queue RAISES: reporting "none of them
+        exist" from a failed read would delete work from a person's view.
+        """
+        wanted = [str(i) for i in item_ids][:PUBLISH_LIMIT]
+        if self.name is None:
+            self.ready()
+        try:
+            page = json.loads(self.run("list", ["--project", self.name, "--limit", str(VERIFY_LIMIT), "--json"],
+                                       PROBE_TIMEOUT))
+        except ValueError:
+            raise QueueUnavailable("the work tracker returned output this bundle could not read") from None
+        found = {entry.get("id"): entry for entry in page.get("items", []) if entry.get("id")}
+        return [found[i] for i in wanted if i in found], [i for i in wanted if i not in found]
 
     def file(self, message_id, item_title, item_description):
         """Add one report. Ambiguity is resolved by reading back, never by retrying.
