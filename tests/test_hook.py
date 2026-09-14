@@ -65,6 +65,65 @@ class DescribeAttribution(unittest.TestCase):
         self.assertEqual(describe(self.message()), describe(self.message(), people={}))
 
 
+class DescribeAnsweredRequest(unittest.TestCase):
+    """An answer that arrives unnoticed is the same as no answer (teamwork-cap-answer-visible).
+
+    Requests already ride back in the excerpt on every prompt -- that was verified,
+    not assumed. What was missing is that an ANSWERED request and an outstanding one
+    rendered identically, so the reply the session was waiting for arrived looking
+    exactly like the question it had already seen.
+    """
+
+    def request(self, **extra):
+        return {"key": "k", "id": "ask-1", "record_type": "request",
+                "content": {"id": "ask-1", "title": "Should read be open to signed-in users?",
+                            "requested_person_id": "person-molly", **extra}}
+
+    def answered(self, response="context", **extra):
+        extra.setdefault("progress_note",
+                         "Open to signed-in users. Private projects stay invite-only.")
+        return self.request(response=response, responded_by="person-molly",
+                            responded_at="2026-09-14T21:00:00Z", **extra)
+
+    def test_an_outstanding_request_still_reads_as_a_request(self):
+        self.assertIn("Request", describe(self.request()))
+
+    def test_an_answered_request_does_not_read_as_an_outstanding_one(self):
+        outstanding, answered = describe(self.request()), describe(self.answered())
+        self.assertNotEqual(outstanding, answered)
+        self.assertNotIn("\u276f Request", answered)
+
+    def test_the_answer_itself_is_in_the_line_not_just_that_one_exists(self):
+        # "You have a reply" costs a round trip to read. The reply costs nothing.
+        self.assertIn("Open to signed-in users", describe(self.answered()))
+
+    def test_who_answered_is_named_when_the_page_delivered_them(self):
+        line = describe(self.answered(), people={"person-molly": "Molly"})
+        self.assertIn("Molly", line)
+        self.assertNotIn("person-molly", line)
+
+    def test_an_unresolvable_responder_is_still_attributed_by_id(self):
+        # Same rule the sender attribution already follows: a real attribution beats
+        # a legible guess, and dropping it is worse than both.
+        self.assertIn("person-molly", describe(self.answered(), people={}))
+
+    def test_each_kind_of_answer_reads_differently(self):
+        lines = {v: describe(self.answered(response=v)) for v in ("act", "defer", "context")}
+        self.assertEqual(len(set(lines.values())), 3, lines)
+
+    def test_a_declined_answer_is_not_dressed_up_as_agreement(self):
+        self.assertNotIn("act", describe(self.answered(response="defer")).lower())
+
+    def test_an_unknown_response_value_is_not_rendered_as_an_answer(self):
+        # The vocabulary is act/defer/context. Anything else is not something this
+        # renderer understands, and guessing at it would be inventing.
+        self.assertIn("Request", describe(self.request(response="maybe")))
+
+    def test_the_line_stays_bounded(self):
+        line = describe(self.answered(progress_note="x" * 4000), limit=140)
+        self.assertLessEqual(len(line), 400, line)
+
+
 class HookTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)

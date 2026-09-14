@@ -59,6 +59,7 @@ INFLUENCE_LABELS = {"message": "\u2709 Message", "insight": "\u2605 Insight", "i
                     "request": "\u276f Request",
                     "work": "\u25cf Work", "plan": "\u25b8 Plan", "plan_step": "\u25b8 Plan step",
                     "project": "\u25aa Project", "person": "\u25cd Teammate", "presence": "\u25cc Presence"}
+ANSWER_LABELS = {"act": "will act on it", "defer": "not now", "context": "context given"}
 INFLUENCE_ORDER = {"message": 0, "insight": 1, "idea": 2, "request": 3, "work": 4, "plan": 5,
                    "plan_step": 6, "project": 7, "person": 8, "presence": 9}
 TITLE_FIELDS = ("title", "headline", "summary", "statement", "text", "name", "goal", "description", "body")
@@ -147,6 +148,22 @@ def describe(record, limit=140, people=None):
     author = None if kind == "person" else next(
         (name for name in (named(content.get(key)) for key in AUTHOR_FIELDS) if name), None)
     author = (people or {}).get(author, author)
+    # An answer that arrives unnoticed is the same as no answer. An answered request
+    # and an outstanding one used to render identically, so the reply a session was
+    # waiting for came back looking exactly like the question it had already read.
+    #
+    # The answer itself goes in the line, not a promise of one: "you have a reply"
+    # costs a round trip to read, and the reply costs nothing. Attribution follows
+    # the rule the sender already uses -- resolve the id against people delivered in
+    # the same page, and when that fails show the id rather than dropping it.
+    answer = ANSWER_LABELS.get(content.get("response")) if kind == "request" else None
+    if answer:
+        who = (people or {}).get(content.get("responded_by"), content.get("responded_by"))
+        note = " ".join(str(content.get("progress_note") or "").split())
+        if len(note) > limit:
+            note = note[:limit - 1].rstrip() + "\u2026"
+        return ("\u2713 Answered" + (" \u00b7 " + who if who else "") + " \u2014 " + title
+                + " \u2014 " + answer + (": " + note if note else ""))
     return label + (" \u00b7 " + author if author else "") + " \u2014 " + title
 
 
