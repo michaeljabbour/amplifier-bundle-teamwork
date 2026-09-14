@@ -379,5 +379,41 @@ class QueueStatus(unittest.TestCase):
         self.assertIn("could not read", result["reason_code"])
 
 
+class SelectedItems(unittest.TestCase):
+    """Selected, by id. There is no path here that reads a whole backlog out."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        self.registry = Path(self.tmp.name) / "queues.json"
+        self.log = Path(self.tmp.name) / "calls.log"
+
+    def queue(self, script):
+        return Queue("teamwork", self.registry, command=stub(self.tmp.name, script))
+
+    def listing(self):
+        return ("open(%r, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+                "print(json.dumps({'items': [{'id': 'tw-1', 'title': 'Cut the relay timeout', 'version': 7},"
+                " {'id': 'tw-2', 'title': 'Private spike', 'version': 2}], 'truncated': False}))\n"
+                % str(self.log))
+
+    def test_only_the_named_items_come_back_in_the_order_asked_for(self):
+        found, missing = self.queue(self.listing()).items(["tw-2", "tw-1"])
+        self.assertEqual([i["id"] for i in found], ["tw-2", "tw-1"])
+        self.assertEqual(missing, [])
+
+    def test_an_unknown_id_is_named_rather_than_silently_dropped(self):
+        found, missing = self.queue(self.listing()).items(["tw-1", "tw-99"])
+        self.assertEqual([i["id"] for i in found], ["tw-1"])
+        self.assertEqual(missing, ["tw-99"])
+
+    def test_the_selection_is_bounded(self):
+        found, missing = self.queue(self.listing()).items(["tw-1"] * 50)
+        self.assertLessEqual(len(found) + len(missing), 20)
+
+    def test_an_unreadable_queue_raises_rather_than_reporting_an_empty_backlog(self):
+        with self.assertRaises(QueueUnavailable):
+            self.queue("print('not json at all')\n").items(["tw-1"])
+
+
 if __name__ == "__main__":
     unittest.main()

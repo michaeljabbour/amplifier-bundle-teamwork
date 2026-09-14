@@ -41,6 +41,11 @@ BODY_LIMIT = 65536
 # arrived without duplicating the filing limit's own headroom.
 MIRROR_BODY_LIMIT = 500
 
+# How many local items one explicit publish call may carry. A bound, not a page
+# size: publishing is a deliberate act about a handful of named items, and a
+# request for fifty is far more likely to be a mistake than an intention.
+PUBLISH_LIMIT = 20
+
 # The single chokepoint every outbound payload this bundle sends passes through.
 #
 # An ALLOW-LIST, never a denylist: the failure mode of a denylist is publishing a
@@ -306,6 +311,25 @@ class Queue:
             raise FilingUnknown("this project's queue is larger than %d items, so an already-filed "
                                 "report could not be ruled out" % VERIFY_LIMIT)
         return None
+
+    def items(self, item_ids):
+        """Read the named local items. Selected by id, never the whole backlog.
+
+        Returns `(found, missing)` with `found` in the order asked for, so the
+        caller can name what it could not see instead of quietly publishing less
+        than was requested. An unreadable queue RAISES: reporting "none of them
+        exist" from a failed read would delete work from a person's view.
+        """
+        wanted = [str(i) for i in item_ids][:PUBLISH_LIMIT]
+        if self.name is None:
+            self.ready()
+        try:
+            page = json.loads(self.run("list", ["--project", self.name, "--limit", str(VERIFY_LIMIT), "--json"],
+                                       PROBE_TIMEOUT))
+        except ValueError:
+            raise QueueUnavailable("the work tracker returned output this bundle could not read") from None
+        found = {entry.get("id"): entry for entry in page.get("items", []) if entry.get("id")}
+        return [found[i] for i in wanted if i in found], [i for i in wanted if i not in found]
 
     def file(self, message_id, item_title, item_description):
         """Add one report. Ambiguity is resolved by reading back, never by retrying.
