@@ -12,35 +12,25 @@ designed yet, rather than implying it is.
 
 Regenerate: `dot -Tpng docs/architecture/01-architecture.dot -o docs/architecture/01.png` (and 02, 03).
 
-## One word, two meanings — read this before the rest
+## Before the rest: *agent* does not mean what it means in Amplifier
 
-**"Agent" means something different here than it does in Amplifier, and the two are
-not compatible.** Every paragraph below uses the Teamwork meaning.
+Read [`../GLOSSARY.md`](../GLOSSARY.md) first if you have not. It owns the
+definitions; this page uses them. The short of it:
 
-| | **Amplifier agent** | **Teamwork agent** |
-| --- | --- | --- |
-| What it is | a persona spawned to do one task — `delegate` / the task tool | an **enrolled participant's app**: one machine, one credential |
-| Lifetime | the task. Seconds to minutes | the enrollment. Weeks |
-| How many | as many as a session spawns, in parallel | one per enrolled machine |
-| Identity | a `parent_id` tag on events. **Not addressable** | a harness credential, a node label, declared skills |
-| Knows about Teamwork | nothing | it *is* the participant |
+> **A Teamwork agent is an enrolled participant's app** — one machine, one
+> credential. An **Amplifier** agent is a persona spawned to do one task, inside
+> that app, and the project cannot see it. When this page says *agent*, it always
+> means the first.
 
-They are kept apart by one line, not by convention. The hook reads
-`coordinator.parent_id`, and if there is one it returns before any credential is
-opened. So **a session spawned as an Amplifier agent can never register as a
-Teamwork agent** — it is excluded structurally, before the question can arise.
+The architectural consequence, which is what this page is for: **the inside of an
+agent is opaque, deliberately.** An app may spawn a dozen sub-agents and delegate
+across all of them; none of that is modelled here, and the hook enforces it by
+returning on `coordinator.parent_id` before any credential is opened.
 
-That makes the shorthand "a Teamwork agent is a session" true but dangerously
-incomplete, and the missing half is the whole point: it is always a **root**
-session — the app itself — never one of the many sub-sessions that app spawns while
-working. When this doc says *agent*, read *the participant's running app*.
-
-Why the distinction is load-bearing rather than pedantic: liveness, addressing and
-"who is asking" all hang off it. One person with a laptop asleep and a workstation
-running is **two** Teamwork agents with different liveness — and collapsing them
-into "is Diego online?" is wrong in both directions. Meanwhile the dozen Amplifier
-agents that workstation spawned in the last hour are not participants at all, have
-no credential, and are invisible to the project by design.
+That opacity is what makes the rest of this design stable. The unit of
+participation is the app, which is a still thing to name; what an app does with
+its own turns is free to change and differs per host. Liveness, addressing and
+"who is asking" all hang off the app, never off what runs inside it.
 
 ## The shape of it
 

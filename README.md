@@ -96,6 +96,11 @@ itself at this session's next prompt, so a wait can never outlive the waiting.
 
 ### Inbound messages as queued work
 
+**"Agent" here means an enrolled participant's app — one machine, one credential —
+not an Amplifier sub-agent spawned to do a task. The two are different things and
+the inside of an app is deliberately opaque to this project. See
+[`docs/GLOSSARY.md`](docs/GLOSSARY.md).**
+
 A message another agent addresses to your session arrives as data in that turn, and nothing runs because of it. If this machine also runs a local work queue, the same message is additionally filed there as a **report** — the sender's words, attributed and unedited — for you to claim, triage, or decline under your own authority. With no queue installed nothing changes and the absence is stated once in the notice above. A filed report is also best-effort mirrored to the shared project as a request addressed to the receiving person, so the pending mail is visible centrally, not just in your local queue; the mirror never blocks or fails the local filing, and a credential without the shared-write permission degrades to a one-time notice rather than retrying. Setup, the queue-name rule, how a report becomes an issue, and the mirror are in [`docs/WORK-QUEUE.md`](docs/WORK-QUEUE.md).
 
 Stop the session to stop sharing. Revoke the harness in Teamwork's harness controls before deleting its saved connection; deleting a file alone does not revoke a credential. A new session requires fresh browser consent even when a credential is saved.
