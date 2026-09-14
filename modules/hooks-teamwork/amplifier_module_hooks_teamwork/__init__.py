@@ -271,6 +271,10 @@ class TeamworkHook:
         # never inferred: a slow provider call is not a person blocking anything,
         # and publishing it as one would make "waiting" meaningless.
         self.waiting_reason = None
+        # The request this wait is ON, when there is one. A wait can name a
+        # record or only a person; naming a record is what makes its END
+        # observable rather than assumed.
+        self.waiting_on = None
         # Said once, on the first notice, so a misconfiguration is not silent.
         self.complaint = complaint
         self.client = client or HTTPClient(connection)
@@ -445,7 +449,11 @@ class TeamworkHook:
         # Any non-waiting report resolves the wait. The turn starting IS the
         # resolution as far as this session can honestly observe -- it is running
         # again -- and a wait that outlives the waiting is worse than none.
-        if state != "waiting":
+        # A wait that named a request ends when that request is answered, and
+        # not before: the session running again says nothing about whether the
+        # person replied. A wait naming only a person still ends here, because
+        # there is nothing to observe and pretending otherwise strands it.
+        if state != "waiting" and not self.waiting_on:
             self.waiting_reason = None
         # An idle session reports no NEW subject, which is not the same as having
         # had none. Blanking it would empty the field almost whenever anyone looks,
@@ -472,8 +480,29 @@ class TeamworkHook:
     async def sense(self, state, summary=""):
         await asyncio.to_thread(self.report_presence, state, summary)
 
-    async def declare_wait(self, reason):
-        self.waiting_reason = reason
+    def note_answer(self, record):
+        """End the wait when the answer actually arrives -- not when a turn starts.
+
+        Until answered requests became distinguishable from outstanding ones, any
+        non-waiting turn had to resolve the wait: the turn starting was the closest
+        thing to an answer this session could honestly observe. It no longer is.
+
+        Redelivery is NOT an answer. A request record comes back on every edit -- a
+        progress note, a status change, a re-addressing -- so accepting arrival as
+        resolution would end the wait on the arrival of the question itself. Only a
+        response this renderer understands counts, which is the same three values
+        the service validates.
+        """
+        if not self.waiting_on or record.get("record_type") != "request":
+            return
+        if record.get("id") != self.waiting_on or record.get("change") in ("delete", "evict"):
+            return
+        content = record.get("content") if isinstance(record.get("content"), dict) else {}
+        if content.get("response") in ANSWER_LABELS:
+            self.waiting_reason = self.waiting_on = None
+
+    async def declare_wait(self, reason, request_id=None):
+        self.waiting_reason, self.waiting_on = reason, request_id
         await asyncio.to_thread(self.report_presence, "waiting")
 
     async def announce(self):
@@ -508,6 +537,7 @@ class TeamworkHook:
                 if record["change"] in ("delete", "evict"): self.state["cache"].pop(key, None)
                 elif "content" in record:
                     self.state["cache"][key] = {"record": record, "delivery_id": page["delivery_id"]}
+                self.note_answer(record)
             self.state["cursor"] = page["next_cursor"]
             self.state["partial"] = page["has_more"] or page["truncated"]
             # Delivery status for this session's own outbound mail -- server-bounded,

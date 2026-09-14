@@ -65,6 +65,72 @@ class DescribeAttribution(unittest.TestCase):
         self.assertEqual(describe(self.message()), describe(self.message(), people={}))
 
 
+class WaitingEndsWhenTheAnswerArrives(unittest.TestCase):
+    """A wait that ends without the thing waited for is a lie about the work.
+
+    Before this, ANY non-waiting turn cleared the wait. That was the honest limit
+    at the time -- the code said so: "the turn starting IS the resolution as far as
+    this session can honestly observe". It is no longer the limit. Answered requests
+    now come back distinguishable from outstanding ones, so a session can observe
+    the actual answer instead of settling for a proxy for it.
+    """
+
+    def hook(self, **kw):
+        h = object.__new__(TeamworkHook)
+        h.waiting_reason, h.waiting_on = None, None
+        for k, v in kw.items(): setattr(h, k, v)
+        return h
+
+    def request(self, rid="ask-1", **extra):
+        return {"record_type": "request", "id": rid, "change": "upsert",
+                "content": {"id": rid, "title": "Should read be open?", **extra}}
+
+    def answered(self, rid="ask-1"):
+        return self.request(rid, response="context", responded_by="person-molly",
+                            progress_note="Open to signed-in users.")
+
+    def test_the_answer_arriving_ends_the_wait(self):
+        h = self.hook(waiting_reason="asked Molly about read access", waiting_on="ask-1")
+        h.note_answer(self.answered())
+        self.assertIsNone(h.waiting_reason)
+        self.assertIsNone(h.waiting_on)
+
+    def test_the_question_coming_back_UNANSWERED_does_not_end_the_wait(self):
+        # The most important case. A request record is re-delivered on any edit --
+        # a progress note, a status change. Treating redelivery as an answer would
+        # end the wait on the arrival of the question itself.
+        h = self.hook(waiting_reason="asked Molly", waiting_on="ask-1")
+        h.note_answer(self.request())
+        self.assertEqual(h.waiting_reason, "asked Molly")
+
+    def test_somebody_elses_answer_does_not_end_this_wait(self):
+        h = self.hook(waiting_reason="asked Molly", waiting_on="ask-1")
+        h.note_answer(self.answered("a-different-question"))
+        self.assertEqual(h.waiting_reason, "asked Molly")
+
+    def test_an_answer_arriving_when_not_waiting_changes_nothing(self):
+        h = self.hook()
+        h.note_answer(self.answered())
+        self.assertIsNone(h.waiting_reason)
+
+    def test_a_wait_on_nothing_nameable_is_untouched_by_arriving_answers(self):
+        # Waiting on a person rather than a record is legitimate -- there is just
+        # nothing to observe, so the old rule stands rather than being faked.
+        h = self.hook(waiting_reason="waiting for the release call", waiting_on=None)
+        h.note_answer(self.answered())
+        self.assertEqual(h.waiting_reason, "waiting for the release call")
+
+    def test_an_unknown_response_value_is_not_treated_as_an_answer(self):
+        h = self.hook(waiting_reason="asked Molly", waiting_on="ask-1")
+        h.note_answer(self.request(response="maybe"))
+        self.assertEqual(h.waiting_reason, "asked Molly")
+
+    def test_a_deletion_of_the_record_is_not_an_answer(self):
+        h = self.hook(waiting_reason="asked Molly", waiting_on="ask-1")
+        h.note_answer({"record_type": "request", "id": "ask-1", "change": "delete"})
+        self.assertEqual(h.waiting_reason, "asked Molly")
+
+
 class DescribeAnsweredRequest(unittest.TestCase):
     """An answer that arrives unnoticed is the same as no answer (teamwork-cap-answer-visible).
 
