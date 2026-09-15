@@ -2,6 +2,27 @@
 
 Teamwork is an **explicit, per-session opt-in** Amplifier bundle for sharing one selected project's visible conversation and bounded project context. It does not install a central agent, publish tool/internal-loop output, claim tasks, or replace your primary bundle or provider.
 
+## What a good teammate does
+
+The bundle gives a session eight tools and, so far, no judgment about when to reach
+for them. Every tool description says what the tool does; none says when interrupting
+a person is worth their attention, or when the answer is better asked of a machine.
+
+[`docs/scenarios/`](docs/scenarios/) is where that judgment gets worked out, one
+decision at a time, before any of it is written as guidance. Each scenario names a
+single moment where a teammate could go either way, what a good one does, what a
+plausible bad one does, and -- the part that makes it more than an opinion -- how you
+would tell them apart from outside.
+
+That last section is load-bearing twice over: it becomes the rubric that grades the
+behaviour, and it is what stops guidance being written that reads well and cannot be
+checked.
+
+Scenarios come in **pairs**. "It asked a person" is not a skill, since anything can be
+made to ask; the property worth having is discrimination -- asking when right and not
+asking when wrong. So a scenario usually has a twin where the same surface signal
+points the opposite way, and guidance is only believed when it passes both.
+
 ## Before you enroll
 
 After native connection consent, or when you run an enabled Teamwork overlay, the selected project can receive:

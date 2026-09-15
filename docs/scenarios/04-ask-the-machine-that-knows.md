@@ -84,9 +84,26 @@ implementations behind it.
 - **This depends on `03`.** A harness can only be chosen for what it is working on if
   harnesses publish what they are working on. `03` is the precondition, and guidance
   for `04` is untestable in a project where nobody says anything.
-- **Is "currently working on" even published?** Agent records carry responsibility,
-  capabilities and queue state. Whether they carry *what is being worked on right now*
-  is not something I have checked, and the scenario leans on it.
+- **Is "currently working on" published? YES -- and that is not the end of it.**
+  Checked against the live service: a session reading `/context` for `presence` gets
+  back other sessions' records, each carrying a `state` and a self-reported `summary`.
+  So the situation above is reachable today.
+
+  But look at what the summaries actually say: *"the person answered; carrying on"*.
+  True, verifiable, and almost useless for routing -- it says a machine is awake and
+  busy, not that it is the machine that knows about output shaping.
+
+  That is deliberate. The code's own note: the summary is the session's own prompt
+  subject, *"never a model's narrative of its own work, which would be unfalsifiable
+  and always flattering."* The honesty constraint and the routing-usefulness
+  constraint pull against each other, and this scenario sits on the seam.
+
+  So the open question is no longer whether the signal exists. It is **which signal
+  routing should use**: `responsibility` and `capabilities` are declared, stable and
+  were designed for this, with presence answering only "is it awake". That reading
+  needs no new mechanism. The alternative needs presence to carry a topic, which means
+  either a model narrating itself -- the thing the code refuses on purpose -- or
+  something that does not exist yet.
 - **What if the other harness is wrong?** It answers from its own uncommitted context.
   Nothing marks its answer as provisional, and the asking harness has no way to tell a
   settled fact from a half-finished one.
