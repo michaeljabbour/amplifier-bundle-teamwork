@@ -2,6 +2,27 @@
 
 Teamwork is an **explicit, per-session opt-in** Amplifier bundle for sharing one selected project's visible conversation and bounded project context. It does not install a central agent, publish tool/internal-loop output, claim tasks, or replace your primary bundle or provider.
 
+## What a good teammate does
+
+The bundle gives a session eight tools and, so far, no judgment about when to reach
+for them. Every tool description says what the tool does; none says when interrupting
+a person is worth their attention, or when the answer is better asked of a machine.
+
+[`docs/scenarios/`](docs/scenarios/) is where that judgment gets worked out, one
+decision at a time, before any of it is written as guidance. Each scenario names a
+single moment where a teammate could go either way, what a good one does, what a
+plausible bad one does, and -- the part that makes it more than an opinion -- how you
+would tell them apart from outside.
+
+That last section is load-bearing twice over: it becomes the rubric that grades the
+behaviour, and it is what stops guidance being written that reads well and cannot be
+checked.
+
+Scenarios come in **pairs**. "It asked a person" is not a skill, since anything can be
+made to ask; the property worth having is discrimination -- asking when right and not
+asking when wrong. So a scenario usually has a twin where the same surface signal
+points the opposite way, and guidance is only believed when it passes both.
+
 ## Before you enroll
 
 After native connection consent, or when you run an enabled Teamwork overlay, the selected project can receive:
@@ -9,8 +30,13 @@ After native connection consent, or when you run an enabled Teamwork overlay, th
 - visible prompts and final responses;
 - session metadata and stable correlation IDs;
 - receipts for bounded, derived project-context excerpts that Amplifier's context manager accepted before a turn;
-- a bounded local-queue status snapshot (`queue_status`, `ready_count`) published on every agent registration, when this machine runs a local work queue; and
-- title, status, and a locator for any local work-tracker items you explicitly publish with `teamwork_publish_work`.
+- **a local work-queue snapshot**, when this machine runs one, published each time the session registers as an agent. Every field it can carry, because a list shorter than the payload is not consent:
+  - `queue_status` -- `ready`, `stale`, or `unavailable`;
+  - `observed_at` -- when the queue was last looked at;
+  - `ready_count` -- how many items are waiting, when it could be read;
+  - `integration` -- the name of the work-tracker command on this machine; and
+  - `reason_code` -- when the queue could **not** be read, the tracker's own explanation. This is free text composed by that program, not by Amplifier, so it is the one field here whose contents this project does not author; and
+- **title, status and a locator** for any local work item you publish deliberately with `teamwork_publish_work`. The locator identifies the item; it is not a link and nothing at the other end is reachable. Your local descriptions and acceptance criteria do not cross.
 
 Details on the local queue and publishing are in [`docs/WORK-QUEUE.md`](docs/WORK-QUEUE.md).
 
