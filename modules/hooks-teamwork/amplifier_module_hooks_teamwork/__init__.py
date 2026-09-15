@@ -382,6 +382,13 @@ class TeamworkHook:
         `unavailable`, which is an answer rather than an error. Everything
         published here leaves through the single outbound sanitizer, so a queue
         name, a path or a command line cannot reach the service by accident.
+
+        `reason_code` in particular can carry the local work-tracker CLI's raw
+        stderr/stdout (see `reports.Queue.status`), which is free text this
+        harness did not author. It gets the same credential-redaction pass every
+        other outbound string gets -- `self.clean_json` -- before the allow-list
+        sanitizer, so a credential-shaped token surfaced by the CLI cannot leave
+        through this path unredacted.
         """
         if self.filing is None:
             return {}
@@ -391,7 +398,7 @@ class TeamworkHook:
             logger.warning("Teamwork could not observe the local work queue; sharing is unaffected",
                            exc_info=True)
             return {}
-        return reports.sanitize_outbound(observation)
+        return reports.sanitize_outbound(self.clean_json(observation))
 
     def register_agent(self):
         """Announce this session as an addressable agent. Best effort, never queued.

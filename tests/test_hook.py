@@ -471,6 +471,29 @@ class HookTests(unittest.IsolatedAsyncioTestCase):
                  for op in body["operations"] if op["op"] == "agent.upsert"]
         self.assertNotIn("queue", cards[-1]["data"])
 
+    async def test_a_credential_shaped_reason_code_is_redacted_before_it_leaves(self):
+        # reports.Queue.status() can put the local work-tracker CLI's raw
+        # stderr/stdout into reason_code (see reports.py). That text is not
+        # authored by this harness and must get the same credential-redaction
+        # pass as everything else this hook sends -- not just the outbound
+        # allow-list sanitizer, which only bounds length/type and does not
+        # redact content.
+        token = self.connection["token"]
+
+        class Filing:
+            def status(self):
+                return {"queue_status": "unavailable", "observed_at": "2026-09-11T10:00:00Z",
+                        "reason_code": "fake-work-tracker exited 1: Authorization: Bearer " + token}
+
+        hook = TeamworkHook(Coordinator(self.context), self.connection, self.journal, self.client,
+                            filing=Filing())
+        await hook.on_start("session:start", {})
+        cards = [op for endpoint, body, _ in self.client.requests if endpoint == "publish"
+                 for op in body["operations"] if op["op"] == "agent.upsert"]
+        reason = cards[-1]["data"]["queue"]["reason_code"]
+        self.assertNotIn(token, reason)
+        self.assertIn("[REDACTED CREDENTIAL]", reason)
+
     async def test_a_probe_that_raises_never_reaches_the_turn(self):
         class Exploding:
             def status(self):

@@ -7,10 +7,16 @@ Teamwork is an **explicit, per-session opt-in** Amplifier bundle for sharing one
 After native connection consent, or when you run an enabled Teamwork overlay, the selected project can receive:
 
 - visible prompts and final responses;
-- session metadata and stable correlation IDs; and
-- receipts for bounded, derived project-context excerpts that Amplifier's context manager accepted before a turn.
+- session metadata and stable correlation IDs;
+- receipts for bounded, derived project-context excerpts that Amplifier's context manager accepted before a turn;
+- a bounded local-queue status snapshot (`queue_status`, `ready_count`) published on every agent registration, when this machine runs a local work queue; and
+- title, status, and a locator for any local work-tracker items you explicitly publish with `teamwork_publish_work`.
+
+Details on the local queue and publishing are in [`docs/WORK-QUEUE.md`](docs/WORK-QUEUE.md).
 
 Credential-shaped strings are redacted with patterns before they are stored or sent. Pattern redaction is **not** a guarantee that arbitrary secrets or sensitive prose will be detected. Do not opt in a session that contains secrets or content you do not intend to share.
+
+A session that declares itself `waiting` and then is killed (not ended cleanly) leaves that "waiting" badge showing on the shared project until this session's next turn clears it -- there is no timeout. This is a deliberate trade-off (see `docs/architecture/ARCHITECTURE.md`), not a bug.
 
 ## Install natively
 
