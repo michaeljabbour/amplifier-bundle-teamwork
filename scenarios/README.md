@@ -55,3 +55,6 @@ scenario is probably two scenarios.
 |---|---|
 | `01-ask-the-expert-not-the-owner` | drafted with Diego; open questions recorded |
 | `02-when-the-owner-is-the-expert` | drafted with Diego; 01's twin |
+| `03-say-what-changes-what-someone-else-would-do` | drafted; twin `03b` named, unwritten |
+| `04-ask-the-machine-that-knows` | drafted; twin `04b` named, unwritten; depends on `03` |
+| `05` -- handing work to another harness | named, unwritten |
