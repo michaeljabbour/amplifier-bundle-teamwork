@@ -471,6 +471,29 @@ class HookTests(unittest.IsolatedAsyncioTestCase):
                  for op in body["operations"] if op["op"] == "agent.upsert"]
         self.assertNotIn("queue", cards[-1]["data"])
 
+    async def test_a_credential_shaped_reason_code_is_redacted_before_it_leaves(self):
+        # reports.Queue.status() can put the local work-tracker CLI's raw
+        # stderr/stdout into reason_code (see reports.py). That text is not
+        # authored by this harness and must get the same credential-redaction
+        # pass as everything else this hook sends -- not just the outbound
+        # allow-list sanitizer, which only bounds length/type and does not
+        # redact content.
+        token = self.connection["token"]
+
+        class Filing:
+            def status(self):
+                return {"queue_status": "unavailable", "observed_at": "2026-09-11T10:00:00Z",
+                        "reason_code": "fake-work-tracker exited 1: Authorization: Bearer " + token}
+
+        hook = TeamworkHook(Coordinator(self.context), self.connection, self.journal, self.client,
+                            filing=Filing())
+        await hook.on_start("session:start", {})
+        cards = [op for endpoint, body, _ in self.client.requests if endpoint == "publish"
+                 for op in body["operations"] if op["op"] == "agent.upsert"]
+        reason = cards[-1]["data"]["queue"]["reason_code"]
+        self.assertNotIn(token, reason)
+        self.assertIn("[REDACTED CREDENTIAL]", reason)
+
     async def test_a_probe_that_raises_never_reaches_the_turn(self):
         class Exploding:
             def status(self):
@@ -1506,6 +1529,42 @@ class PublishWorkTests(unittest.IsolatedAsyncioTestCase):
         result = await PublishWorkTool(self.hook).execute({"item_ids": ["tw-1", "nope-9"]})
         self.assertEqual(result.output["not_found"], ["nope-9"])
         self.assertEqual([op["id"] for op in self.published()], ["worktracker-tw-1"])
+
+    async def test_a_failed_READ_does_not_report_itself_as_a_refused_PUBLISH(self):
+        """The message that cost hours.
+
+        Publishing reads the shared project first, to learn which records already
+        exist. When that READ failed, the error was worded by the same helper that
+        explains a refused WRITE -- so a 404 meaning "this session is not on the
+        service yet" arrived as "the project service refused it (HTTP 404)".
+
+        On a work.upsert, a 404 genuinely does say something about permissions. So
+        the message did not merely fail to help, it pointed confidently at the wrong
+        half of the system, and nothing was published for it to be about.
+        """
+        def unreachable():
+            raise SyncError(404, {"error": {"code": "session_not_found"}})
+        self.hook.client.request = lambda *a, **k: unreachable()
+        result = await PublishWorkTool(self.hook).execute({"item_ids": ["tw-1"]})
+        self.assertFalse(result.success)
+        message = result.error["message"].lower()
+        self.assertNotIn("refused it", message)
+        self.assertNotIn("shared-write", message)
+        self.assertIn("read", message, "name the call that failed: " + message)
+
+    async def test_a_genuinely_refused_publish_still_says_so(self):
+        # The other half. Narrowing the read's message must not blunt the write's,
+        # which is correct and load-bearing: a 403 here really is about permission.
+        calls = []
+        def refuse(endpoint, body=None, *a, **k):
+            calls.append(endpoint)
+            if endpoint == "publish" and any(o.get("op") == "work.upsert"
+                                             for o in (body or {}).get("operations", [])):
+                raise SyncError(403, {})
+            return self.Client(self.hook.sid).request(endpoint, body, *a, **k)
+        self.hook.client.request = refuse
+        result = await PublishWorkTool(self.hook).execute({"item_ids": ["tw-1"]})
+        self.assertIn("shared-write", json.dumps(result.output or result.error))
 
     async def test_a_machine_with_no_queue_says_so_rather_than_publishing_nothing_quietly(self):
         self.hook.filing = None

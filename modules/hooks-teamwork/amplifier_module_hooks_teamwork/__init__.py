@@ -382,6 +382,13 @@ class TeamworkHook:
         `unavailable`, which is an answer rather than an error. Everything
         published here leaves through the single outbound sanitizer, so a queue
         name, a path or a command line cannot reach the service by accident.
+
+        `reason_code` in particular can carry the local work-tracker CLI's raw
+        stderr/stdout (see `reports.Queue.status`), which is free text this
+        harness did not author. It gets the same credential-redaction pass every
+        other outbound string gets -- `self.clean_json` -- before the allow-list
+        sanitizer, so a credential-shaped token surfaced by the CLI cannot leave
+        through this path unredacted.
         """
         if self.filing is None:
             return {}
@@ -391,7 +398,7 @@ class TeamworkHook:
             logger.warning("Teamwork could not observe the local work queue; sharing is unaffected",
                            exc_info=True)
             return {}
-        return reports.sanitize_outbound(observation)
+        return reports.sanitize_outbound(self.clean_json(observation))
 
     def register_agent(self):
         """Announce this session as an addressable agent. Best effort, never queued.
@@ -1180,7 +1187,20 @@ class PublishWorkTool(WorkTools):
                 "required": ["item_ids"]}
 
     def publish_selected(self, item_ids):
-        work, mine = self.project()
+        # Publishing READS the shared project first, to learn which records already
+        # exist. That read and the writes below fail through the same exception, and
+        # wording both with `refusal` -- whose whole vocabulary is about a refused
+        # WRITE -- reported a read failure as a verdict on this credential's
+        # permissions. On a work.upsert a 404 genuinely does mean something about
+        # permission, so the message did not merely fail to help: it pointed
+        # confidently at the wrong half of the system, about a publish that had not
+        # happened yet. Name the call that actually failed.
+        try:
+            work, mine = self.project()
+        except SyncError as error:
+            return None, ("could not read the shared project first (HTTP %s); nothing was published"
+                          % error.status if error.status else
+                          "could not reach the shared project to read it first; nothing was published")
         if not mine:
             return None, "this session is not registered as an agent yet, so nothing could be attributed to a person"
         found, missing = self.hook.filing.items(item_ids)
