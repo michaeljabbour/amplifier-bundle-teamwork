@@ -11,8 +11,65 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "modules/hooks-teamwork"))
-from setup_teamwork import build_overlay, bundle_reference, NoRedirect, project_paths
+from setup_teamwork import build_overlay, bundle_reference, NoRedirect, project_paths, send
 from amplifier_module_hooks_teamwork.service_url import service_origin, validate_service_url
+
+
+class ColdServiceTests(unittest.TestCase):
+    """The service sleeps when idle. Waking it must not look like a broken account.
+
+    Measured: a cold start answers in about 25 seconds while a warm one answers in
+    half a second. Enrollment allowed 30, so a cold service was close to a coin
+    flip -- and losing it printed eleven frames of SSL internals.
+
+    The person who hits that is, by definition, enrolling for the FIRST time. So
+    they are both the most likely to find the service cold and the least equipped
+    to read a stack trace and conclude "wait and run it again". Every wrong
+    conclusion is available to them instead: my code is wrong, I am not a member,
+    the address is wrong, the service is down. None of them are true.
+    """
+
+    def waking(self, failures, error=None):
+        """A service that refuses `failures` times and then answers."""
+        error = error or TimeoutError("The read operation timed out")
+        calls = []
+        class Response:
+            headers = {}
+            def read(self): return b'{"ok": true}'
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        def opener(request, timeout=None):
+            calls.append(timeout)
+            if len(calls) <= failures: raise error
+            return Response()
+        return opener, calls
+
+    def test_a_service_that_was_merely_asleep_is_waited_for_not_reported_as_broken(self):
+        opener, calls = self.waking(failures=1)
+        send(object(), opener=opener)
+        self.assertEqual(len(calls), 2, "a known-transient cold start deserves one retry")
+
+    def test_the_timeout_allows_for_the_cold_start_we_measured(self):
+        opener, calls = self.waking(failures=0)
+        send(object(), opener=opener)
+        self.assertGreater(calls[0], 25, "30s against a 25s cold start is a coin flip")
+
+    def test_a_service_that_never_answers_says_so_in_a_sentence(self):
+        opener, _ = self.waking(failures=99)
+        with self.assertRaises(SystemExit) as raised:
+            send(object(), opener=opener)
+        message = str(raised.exception).lower()
+        self.assertNotIn("traceback", message)
+        for word in ("start", "again"):
+            self.assertIn(word, message, "must tell them it is waking and to retry: " + message)
+
+    def test_an_unreachable_address_is_not_dressed_up_as_a_sleeping_service(self):
+        # A wrong URL and a sleeping service both fail to connect. Telling someone
+        # to "try again" when the address is wrong sends them round a loop forever.
+        opener, _ = self.waking(failures=99, error=urllib.error.URLError("Name or service not known"))
+        with self.assertRaises(SystemExit) as raised:
+            send(object(), opener=opener)
+        self.assertIn("name or service not known", str(raised.exception).lower())
 
 
 class SetupTests(unittest.TestCase):

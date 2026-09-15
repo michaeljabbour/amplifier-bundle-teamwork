@@ -38,6 +38,52 @@ def project_paths(project):
     return directory / "connection.json", directory / "teamwork-overlay.yaml"
 
 
+# A cold start on the hosted service answers in about 25 seconds; a warm one in
+# half a second. The old 30-second bound was therefore close to a coin flip, and
+# losing it produced a stack trace rather than a sentence.
+COLD_START_SECONDS = 60
+
+
+def send(request, opener=None):
+    """One enrollment request, forgiving of a service that was merely asleep.
+
+    The service sleeps when idle. The person who meets it cold is, by definition,
+    enrolling for the FIRST time -- so they are both the likeliest to find it
+    asleep and the least equipped to read eleven frames of SSL internals and
+    conclude "wait and run it again". Every wrong conclusion is available to them
+    instead: my login code is wrong, I am not a member of this project, the
+    address is wrong, the service is down. None of those are true.
+
+    So a timeout is retried ONCE, because a cold start is a known and transient
+    state of this deployment rather than a fault. If it still does not answer, the
+    message says what is happening and what to do.
+
+    A connection that cannot be made at all is NOT treated as sleep. A wrong
+    address and a sleeping service both fail to connect, and telling somebody to
+    "try again" when the address is wrong sends them round a loop forever -- so
+    that one reports what the system actually said.
+
+    HTTPError passes through untouched: an answering service that refuses is a
+    different conversation, and the caller already says something useful about it.
+    """
+    opener = opener or urllib.request.build_opener(NoRedirect()).open
+    for attempt in (1, 2):
+        try:
+            with opener(request, timeout=COLD_START_SECONDS) as response:
+                return json.load(response), response.headers
+        except urllib.error.HTTPError:
+            raise
+        except urllib.error.URLError as error:
+            raise SystemExit("Could not reach the service: %s. Check the address and your network."
+                             % (getattr(error, "reason", None) or error)) from None
+        except TimeoutError:
+            if attempt == 2:
+                raise SystemExit(
+                    "The service did not answer in %d seconds. It sleeps when nobody is using it and "
+                    "takes a few seconds to start, so this is usually not a problem with your login "
+                    "code or your membership -- run this again." % COLD_START_SECONDS) from None
+
+
 def enroll_and_save(post, base, project, base_bundle, label, name, code, path, output):
     """Reserve both private outputs before issuing a remote harness credential."""
     path, output = path.expanduser().resolve(), output.expanduser().resolve()
@@ -111,7 +157,7 @@ def main():
         if cookie: headers["Cookie"] = cookie
         request = urllib.request.Request(base + endpoint, data=json.dumps(body).encode(), headers=headers)
         try:
-            with urllib.request.build_opener(NoRedirect()).open(request, timeout=30) as response: return json.load(response), response.headers
+            return send(request)
         except urllib.error.HTTPError as error:
             status = error.code; error.close(); raise SystemExit(f"Enrollment HTTP {status}; check login and project membership") from None
     path, output = enroll_and_save(post, base, args.project, args.bundle, args.label, name, token, path, output)
