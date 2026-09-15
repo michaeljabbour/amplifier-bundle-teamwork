@@ -53,4 +53,5 @@ scenario is probably two scenarios.
 
 | scenario | state |
 |---|---|
-| _(none yet)_ | |
+| `01-ask-the-expert-not-the-owner` | drafted with Diego; open questions recorded |
+| `02` -- when the owner IS the expert | named as 01's twin, not yet written |
