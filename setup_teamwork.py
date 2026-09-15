@@ -19,6 +19,29 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise urllib.error.HTTPError(req.full_url, code, "Redirect refused", headers, fp)
 
 
+# Same pattern class the hooks-teamwork redaction pass uses for anything
+# credential-shaped that is not a specific known secret (see TeamworkHook.clean).
+# Reused here, not imported, because this script has no connection/token
+# object yet at the point a malformed body can appear -- there is nothing more
+# specific to redact against.
+_CREDENTIAL_PATTERN = re.compile(r"(?i)(?:sk-[a-z0-9_-]{16,}|bearer\s+[a-z0-9._~-]{16,})")
+
+
+def _preview(raw, limit=80):
+    """First `limit` characters of a response body, redacted and collapsed.
+
+    Best-effort only: this exists to help a person see what went wrong, not to
+    reproduce the body. A body that cannot be decoded as text becomes no body,
+    same as the JSON parse failure it is standing in for.
+    """
+    try:
+        text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
+    except Exception:
+        return ""
+    text = _CREDENTIAL_PATTERN.sub("[REDACTED CREDENTIAL]", text)
+    return " ".join(text.split())[:limit]
+
+
 def bundle_reference(value):
     path = Path(value).expanduser()
     return path.resolve().as_uri() if path.exists() else value
@@ -65,12 +88,25 @@ def send(request, opener=None):
 
     HTTPError passes through untouched: an answering service that refuses is a
     different conversation, and the caller already says something useful about it.
+
+    A 200 with a body this cannot parse as JSON is a THIRD kind of failure, distinct
+    from both of the above -- the service answered and did not refuse, it just did
+    not send back what this expects. Reported as its own SystemExit (same class the
+    other failures use, so the caller does not need a fourth branch) rather than
+    left to surface as a raw json.JSONDecodeError traceback.
     """
     opener = opener or urllib.request.build_opener(NoRedirect()).open
     for attempt in (1, 2):
         try:
             with opener(request, timeout=COLD_START_SECONDS) as response:
-                return json.load(response), response.headers
+                raw = response.read()
+                try:
+                    return json.loads(raw), response.headers
+                except ValueError:
+                    status = getattr(response, "status", None) or getattr(response, "code", None) or "unknown"
+                    raise SystemExit(
+                        "The service answered (HTTP %s) but its response could not be read as JSON: %s"
+                        % (status, _preview(raw) or "(no readable body)")) from None
         except urllib.error.HTTPError:
             raise
         except urllib.error.URLError as error:

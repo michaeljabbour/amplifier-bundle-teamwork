@@ -71,6 +71,40 @@ class ColdServiceTests(unittest.TestCase):
             send(object(), opener=opener)
         self.assertIn("name or service not known", str(raised.exception).lower())
 
+    def test_a_malformed_200_body_is_a_readable_error_not_a_traceback(self):
+        # A 200 that answers with something that is not JSON at all is a third
+        # failure mode, distinct from a refusal (HTTPError) and a cold/unreachable
+        # service. It must surface as the same SystemExit class the others use,
+        # not as a raw json.JSONDecodeError -- exactly the failure class the
+        # cold-start fix removed for the other two cases.
+        class Response:
+            status = 200
+            headers = {}
+            def read(self): return b"<html>not json, an upstream proxy error page</html>"
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        def opener(request, timeout=None): return Response()
+        with self.assertRaises(SystemExit) as raised:
+            send(object(), opener=opener)
+        message = str(raised.exception)
+        self.assertNotIn("Traceback", message)
+        self.assertIn("200", message)
+        self.assertIn("not json", message.lower())
+
+    def test_a_credential_shaped_string_in_a_malformed_body_is_redacted(self):
+        class Response:
+            status = 200
+            headers = {}
+            def read(self): return b"Bearer abcdefghij1234567890 could not be parsed as json"
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        def opener(request, timeout=None): return Response()
+        with self.assertRaises(SystemExit) as raised:
+            send(object(), opener=opener)
+        message = str(raised.exception)
+        self.assertNotIn("abcdefghij1234567890", message)
+        self.assertIn("[REDACTED CREDENTIAL]", message)
+
 
 class SetupTests(unittest.TestCase):
     def test_existing_bundle_is_file_uri_and_overlay_keeps_secret_out(self):
