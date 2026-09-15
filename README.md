@@ -28,8 +28,15 @@ points the opposite way, and guidance is only believed when it passes both.
 After native connection consent, or when you run an enabled Teamwork overlay, the selected project can receive:
 
 - visible prompts and final responses;
-- session metadata and stable correlation IDs; and
-- receipts for bounded, derived project-context excerpts that Amplifier's context manager accepted before a turn.
+- session metadata and stable correlation IDs;
+- receipts for bounded, derived project-context excerpts that Amplifier's context manager accepted before a turn;
+- **a local work-queue snapshot**, when this machine runs one, published each time the session registers as an agent. Every field it can carry, because a list shorter than the payload is not consent:
+  - `queue_status` -- `ready`, `stale`, or `unavailable`;
+  - `observed_at` -- when the queue was last looked at;
+  - `ready_count` -- how many items are waiting, when it could be read;
+  - `integration` -- the name of the work-tracker command on this machine; and
+  - `reason_code` -- when the queue could **not** be read, the tracker's own explanation. This is free text composed by that program, not by Amplifier, so it is the one field here whose contents this project does not author; and
+- **title, status and a locator** for any local work item you publish deliberately with `teamwork_publish_work`. The locator identifies the item; it is not a link and nothing at the other end is reachable. Your local descriptions and acceptance criteria do not cross.
 
 Credential-shaped strings are redacted with patterns before they are stored or sent. Pattern redaction is **not** a guarantee that arbitrary secrets or sensitive prose will be detected. Do not opt in a session that contains secrets or content you do not intend to share.
 
