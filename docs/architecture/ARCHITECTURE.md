@@ -182,10 +182,11 @@ mid-session starts working.
 The bundle never creates the tracker project. Provisioning a queue nobody asked
 for is acting on someone's behalf.
 
-> **Caveat that belongs on the picture, not in a footnote.** The notice is carried
-> on `HookResult.user_message`. In the stack verified for `teamwork-4q7`, nothing
-> renders that field under `amplifier run`. The absence is reported *in-process*
-> and is not yet demonstrated as user-visible.
+The composed hook uses the host display that Foundation supplies to the session:
+`coordinator.display_system.show_message(...)`. Successful display returns a continue
+result without a second copy of the notice. Hosts without a usable display retain the
+legacy `HookResult.user_message` fallback; that result alone does not prove visibility.
+Released Core 1.6.1 already exposes this interface, so no Core fork is required.
 
 ## Asking a question you cannot proceed without
 
