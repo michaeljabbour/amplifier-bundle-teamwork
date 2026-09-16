@@ -14,7 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "modules/hooks-team
 from amplifier_module_hooks_teamwork import (HTTPClient, Journal, TeamworkHook, SyncError, sha, NoRedirect,
                                              mount, resolve_connection, describe, PERSON_FIELDS, verbosity,
                                              PRESENCE_SUMMARY, TasksTool, ClaimTool, ProgressTool,
-                                             RETIRED_MESSAGE, SendTool, WaitTool, PublishWorkTool)
+                                             RETIRED_MESSAGE, SendTool, WaitTool, PublishWorkTool,
+                                             RecordInsightTool)
 
 
 class Context:
@@ -1783,6 +1784,157 @@ class PublishWorkTests(unittest.IsolatedAsyncioTestCase):
         self.hook.client = Both(self.hook.sid)
         await PublishWorkTool(self.hook).execute({"item_ids": ["tw-1"]})
         self.assertEqual(self.published()[0]["expected_version"], 3)
+
+
+class RecordInsight(unittest.IsolatedAsyncioTestCase):
+    """teamwork_record_insight -- a claim without evidence is refused before anything is sent."""
+
+    def build(self, fail_status=None, fail_body=None):
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        # A short token like "t" is a substring of ordinary prose and would be
+        # redacted out of the claim text by hook.clean -- use a realistic one.
+        connection = {"base_url": "https://team.example.invalid", "project_id": "teamwork",
+                      "token": "test-credential-no-real-secret"}
+        client = SendClient(fail_status, fail_body=fail_body)
+        hook = TeamworkHook(Coordinator(Context([])), connection, Journal(Path(tmp.name) / "q.db"), client)
+        hook.entered = True  # Normal tool calls follow the hook's first prompt.
+        return hook, client
+
+    def valid_input(self, **extra):
+        base = {"claim": "Retries above 3 do not improve delivery odds for this transport.",
+                "basis": "observation", "confidence": "high",
+                "limitations": "Only observed against the staging relay, not production.",
+                "evidence": [{"kind": "artifact", "uri": "https://example.invalid/logs/1", "label": "run log"}]}
+        base.update(extra)
+        return base
+
+    async def test_a_well_formed_call_sends_one_insight_upsert_at_version_zero(self):
+        hook, client = self.build()
+        result = await RecordInsightTool(hook).execute(self.valid_input())
+        self.assertTrue(result.success, result.error)
+        ops = [op for endpoint, body, _ in client.requests if endpoint == "publish"
+               for op in body["operations"]]
+        self.assertEqual(len(ops), 1)
+        op = ops[0]
+        self.assertEqual(op["op"], "insight.upsert")
+        self.assertEqual(op["expected_version"], 0)
+        data = op["data"]
+        self.assertEqual(data["claim"], self.valid_input()["claim"])
+        self.assertEqual(data["basis"], "observation")
+        self.assertEqual(data["confidence"], "high")
+        self.assertIn("limitations", data)
+        self.assertEqual(data["evidence_refs"], [{"kind": "artifact", "uri": "https://example.invalid/logs/1", "label": "run log"}])
+        self.assertNotIn("evidence", data)
+
+    async def test_missing_evidence_is_refused_locally_without_a_request(self):
+        hook, client = self.build()
+        result = await RecordInsightTool(hook).execute(self.valid_input(evidence=[]))
+        self.assertFalse(result.success)
+        self.assertIn("opinion", result.error["message"])
+        self.assertEqual(client.requests, [])
+
+    async def test_absent_evidence_key_is_refused_locally_without_a_request(self):
+        hook, client = self.build()
+        payload = self.valid_input()
+        del payload["evidence"]
+        result = await RecordInsightTool(hook).execute(payload)
+        self.assertFalse(result.success)
+        self.assertEqual(client.requests, [])
+
+    async def test_a_bad_basis_is_refused_locally_without_a_request(self):
+        hook, client = self.build()
+        result = await RecordInsightTool(hook).execute(self.valid_input(basis="i_think_so"))
+        self.assertFalse(result.success)
+        self.assertEqual(client.requests, [])
+
+    async def test_a_bad_confidence_is_refused_locally_without_a_request(self):
+        hook, client = self.build()
+        result = await RecordInsightTool(hook).execute(self.valid_input(confidence="very sure"))
+        self.assertFalse(result.success)
+        self.assertEqual(client.requests, [])
+
+    async def test_a_403_does_not_request_broader_shared_write_permission(self):
+        hook, client = self.build(fail_status=403)
+        result = await RecordInsightTool(hook).execute(self.valid_input())
+        self.assertFalse(result.success)
+        self.assertIn("session-write permission", result.error["message"])
+        self.assertNotIn("shared-write", result.error["message"])
+
+    async def test_non_string_claim_is_refused_before_any_request(self):
+        hook, client = self.build()
+        result = await RecordInsightTool(hook).execute(self.valid_input(claim={"text": "not a string"}))
+        self.assertFalse(result.success)
+        self.assertEqual(client.requests, [])
+
+    async def test_mid_session_binding_registers_and_flushes_source_before_insight(self):
+        hook, client = self.build()
+        hook.entered = False
+        result = await RecordInsightTool(hook).execute(self.valid_input())
+        self.assertTrue(result.success)
+        ops = [op for endpoint, body, _ in client.requests if endpoint == "publish"
+               for op in body["operations"]]
+        self.assertEqual([op["op"] for op in ops], ["session.upsert", "insight.upsert"])
+        self.assertEqual(ops[0]["id"], ops[1]["data"]["source_session_id"])
+
+    async def test_unknown_write_outcome_retains_attempted_id_and_warns_about_duplicates(self):
+        for status in (0, 500, 503):
+            with self.subTest(status=status):
+                hook, client = self.build()
+                def fail(endpoint, body, key=None):
+                    client.requests.append((endpoint, body, key))
+                    raise SyncError(status)
+                client.request = fail
+                result = await RecordInsightTool(hook).execute(self.valid_input())
+                self.assertFalse(result.success)
+                self.assertEqual(result.error["outcome"], "unknown")
+                self.assertEqual(result.error["attempted_record_id"], client.requests[0][1]["operations"][0]["id"])
+                self.assertIn("before retrying", result.error["message"])
+                self.assertNotIn("Not recorded", result.error["message"])
+
+    async def test_malformed_success_response_cannot_claim_a_record_was_stored(self):
+        for response in ({}, {"results": []}, {"results": [{"id": "wrong", "version": 1}]}):
+            with self.subTest(response=response):
+                hook, client = self.build()
+                client.request = lambda *args: response
+                result = await RecordInsightTool(hook).execute(self.valid_input())
+                self.assertFalse(result.success)
+                self.assertEqual(result.error["outcome"], "unknown")
+
+    async def test_malformed_422_body_uses_a_safe_generic_refusal(self):
+        for body in ({"error": "invalid"}, {"error": {"message": {"private": "details"}}}):
+            with self.subTest(body=body):
+                hook, _ = self.build(fail_status=422, fail_body=body)
+                result = await RecordInsightTool(hook).execute(self.valid_input())
+                self.assertFalse(result.success)
+                self.assertEqual(result.error["message"], "Not recorded: the project service rejected the record")
+
+    async def test_service_validation_error_cannot_echo_the_connection_credential(self):
+        hook, _ = self.build(fail_status=422, fail_body={"error": {
+            "message": "invalid value test-credential-no-real-secret",
+        }})
+        result = await RecordInsightTool(hook).execute(self.valid_input())
+        self.assertFalse(result.success)
+        self.assertNotIn(hook.connection["token"], result.error["message"])
+        self.assertIn("[REDACTED CREDENTIAL]", result.error["message"])
+
+    async def test_all_outbound_text_fields_redact_the_connection_credential(self):
+        hook, client = self.build()
+        secret = hook.connection["token"]
+        result = await RecordInsightTool(hook).execute(self.valid_input(
+            claim="claim " + secret, title="title " + secret, limitations="limit " + secret,
+            evidence=[{"kind": "external", "uri": "fixture://" + secret, "label": "label " + secret}],
+        ))
+        self.assertTrue(result.success)
+        self.assertNotIn(secret, json.dumps(client.requests))
+
+    async def test_source_session_id_is_the_hooks_own_and_cannot_be_overridden(self):
+        hook, client = self.build()
+        result = await RecordInsightTool(hook).execute(self.valid_input(source_session_id="somebody-elses-session"))
+        self.assertTrue(result.success, result.error)
+        op = [op for endpoint, body, _ in client.requests if endpoint == "publish"
+              for op in body["operations"]][0]
+        self.assertEqual(op["data"]["source_session_id"], hook.sid)
+        self.assertNotEqual(op["data"]["source_session_id"], "somebody-elses-session")
 
 
 if __name__ == '__main__':

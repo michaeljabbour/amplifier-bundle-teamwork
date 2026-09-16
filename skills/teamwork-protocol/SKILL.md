@@ -130,24 +130,53 @@ accepted. Do not record, report, or reason as though it has.
 
 ---
 
-## What this skill does not cover yet
+## Contributing knowledge
 
-**Contributing knowledge — recording a decision or an insight so a participant who was
-not present can use it.**
+Everything above moves work and questions between people who are both present. This part
+is different: it leaves something behind for a participant who was **never here**.
 
-This is deliberately empty rather than absent, because the gap is in the bundle and not
-in your judgment: the service carries `idea` and `insight` as first-class records and the
-hook already delivers them into your context, but **no tool here writes one**. You can
-read the team's accumulated knowledge and cannot add to it.
+**Record what will still be true when the task is forgotten.**
 
-The judgment this section will eventually carry is already written down — scenarios `06`
-(record the lesson, not the incident) and `07` (replace by addition, never by erasure).
-Until a write path exists, the honest move when you learn something that generalises is to
-put it where the work is visible — a progress note on the item, or an answer to the person
-who asked — and to know that it will not be found later by somebody who was not there.
+The test is not "is this true" or "did I just learn it" — both are true of a
+version-specific fact and of the whole investigation you did to find it. It is *would
+this change what somebody does on a **different** task?* A rule about how to search
+passes. A fact about one field on one version fails, and belongs in the task's own
+progress note.
 
-Tracked as `teamwork-cpq` (no write path) and `teamwork-s7d` (a superseded record cannot
-say what replaced it, and a reviewer who is asked cannot answer).
+The incident is the evidence, not the lesson. A lesson with no incident is an opinion; a
+lesson that is *only* its incident has not been generalised and will not be found by
+anybody who did not live it. Both halves, and the lesson stated first.
+
+`teamwork_record_insight` takes five things, and each one is doing a job:
+
+| field | what it is for |
+|---|---|
+| `claim` | the transferable statement — the part that outlives the task |
+| `basis` | `observation` if you saw it happen, `inference` if you concluded it. Do not blur these |
+| `confidence` | `low` / `medium` / `high`, self-reported and read as such |
+| `limitations` | what this does **not** establish. The field most often skipped and the one that makes the record honest |
+| `evidence` | **required.** An insight without it is refused, locally, before anything is sent |
+
+The refusal is deliberate and is not a validation quirk: a claim nobody can check is an
+opinion, and a project filling with unfalsifiable opinions is worse than one with none.
+If you have nothing to cite, you have a hunch — keep working until you have a reason.
+
+**It is deliberate.** Nothing records on your behalf, and being able to record is not a
+reason to. Most turns produce nothing worth keeping; a session that records something
+every time has stopped discriminating, and the cost lands on every future reader.
+
+**Correcting one.** This tool creates a new insight; it does not expose record editing.
+When a later finding changes an earlier claim, create a correction with a record evidence
+reference to the original, and state what changed. The service also supports versioned
+revisions by an authorized author, but that operation is not exposed by this tool.
+
+Two limits, named because you will meet them: a superseded record has no way to point
+forward at what replaced it, and a reviewer who is asked for a verdict cannot record one
+(`teamwork-s7d`). So if a record you are correcting has been cited elsewhere, say what it
+replaces **inside the new one** — the link will not be visible from the old.
+
+Derived from scenarios `06` (record the lesson, not the incident) and `07` (replace by
+addition, never by erasure).
 
 ---
 
@@ -158,7 +187,8 @@ say what replaced it, and a reviewer who is asked cannot answer).
 | route on the subject, not the relationship | `docs/scenarios/01`, `02` |
 | publish what changes someone else's next move | `docs/scenarios/03` |
 | facts to machines, decisions to people | `docs/scenarios/04` |
-| contributing knowledge | `docs/scenarios/06`, `07` — not yet buildable |
+| record what will still be true when the task is forgotten | `docs/scenarios/06` |
+| replace by addition, never by erasure | `docs/scenarios/07` |
 
 Enum values and status transitions are enforced by the service; where this file and the
 service disagree, the service is right and this file is a bug.
