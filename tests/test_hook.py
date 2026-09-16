@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 import urllib.request
 import urllib.error
 import subprocess
@@ -637,6 +638,66 @@ class InfluenceTests(unittest.IsolatedAsyncioTestCase):
 
     def cache(self, sources):
         self.hook.state["cache"] = {s["record"]["record_type"] + ":" + s["record"]["id"]: s for s in sources}
+
+    async def assert_person_record_delivery(self, kind, content):
+        sources = [
+            self.source("person", "person-dana", {"id": "person-dana", "name": "Dana Cole"}),
+            self.source(kind, "arrival-fixture", content),
+        ]
+        request = self.client.request
+        def with_people(endpoint, body, key=None):
+            response = request(endpoint, body, key)
+            if endpoint == "context":
+                response["items"] = [dict(source["record"], change="upsert") for source in sources]
+            return response
+        self.client.request = with_people
+        result = await self.hook.on_submit("prompt:submit", {"prompt": "Check synthetic arrival"})
+        self.assertIsInstance(self.hook.people()["person-dana"], dict)
+        self.assertIn("Dana Cole", result.user_message or "")
+        self.assertNotIn("person-dana", result.user_message)
+        self.assertEqual(result.user_message_source, "teamwork")
+        receipts = [body for endpoint, body, _ in self.client.requests if endpoint == "acknowledgements"]
+        self.assertTrue(any(kind + ":arrival-fixture:1" in [item["key"] for item in receipt["items"]]
+                            for receipt in receipts))
+        events = [event for event, _ in self.events]
+        self.assertLess(events.index("input_accepted"), events.index("acknowledgements"))
+        again = await self.hook.on_submit("prompt:submit", {"prompt": "Check unchanged arrival"})
+        self.assertIsNone(again.user_message)
+        return result
+
+    async def test_message_with_cached_person_record_is_announced_and_acknowledged(self):
+        result = await self.assert_person_record_delivery("message", {
+            "body": "Synthetic arrival marker", "created_by": "person-dana"})
+        self.assertIn("Synthetic arrival marker", result.user_message)
+
+    async def test_answer_with_cached_person_record_is_announced_and_acknowledged(self):
+        result = await self.assert_person_record_delivery("request", {
+            "title": "Synthetic request", "response": "context", "responded_by": "person-dana",
+            "progress_note": "Synthetic answer marker"})
+        self.assertIn("Answered", result.user_message)
+        self.assertIn("Synthetic answer marker", result.user_message)
+
+    async def test_truncated_message_resolves_cached_person_without_losing_delivery(self):
+        await self.assert_person_record_delivery("message", {
+            "body": "Synthetic long arrival " + "x" * 2000, "created_by": "person-dana"})
+        accepted = next(value for event, value in self.events if event == "input_accepted")
+        self.assertIn("[excerpt truncated;", accepted["content"])
+        self.assertIn("Dana Cole", accepted["content"])
+
+    def test_failed_notice_formatting_does_not_suppress_the_retry(self):
+        original = self.source("message", "m1", {"body": "Original arrival"}, "hash-1")
+        self.cache([original])
+        self.assertIn("Original arrival", self.hook.influence([original]))
+        changed = self.source("message", "m1", {"body": "Changed arrival"}, "hash-2")
+        self.cache([changed])
+        self.hook.complaint = "Invalid verbosity fixture"
+        with patch("amplifier_module_hooks_teamwork.describe", side_effect=RuntimeError("Formatting failed")):
+            with self.assertRaises(RuntimeError):
+                self.hook.influence([changed])
+        retried = self.hook.influence([changed]) or ""
+        self.assertIn("Changed arrival", retried)
+        self.assertIn("Invalid verbosity fixture", retried)
+        self.assertIsNone(self.hook.influence([changed]))
 
     def test_a_numerous_kind_no_longer_starves_the_others(self):
         # One person record is worth more to a reader than a twentieth task.
