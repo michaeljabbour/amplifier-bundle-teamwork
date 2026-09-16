@@ -12,3 +12,4 @@ dist/
 *connection*.json
 teamwork-overlay*
 .DS_Store
+evals/*/results/
