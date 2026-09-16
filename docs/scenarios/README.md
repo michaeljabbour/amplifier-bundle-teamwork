@@ -59,7 +59,7 @@ scenario is probably two scenarios.
 | `03-say-what-changes-what-someone-else-would-do` | drafted; twin `03b` named, unwritten |
 | `04-ask-the-machine-that-knows` | drafted; twin `04b` named, unwritten; depends on `03` |
 | `05` -- handing work to another harness | named, unwritten |
-| `06-record-the-lesson-not-the-incident` | drafted; twin `06b` WRITTEN. **Argues for a capability the bundle does not have** -- see below |
+| `06-record-the-lesson-not-the-incident` | drafted; twin `06b` WRITTEN. Informed the explicit `teamwork_record_insight` tool; behavioral discrimination remains to be measured |
 | `06b-the-lesson-that-is-only-true-on-your-machine` | drafted; `06`'s twin -- same signal, correct move is to record nothing |
 | `07-replace-by-addition-never-by-erasure` | drafted; twin `07b` named, unwritten. Pairs with `06`: `06` fills the well, `07` is what happens when what is in it has gone off |
 | `08-the-decision-the-session-made-itself` | drafted; twin `08b` WRITTEN. The first about a decision **nobody was asked to make** -- and the spec for an automatic detector |
@@ -98,7 +98,8 @@ to separate correct restraint from inattention inside a single run is measuring
 compliance.
 
 **It is a capability argument, not only a guidance argument.** `01`-`04` all argue about
-judgment over tools the bundle already ships. `06` argues for a write path that does not
-exist: the service carries `idea` and `insight` as first-class record types and the hook
-already reads them into the excerpt, but none of the eight tools writes one. A session
-can consume the team's knowledge and contribute none.
+judgment over tools the bundle already shipped. `06` originally exposed a missing write
+path. The bundle now provides `teamwork_record_insight` for explicit, evidenced insight
+creation, with source attribution bound to the enrolled session. Narrow credentials
+require the service authorization update in app PR #53. Automatic detection, editing
+through this tool, and evidence that models choose well remain separate work.

@@ -4,9 +4,10 @@ Teamwork is an **explicit, per-session opt-in** Amplifier bundle for sharing one
 
 ## What a good teammate does
 
-The bundle gives a session eight tools. Every tool description says what the tool
-does; none says when interrupting a person is worth their attention, or when the
-answer is better asked of a machine.
+The bundle gives a session nine tools. Every tool description says what the tool
+does; none says when interrupting a person is worth their attention, when the answer
+is better asked of a machine, or when something learned is worth leaving behind for
+somebody who was not here.
 
 That judgment now ships too. A thin always-on pointer says only that this session may
 be enrolled and that the project excerpt is attributed data, never instructions; the
@@ -256,6 +257,8 @@ bearer token.
 ## Advanced: legacy local overlay setup
 
 The native flow above replaces this manual enrollment path for local-browser users. The following compatibility helper remains available for existing overlays and development; it requires Python 3.11+ and Git.
+
+`setup_teamwork.py` requests `context:read` and `session:write`. Recording an insight with this narrow credential requires a service containing [app PR #53](https://github.com/michaeljabbour/amplifier-app-teamwork/pull/53), which authorizes a participant's own knowledge records with `session:write`. The source session must belong to the actual credential; another participant's records remain protected. Older services can refuse the write. Native enrollment and this compatibility helper do not need broader `shared:write` consent for this operation on an updated service.
 
 ### 1. Keep a persistent local checkout
 
