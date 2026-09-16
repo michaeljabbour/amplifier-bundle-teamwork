@@ -661,6 +661,38 @@ class BrowserTests(unittest.TestCase):
             self.assertIn(seen['url'], printed.getvalue())
             self.assertFalse(pointer.exists(), 'the one-time address must not outlive the window')
 
+    def test_printed_form_can_complete_when_browser_cannot_open(self):
+        errors, workers = [], []
+        def notify(url, pointer, opened, minutes):
+            self.assertFalse(opened)
+            def submit():
+                try:
+                    with urllib.request.urlopen(url) as response:
+                        csrf = self.token(response.read().decode())
+                    origin = 'http://' + urllib.parse.urlsplit(url).netloc
+                    status, body = self.post(url, dict(FORM, csrf=csrf), {'Origin': origin})
+                    self.assertEqual(status, 200)
+                    self.assertNotIn(FORM['code'], body)
+                except BaseException as error:
+                    errors.append(error)
+            worker = threading.Thread(target=submit); workers.append(worker); worker.start()
+        with tempfile.TemporaryDirectory() as home, patch('webbrowser.open', return_value=False), patch(
+                'amplifier_module_tool_teamwork.connect', return_value=(Path('/private/fixture.json'), 'selected')) as enroll:
+            result = private_browser_connect(BASE, Path(home), threading.Event(), timeout=5, notify=notify)
+            for worker in workers: worker.join(10)
+            if errors: raise errors[0]
+            self.assertEqual(result[1], 'selected')
+            enroll.assert_called_once()
+            self.assertFalse((Path(home) / POINTER_NAME).exists())
+
+    def test_remote_host_notice_has_matching_loopback_forward(self):
+        printed = io.StringIO()
+        announce('http://127.0.0.1:43210/private-fixture', None, False, 15, stream=printed)
+        output = printed.getvalue()
+        self.assertIn('ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:43210:127.0.0.1:43210 USER@REMOTE_HOST', output)
+        self.assertIn('SAME address', output)
+        self.assertIn('Never expose this port publicly', output)
+
     def test_missing_browser_still_serves_the_printed_address(self):
         with patch('webbrowser.open', return_value=False), patch('amplifier_module_tool_teamwork.connect') as enroll:
             with self.assertRaises(ConsentAborted) as error:

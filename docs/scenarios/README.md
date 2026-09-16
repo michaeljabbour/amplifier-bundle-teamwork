@@ -58,3 +58,44 @@ scenario is probably two scenarios.
 | `03-say-what-changes-what-someone-else-would-do` | drafted; twin `03b` named, unwritten |
 | `04-ask-the-machine-that-knows` | drafted; twin `04b` named, unwritten; depends on `03` |
 | `05` -- handing work to another harness | named, unwritten |
+| `06-record-the-lesson-not-the-incident` | drafted; twin `06b` WRITTEN. **Argues for a capability the bundle does not have** -- see below |
+| `06b-the-lesson-that-is-only-true-on-your-machine` | drafted; `06`'s twin -- same signal, correct move is to record nothing |
+| `07-replace-by-addition-never-by-erasure` | drafted; twin `07b` named, unwritten. Pairs with `06`: `06` fills the well, `07` is what happens when what is in it has gone off |
+
+`06` and `07` are the two halves of contributing knowledge -- recording something, and
+replacing something somebody else recorded. Between them they cover the step the earlier
+scenarios do not: a question is asked (`01`, `02`, `04`), an answer comes back, something
+is settled, and then it has to survive being read and refined by people who were not
+there.
+
+### What `06` broke, recorded rather than smoothed over
+
+`06` is the first scenario here about **contributing** knowledge rather than routing a
+question or publishing status, and writing it strained this directory's own shape in two
+places worth knowing before the next one is written.
+
+**The outside tell is displaced in time.** The table above maps *how you'd tell them
+apart from outside* onto *the rubric that grades it*, and that mapping assumes the tell
+is visible in the run that produced the behaviour. For `01`-`04` it is: you look at who
+was asked, or what was published. `06`'s tell is a *different session, weeks later*,
+either benefiting from the record or repeating the mistake. So a rubric derived from it
+**cannot score a single run** -- it can only score a pair. An evaluation built the usual
+way against `06` will silently measure nothing.
+
+**The twin survived.** This was the part expected to break and did not: `06b` is a clean
+same-signal-opposite-move pair (a lesson that is only true on your own machine), so the
+pairing discipline in this README holds for knowledge scenarios unchanged.
+
+Writing `06b` then surfaced a second, sharper limit on grading, recorded in its own open
+questions: **a run that correctly records nothing is indistinguishable, in that run, from
+a run that noticed nothing.** The twin is what makes `06` gradeable at all -- without it a
+rubric can only reward recording, which is a bias rather than a skill -- but the pair
+still cannot be scored from one side alone. Any rubric built from `06`/`06b` that claims
+to separate correct restraint from inattention inside a single run is measuring
+compliance.
+
+**It is a capability argument, not only a guidance argument.** `01`-`04` all argue about
+judgment over tools the bundle already ships. `06` argues for a write path that does not
+exist: the service carries `idea` and `insight` as first-class record types and the hook
+already reads them into the excerpt, but none of the eight tools writes one. A session
+can consume the team's knowledge and contribute none.
