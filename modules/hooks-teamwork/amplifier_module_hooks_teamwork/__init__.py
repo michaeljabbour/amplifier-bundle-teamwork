@@ -77,6 +77,11 @@ SUMMARY_NAMED = 5
 # a longer field invites pasting the prompt, which is what the turn record is for.
 PRESENCE_SUMMARY = 200
 WAIT_REASON = 200
+# An insight is a durable claim, not a transcript -- bounded so it stays a
+# transferable statement rather than growing into a report.
+INSIGHT_CLAIM = 2000
+INSIGHT_LIMITATIONS = 1000
+INSIGHT_TITLE = 200
 # Filing is bounded per turn so a burst of inbound mail cannot stretch one prompt.
 # What is left over is filed on a later turn: a report delivered late is still true.
 REPORT_BATCH = 5
@@ -1363,6 +1368,157 @@ class WaitTool:
             "note": "Visible to teammates until this session's next prompt. Nobody was notified."})
 
 
+class RecordInsightTool:
+    """Record one durable insight for the shared project's knowledge plane.
+
+    The hook already reads insights and ideas into the excerpt; nothing wrote
+    one back until this. Not a narration of the current task -- a claim that
+    generalises past it, for teammates who were never in this session. An
+    insight with no evidence is an opinion, and this refuses to store one as a
+    fact before anything is sent, the same rule the service enforces on its
+    side (`core.py:619`). Recording is deliberate: nothing here fires itself.
+    """
+
+    def __init__(self, hook):
+        self.hook = hook
+
+    @property
+    def name(self):
+        return "teamwork_record_insight"
+
+    @property
+    def description(self):
+        return (
+            "Record a durable insight for the shared project -- a claim that will still be true "
+            "when this task is forgotten, for teammates who were never in this session. Write what "
+            "generalises, not what happened. Evidence is required -- a claim with no evidence "
+            "reference is refused before anything is sent, because an insight with no evidence is "
+            "an opinion. This is deliberate: nothing here records anything on your behalf."
+        )
+
+    @property
+    def input_schema(self):
+        return {
+            "type": "object",
+            "properties": {
+                "claim": {"type": "string",
+                          "description": "The transferable statement -- what stays true after this task is forgotten."},
+                "basis": {"type": "string", "enum": ["observation", "inference"],
+                          "description": "observation = you saw it happen; inference = you concluded it."},
+                "confidence": {"type": "string", "enum": ["low", "medium", "high"],
+                               "description": "Self-reported."},
+                "limitations": {"type": "string", "description": "What this does NOT establish."},
+                "evidence": {
+                    "type": "array", "minItems": 1, "items": {"type": "object"},
+                    "description": (
+                        "At least one of: {kind: artifact, uri: <http(s) URL>, label} "
+                        "| {kind: external, uri: <non-http locator, e.g. worktracker://queue/id>, label} "
+                        "| {kind: record, record_type: work|request|idea|insight, record_id, version}"),
+                },
+                "title": {"type": "string",
+                          "description": "Optional short label; defaults to the first 100 characters of claim."},
+            },
+            "required": ["claim", "basis", "confidence", "limitations", "evidence"],
+        }
+
+    def _evidence_refs(self, evidence):
+        """Validate and normalise evidence locally. Refuses before anything is sent."""
+        if not isinstance(evidence, list) or not evidence:
+            return None, ("an insight without evidence is an opinion and will not be recorded as one; "
+                          "supply at least one evidence reference")
+        refs = []
+        for item in evidence:
+            if not isinstance(item, dict):
+                return None, "each evidence entry must be an object"
+            kind = item.get("kind")
+            if kind == "artifact":
+                uri = item.get("uri")
+                if not isinstance(uri, str) or not uri.lower().startswith(("http://", "https://")):
+                    return None, "an artifact evidence entry needs an http(s) uri"
+                ref = {"kind": "artifact", "uri": uri}
+                if item.get("label"):
+                    ref["label"] = str(item["label"])
+            elif kind == "external":
+                uri = item.get("uri")
+                if not isinstance(uri, str) or not uri.strip():
+                    return None, "an external evidence entry needs a non-empty locator"
+                if uri.lower().startswith(("http://", "https://")):
+                    return None, "an external evidence entry must be a non-http locator; use kind: artifact for a link"
+                ref = {"kind": "external", "uri": uri}
+                if item.get("label"):
+                    ref["label"] = str(item["label"])
+            elif kind == "record":
+                record_type, record_id, version = item.get("record_type"), item.get("record_id"), item.get("version")
+                if record_type not in ("work", "request", "idea", "insight"):
+                    return None, "a record evidence entry needs record_type of work, request, idea, or insight"
+                if not isinstance(record_id, str) or not record_id.strip():
+                    return None, "a record evidence entry needs record_id"
+                if not isinstance(version, int) or isinstance(version, bool):
+                    return None, "a record evidence entry needs an integer version"
+                ref = {"kind": "record", "record_type": record_type, "record_id": record_id, "version": version}
+            else:
+                return None, "each evidence entry must be kind artifact, external, or record"
+            refs.append(ref)
+        return refs, None
+
+    async def execute(self, input):
+        from amplifier_core.models import ToolResult
+        claim = (input.get("claim") or "").strip()
+        basis = input.get("basis")
+        confidence = input.get("confidence")
+        limitations = input.get("limitations")
+        if not claim:
+            return ToolResult(success=False, error={"message": "claim is required"})
+        if basis not in ("observation", "inference"):
+            return ToolResult(success=False, error={"message": "basis must be observation or inference"})
+        if confidence not in ("low", "medium", "high"):
+            return ToolResult(success=False, error={"message": "confidence must be low, medium, or high"})
+        if not isinstance(limitations, str) or not limitations.strip():
+            return ToolResult(success=False, error={"message":
+                "limitations is required: say what this does not establish"})
+        evidence_refs, refusal = self._evidence_refs(input.get("evidence"))
+        if refusal:
+            return ToolResult(success=False, error={"message": "Not recorded: " + refusal})
+        claim = self.hook.clean(claim)[:INSIGHT_CLAIM]
+        limitations = self.hook.clean(limitations.strip())[:INSIGHT_LIMITATIONS]
+        evidence_refs = self.hook.clean_json(evidence_refs)
+        raw_title = input.get("title")
+        title = self.hook.clean(raw_title).strip()[:INSIGHT_TITLE] if isinstance(raw_title, str) and raw_title.strip() else None
+        data = {
+            "claim": claim, "basis": basis, "confidence": confidence, "limitations": limitations,
+            "evidence_refs": evidence_refs,
+            # Not caller-supplied: this session's own identity, never overridable
+            # by anything in `input`.
+            "source_session_id": self.hook.sid,
+            "review_state": "unreviewed",
+        }
+        if title:
+            data["title"] = title
+        record_id = uid()
+        try:
+            await asyncio.to_thread(
+                self.hook.client.request, "publish",
+                {"operations": [{"op": "insight.upsert", "id": record_id, "expected_version": 0, "data": data}]}, uid())
+        except SyncError as error:
+            if error.status == 403:
+                reason = ("this project's service does not allow this session to record knowledge "
+                          "(it needs the shared-write permission)")
+            elif error.status == 422:
+                server_message = (error.body.get("error") or {}).get("message") if isinstance(error.body, dict) else None
+                reason = ("the project service rejected the record: " + server_message if server_message
+                          else "the project service rejected the record")
+            elif error.status == 409:
+                reason = "a record with that id already exists; this is a bug in the tool, not something you did"
+            elif error.status:
+                reason = "the project service refused the record (HTTP %s)" % error.status
+            else:
+                reason = "the project service could not be reached"
+            return ToolResult(success=False, error={"message": "Not recorded: " + reason})
+        return ToolResult(success=True, output={
+            "recorded": record_id, "title": title or claim[:100],
+            "note": "Visible to the project. It can be revised by you; every earlier version is preserved."})
+
+
 async def mount(coordinator, config=None):
     # Delegated prompts are internal work, not the opted-in human conversation.
     if getattr(coordinator, "parent_id", None):
@@ -1412,7 +1568,8 @@ async def mount(coordinator, config=None):
         coordinator.hooks.register(name, handler, priority=50, name="teamwork-" + name.replace(":", "-"))
     send = SendTool(hook)
     await coordinator.mount("tools", send, name=send.name)
-    for tool in (TasksTool(hook), ClaimTool(hook), ProgressTool(hook), WaitTool(hook), PublishWorkTool(hook)):
+    for tool in (TasksTool(hook), ClaimTool(hook), ProgressTool(hook), WaitTool(hook), PublishWorkTool(hook),
+                RecordInsightTool(hook)):
         await coordinator.mount("tools", tool, name=tool.name)
     coordinator.register_capability("teamwork.session_id", hook.sid)
     coordinator.register_capability("teamwork.rebind", hook.rebind)
