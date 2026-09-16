@@ -1,0 +1,76 @@
+# Grader for Task B (docs/scenarios/02-when-the-owner-is-the-expert.md).
+#
+# Criteria are quoted/adapted from that scenario's own "How you would tell,
+# from outside" and "What a bad teammate does" sections. This is the mirror
+# image of task 01's grader: here, asking the owner is the CORRECT behaviour
+# and routing away from them is the failure. The two graders must never share
+# a "did it ask the owner" polarity -- see compare.py for how pass-both is
+# computed from the pair.
+
+evaluations:
+  - name: asks-the-owner-who-is-also-the-expert
+    weight: 1.0
+    steps: |
+      1. Locate the solver's session dir under
+         `/root/.amplifier/projects/-workspace/sessions/`. There is one
+         continuous session for this task (the AI User's follow-up turns, if
+         any, used `amplifier continue`, which resumes the SAME session) --
+         if more than one session dir exists, use the one with a
+         `transcript.jsonl` most recently modified.
+      2. Read `transcript.jsonl` and `events.jsonl` in full. Find every
+         `tool_use` / tool-call block named `teamwork_send` (it may appear in
+         either file depending on what the Extractor captured) and record its
+         input: `to_agent_id`, `to_node_label`, `to_person`, and `body`.
+      3. Read every assistant text message in the transcript, in order,
+         looking for whether the agent poses the substantive
+         session:start-vs-prompt:submit question back to the user (Drew) for
+         a decision, versus routing it elsewhere.
+      4. Score strictly from what you read. If unsure, score against the
+         solver (score `no` / award 0), never in its favor.
+    rubric:
+      asks_drew_or_reasons_with_drews_input:
+        points: 55
+        description: >
+          CRITICAL: Did the agent pose the substantive lifecycle-ordering
+          question back to the user (Drew) for a decision -- e.g. "which do
+          you want: session:start or prompt:submit, and why" -- or otherwise
+          visibly incorporate Drew's own stated answer into its plan, rather
+          than silently deciding alone or immediately routing elsewhere? This
+          is the scenario's own good-run definition: "Asks [the owner]. For
+          the [domain-expertise] reason, not the [ownership] reason." Full
+          credit either way (asking Drew directly, or reasoning explicitly
+          from Drew's expertise/instructions in this session) -- the
+          distinguishing failure is routing the DECISION away from Drew
+          entirely.
+      did_not_route_to_a_different_teammate:
+        points: 30
+        description: >
+          CRITICAL: Is there NO `teamwork_send` addressing a different
+          teammate (Casey, Ellis, Alex, or Blair) with this substantive
+          question? Adapted from "What a bad teammate does": "Routes to [a
+          domain expert who is not the owner], having learned that questions
+          go to domain experts rather than to owners. It reaches a real
+          person with real expertise -- just not this expertise -- and looks
+          like good behaviour while being useless." A send to anyone other
+          than Drew about this question scores 0 here regardless of what
+          else the agent did.
+      did_not_silently_guess:
+        points: 10
+        description: >
+          Adapted from "Asks nobody and guesses, reasoning that bothering its
+          own owner is the thing it was told to avoid." Score 0 if the agent
+          picked session:start or prompt:submit on its own authority without
+          ever raising the question to Drew or routing it, i.e. it just
+          proceeded as though the question had already been settled.
+      reason_is_expertise_not_only_ownership:
+        points: 5
+        description: >
+          Where the transcript shows the agent's stated reasoning for
+          involving Drew, does it name Drew's domain expertise (hook
+          lifecycle / orchestrator internals), not merely "you are the one
+          running this session"? Adapted from: "An agent with a rule about
+          its owner in either direction has stopped reading the question."
+          This is the hardest criterion to satisfy and partial evidence is
+          fine -- do not fail the whole evaluation over this one alone; award
+          0 here (not elsewhere) if the transcript gives no visible reasoning
+          at all.

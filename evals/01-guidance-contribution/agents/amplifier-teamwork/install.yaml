@@ -1,0 +1,84 @@
+requires:
+  env:
+    - ANTHROPIC_API_KEY
+
+# Runs inside the launched task DTU via `bash -lc`, after the profile's
+# provision stage (which already wrote /workspace/owner_name.txt and
+# installed uv/git/curl). Shared verbatim by both tasks and both arms --
+# the ARM is selected earlier, by which Gitea mirror the profile's
+# url_rewrites point the bundle clone at; the TASK's owner was already
+# written to /workspace/owner_name.txt by provision.
+setup_cmds:
+  - export PATH="/root/.local/bin:$PATH"; uv tool install git+https://github.com/microsoft/amplifier
+
+  # Provider config. Unquoted EOF expands $ANTHROPIC_API_KEY (provided via the
+  # profile's passthrough.services) into the file at install time.
+  - |
+    mkdir -p /root/.amplifier
+    cat > /root/.amplifier/settings.yaml <<EOF
+    config:
+      providers:
+        - module: provider-anthropic
+          source: git+https://github.com/microsoft/amplifier-module-provider-anthropic@main
+          config:
+            api_key: $ANTHROPIC_API_KEY
+    EOF
+
+  # Three clones, each rewritten by the task profile's url_rewrites:
+  #   - this eval's seed script         -> fixed Gitea mirror
+  #   - the Teamwork service source     -> fixed Gitea mirror
+  #   - the teamwork bundle             -> ARM-selected Gitea mirror
+  - git clone https://github.com/microsoft/amplifier-teamwork-eval-support /workspace/eval-support
+  - git clone https://github.com/michaeljabbour/amplifier-app-teamwork /workspace/amplifier-app-teamwork
+  - git clone https://github.com/michaeljabbour/amplifier-bundle-teamwork /workspace/amplifier-bundle-teamwork
+
+  # pyjwt is an optional import in the app's backend (only touched by the
+  # Entra/SSO path, never taken in local mode) but installed anyway so a
+  # future code path that imports it eagerly doesn't silently break this
+  # eval; local mode itself needs nothing beyond the stdlib.
+  - pip install --break-system-packages --quiet pyjwt || true
+
+  # Free ephemeral port (never hardcoded -- a fixed port may already be
+  # taken in a reused container). local_dev.py binds 127.0.0.1 only, so no
+  # LAN exposure either way.
+  - |
+    PORT=$(python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1]); s.close()")
+    echo -n "$PORT" > /workspace/teamwork-port.txt
+    cd /workspace/amplifier-app-teamwork
+    nohup python3 scripts/local_dev.py --port "$PORT" > /workspace/teamwork-service.log 2>&1 &
+    echo $! > /workspace/teamwork-service.pid
+    for i in $(seq 1 30); do
+      curl -sf "http://localhost:$PORT/api/config" >/dev/null 2>&1 && break
+      sleep 1
+    done
+    curl -sf "http://localhost:$PORT/api/config" >/dev/null || { echo "Teamwork service did not become ready" >&2; cat /workspace/teamwork-service.log >&2; exit 1; }
+
+  # Seed all five members' profiles (identical across every trial), then
+  # print the OWNER's login code on stdout (seed.py's documented contract:
+  # it is the only line printed to stdout when --owner is given).
+  - |
+    PORT=$(cat /workspace/teamwork-port.txt)
+    OWNER_NAME=$(cat /workspace/owner_name.txt)
+    OWNER_CODE=$(python3 /workspace/eval-support/seed.py --port "$PORT" --app-repo /workspace/amplifier-app-teamwork --owner "$OWNER_NAME" 2>/workspace/teamwork-seed.log)
+    printf '%s' "$OWNER_CODE" > /workspace/owner_code.txt
+
+  # Enroll as the owner via the REAL setup_teamwork.py (never a hand-written
+  # connection file -- see README.md's "Environment" section for why that
+  # matters). Piping name+code answers its two interactive prompts. Origin
+  # must be exactly what TEAMWORK_PUBLIC_ORIGIN is set to by local_dev.py
+  # (http://localhost:<port>), independent of --base-url.
+  - |
+    PORT=$(cat /workspace/teamwork-port.txt)
+    OWNER_NAME=$(cat /workspace/owner_name.txt)
+    cd /workspace/amplifier-bundle-teamwork
+    printf '%s\n%s\n' "$OWNER_NAME" "$(cat /workspace/owner_code.txt)" | \
+      python3 setup_teamwork.py \
+        --base-url "http://localhost:$PORT" \
+        --origin "http://localhost:$PORT" \
+        --bundle "git+https://github.com/microsoft/amplifier-foundation@main" \
+        --output /workspace/teamwork-overlay.yaml \
+        --connection-file /workspace/teamwork-connection.json \
+        --project teamwork
+    test -f /workspace/teamwork-overlay.yaml || { echo "setup_teamwork.py did not produce an overlay" >&2; exit 1; }
+
+  - export PATH="/root/.local/bin:$PATH"; amplifier --version

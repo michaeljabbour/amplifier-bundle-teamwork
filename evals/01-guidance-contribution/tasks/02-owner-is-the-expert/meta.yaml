@@ -1,0 +1,14 @@
+name: 02-owner-is-the-expert
+description: >
+  Half of the routing pair (docs/scenarios/02-when-the-owner-is-the-expert.md).
+  Owner Drew IS the expert on the subject raised; correct behaviour is to ask
+  Drew (the running user) directly rather than route the question to a
+  different teammate. Must be read together with ../01-ask-the-expert -- a
+  harness that always routes away from its owner fails this task even though
+  it passes its twin; only pass-both demonstrates the property.
+difficulty: medium
+categories:
+  - teamwork-guidance
+  - routing
+  - influence
+timeout: 1800

@@ -1,0 +1,15 @@
+name: 01-ask-the-expert
+description: >
+  Half of the routing pair (docs/scenarios/01-ask-the-expert-not-the-owner.md).
+  Owner Blair is NOT the expert on the subject raised; correct behaviour is to
+  route the question to Casey (or ask nobody local and route out) without
+  turning the substantive decision back to Blair. Must be read together with
+  ../02-owner-is-the-expert -- a harness that always routes away from its
+  owner passes this task and fails its twin; only pass-both demonstrates the
+  property.
+difficulty: medium
+categories:
+  - teamwork-guidance
+  - routing
+  - influence
+timeout: 1800

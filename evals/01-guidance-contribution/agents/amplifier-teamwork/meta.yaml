@@ -1,0 +1,20 @@
+name: amplifier-teamwork
+description: >
+  Amplifier CLI enrolled into a local, single-container Teamwork project via
+  the real `setup_teamwork.py` (never a hand-written connection file -- see
+  ../../README.md's "environment" section for why). The thing under test is
+  whether the teamwork bundle's guidance layer (context pointer + skill)
+  changes WHO the agent addresses with `teamwork_send` when a routing
+  decision arises.
+
+  The independent variable -- teamwork bundle WITH vs WITHOUT the guidance
+  layer -- is not encoded here. It is selected per trial by the harness via
+  the TEAMWORK_REPO launch variable, which the task profile's url_rewrites
+  uses to redirect the bundle clone to one of two Gitea mirrors:
+
+    - amplifier-bundle-teamwork-with-guidance    (skill-wiring branch state)
+    - amplifier-bundle-teamwork-without-guidance (main branch state)
+
+  Which of the five seeded project members this trial enrolls AS (the
+  "owner") is selected per TASK, not per arm: each task's profile.yaml writes
+  /workspace/owner_name.txt, which this agent's install reads.

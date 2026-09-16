@@ -12,3 +12,8 @@ dist/
 *connection*.json
 teamwork-overlay*
 .DS_Store
+
+# Evaluation run output: results belong outside the repo, per this project's
+# convention (see evals/*/README.md). Never commit a run's session data,
+# transcripts, or reports.
+evals/*/results/
