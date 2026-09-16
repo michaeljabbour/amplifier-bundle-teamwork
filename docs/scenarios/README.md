@@ -1,9 +1,10 @@
 # Scenarios
 
-The bundle ships eight tools and no judgment. A tool description says what a tool
-does; none of them says when interrupting a person is worth their attention. These
-scenarios are where that judgment gets worked out, before any of it is written as
-guidance.
+The bundle ships tools plus an on-demand [protocol skill](../../skills/teamwork-protocol/SKILL.md).
+These scenarios are where its guidance is worked out: a tool description explains what
+an operation does, while a scenario examines when it is worth another participant's
+attention. Behavioral benefit remains to be measured; shipping guidance is not proof
+that a model follows it.
 
 Everything downstream is derived from here, not invented beside it:
 

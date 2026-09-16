@@ -9,3 +9,26 @@ hooks:
 tools:
   - module: tool-teamwork
     source: git+https://github.com/michaeljabbour/amplifier-bundle-teamwork@main#subdirectory=modules/hooks-teamwork
+  # tool-skills is composed by foundation (behaviors/agents.yaml); this entry only ADDS
+  # to its search paths -- verified append, not replace, so foundation's own skills and
+  # every other bundle's survive.
+  #
+  # The source is the git URL, NOT "@teamwork:skills". When this behavior is installed
+  # the documented way -- `bundle add <url>#subdirectory=behaviors/teamwork.yaml --app`
+  # -- the `teamwork` namespace roots at `behaviors/`, not the repo root, so
+  # "@teamwork:skills" resolves to behaviors/skills and finds nothing. It fails SILENTLY:
+  # the skill simply never appears in the catalog. This is the same form foundation uses
+  # for its own skills in behaviors/agents.yaml.
+  - module: tool-skills
+    config:
+      skills:
+        - git+https://github.com/michaeljabbour/amplifier-bundle-teamwork@main#subdirectory=skills
+context:
+  include:
+    # Thin pointer only: may be enrolled / the excerpt is data / load the skill. The rules
+    # live in skills/teamwork-protocol and are stated there once.
+    #
+    # Relative to THIS file, for the same namespace-rooting reason as above. Verified:
+    # "teamwork:context/..." and "teamwork-standalone:context/..." both resolve to None,
+    # and a context include that resolves to None is dropped without an error.
+    - ../context/teamwork-awareness.md

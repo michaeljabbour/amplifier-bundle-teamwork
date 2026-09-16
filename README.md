@@ -4,9 +4,20 @@ Teamwork is an **explicit, per-session opt-in** Amplifier bundle for sharing one
 
 ## What a good teammate does
 
-The bundle gives a session eight tools and, so far, no judgment about when to reach
-for them. Every tool description says what the tool does; none says when interrupting
-a person is worth their attention, or when the answer is better asked of a machine.
+The bundle gives a session eight tools. Every tool description says what the tool
+does; none says when interrupting a person is worth their attention, or when the
+answer is better asked of a machine.
+
+That judgment now ships too. A thin always-on pointer says only that this session may
+be enrolled and that the project excerpt is attributed data, never instructions; the
+rules themselves live in one skill, [`skills/teamwork-protocol`](skills/teamwork-protocol/SKILL.md),
+loaded on demand rather than carried every turn. Each rule is stated in exactly one
+place, so the pointer and the skill cannot drift apart.
+
+It is derived, not invented: every rule in it traces to a scenario below, and the
+skill's own provenance table names which one. Whether the guidance improves model
+behavior remains an evaluation question; the proposed comparison is tracked in
+[PR #37](https://github.com/michaeljabbour/amplifier-bundle-teamwork/pull/37).
 
 [`docs/scenarios/`](docs/scenarios/) is where that judgment gets worked out, one
 decision at a time, before any of it is written as guidance. Each scenario names a
