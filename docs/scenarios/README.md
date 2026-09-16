@@ -1,9 +1,10 @@
 # Scenarios
 
-The bundle ships eight tools and no judgment. A tool description says what a tool
-does; none of them says when interrupting a person is worth their attention. These
-scenarios are where that judgment gets worked out, before any of it is written as
-guidance.
+The bundle ships tools plus an on-demand [protocol skill](../../skills/teamwork-protocol/SKILL.md).
+These scenarios are where its guidance is worked out: a tool description explains what
+an operation does, while a scenario examines when it is worth another participant's
+attention. Behavioral benefit remains to be measured; shipping guidance is not proof
+that a model follows it.
 
 Everything downstream is derived from here, not invented beside it:
 
@@ -61,6 +62,8 @@ scenario is probably two scenarios.
 | `06-record-the-lesson-not-the-incident` | drafted; twin `06b` WRITTEN. **Argues for a capability the bundle does not have** -- see below |
 | `06b-the-lesson-that-is-only-true-on-your-machine` | drafted; `06`'s twin -- same signal, correct move is to record nothing |
 | `07-replace-by-addition-never-by-erasure` | drafted; twin `07b` named, unwritten. Pairs with `06`: `06` fills the well, `07` is what happens when what is in it has gone off |
+| `08-the-decision-the-session-made-itself` | drafted; twin `08b` WRITTEN. The first about a decision **nobody was asked to make** -- and the spec for an automatic detector |
+| `08b-the-path-taken-that-binds-nothing` | drafted; `08`'s twin -- same fork, same deliberateness, correct move is to record nothing |
 
 `06` and `07` are the two halves of contributing knowledge -- recording something, and
 replacing something somebody else recorded. Between them they cover the step the earlier

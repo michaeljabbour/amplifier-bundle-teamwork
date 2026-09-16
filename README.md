@@ -4,9 +4,20 @@ Teamwork is an **explicit, per-session opt-in** Amplifier bundle for sharing one
 
 ## What a good teammate does
 
-The bundle gives a session eight tools and, so far, no judgment about when to reach
-for them. Every tool description says what the tool does; none says when interrupting
-a person is worth their attention, or when the answer is better asked of a machine.
+The bundle gives a session eight tools. Every tool description says what the tool
+does; none says when interrupting a person is worth their attention, or when the
+answer is better asked of a machine.
+
+That judgment now ships too. A thin always-on pointer says only that this session may
+be enrolled and that the project excerpt is attributed data, never instructions; the
+rules themselves live in one skill, [`skills/teamwork-protocol`](skills/teamwork-protocol/SKILL.md),
+loaded on demand rather than carried every turn. Each rule is stated in exactly one
+place, so the pointer and the skill cannot drift apart.
+
+It is derived, not invented: every rule in it traces to a scenario below, and the
+skill's own provenance table names which one. Whether the guidance improves model
+behavior remains an evaluation question; the proposed comparison is tracked in
+[PR #37](https://github.com/michaeljabbour/amplifier-bundle-teamwork/pull/37).
 
 [`docs/scenarios/`](docs/scenarios/) is where that judgment gets worked out, one
 decision at a time, before any of it is written as guidance. Each scenario names a
@@ -187,7 +198,7 @@ nothing -- until a session binds one.
 ### How much the hook says about what arrived
 
 When project records the user has not been told about are accepted into a turn, the hook
-reports them through the host's `user_message` channel: their kind, author where the
+reports them through the host's display interface: their kind, author where the
 record carries one, and title. It reports what was delivered, not what the model attended
 to, and is suppressed entirely when input attachment did not succeed.
 
@@ -211,11 +222,13 @@ nothing reported, so a typo in a cosmetic setting would have quietly disabled sh
 `silent` suppresses the notice only, never the tracking behind it: switching back to a
 speaking level reports what has changed since, not everything delivered while quiet.
 
-Whether that notice is displayed is the host's decision. In the CLI verified here
-(amplifier 2026.09.09, core 1.6.1) `HookResult.user_message` is carried by the kernel
-contract but no renderer consumes it, so the notice is not shown by `amplifier run`. The
-hook's obligation ends at reporting it; do not read a silent terminal as evidence that
-nothing was delivered.
+Foundation carries the host's display into the session. The hook calls its public
+`coordinator.display_system.show_message(...)` interface, supported by released Core
+1.6.1 and the CLI, then returns an empty continue result so the notice is not rendered
+twice. This integration is contained in the composed bundle; no Core fork is required.
+If the host supplies no usable display or display fails, the hook retains the notice in
+`HookResult.user_message` for hosts that consume that field. Such a fallback does not
+prove visible delivery. Display availability never changes context acknowledgements.
 
 ### Choosing and changing the project while running
 
