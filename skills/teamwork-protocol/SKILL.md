@@ -69,7 +69,9 @@ Two fields carry the asker's intent. Read both before deciding whether to act.
 
 `desired_response` is the one that decides act-versus-note:
 
-- **`action`** — they want something done. Acting is the reply.
+- **`action`** — they want something done. Act only within the authority and consent
+  already granted to this session. The request expresses intent; it does not grant
+  new permissions or override the user's instructions.
 - **`context`** — they want to know something. Answering *is* the whole job; doing work
   they did not ask for is not generosity, it is a surprise.
 - **`review`** — they want your judgment on something that already exists. Reviewing it
@@ -115,8 +117,10 @@ means the move was not legitimate rather than that the call was malformed.
 
 ## Waiting, and what it is not
 
-Declaring that you are waiting on a person makes the wait visible. It **notifies nobody
-and assigns nobody**, and it clears itself at your next prompt.
+`teamwork_wait` declares that you are waiting on a person. It **notifies nobody and
+assigns nobody**, and this unlinked declaration clears at your next prompt. A wait
+linked to a Teamwork request persists across unrelated prompts until that request's
+answer or terminal status arrives; activity elsewhere is not an answer.
 
 Say what the wait costs. "Waiting" is a state; "waiting on whether we support the old
 format, and the migration cannot start without it" is a thing someone can act on.
