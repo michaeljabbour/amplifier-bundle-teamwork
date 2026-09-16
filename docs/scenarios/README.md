@@ -59,6 +59,13 @@ scenario is probably two scenarios.
 | `04-ask-the-machine-that-knows` | drafted; twin `04b` named, unwritten; depends on `03` |
 | `05` -- handing work to another harness | named, unwritten |
 | `06-record-the-lesson-not-the-incident` | drafted; twin `06b` named, unwritten. **Argues for a capability the bundle does not have** -- see below |
+| `07-replace-by-addition-never-by-erasure` | drafted; twin `07b` named, unwritten. Pairs with `06`: `06` fills the well, `07` is what happens when what is in it has gone off |
+
+`06` and `07` are the two halves of contributing knowledge -- recording something, and
+replacing something somebody else recorded. Between them they cover the step the earlier
+scenarios do not: a question is asked (`01`, `02`, `04`), an answer comes back, something
+is settled, and then it has to survive being read and refined by people who were not
+there.
 
 ### What `06` broke, recorded rather than smoothed over
 
