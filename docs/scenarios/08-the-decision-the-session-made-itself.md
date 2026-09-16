@@ -90,8 +90,10 @@ separates them.
 
 - **What fires this, and what does it cost?** Two candidate signals: the `pre` of a
   delegation call, and `session:end`, which sees which choices actually survived the
-  session rather than which were made and later revised. Neither sees a session that
-  decides and does the work itself with no delegation. That gap is known and not closed.
+  session rather than which were made and later revised. The delegation signal misses
+  a session that decides and does the work itself; a normal `session:end` can cover
+  that case. A crash or interruption that prevents the end event can still leave it
+  unseen. The coverage and latency of these signals need to be measured.
 
 - **The decision is not in the delegation instruction -- it is in what led to it.** The
   instruction is where a choice *surfaces*; the choice itself was formed across the root
