@@ -8,7 +8,7 @@ digraph teamwork_standalone {
     nodesep=0.6
     ranksep=0.7
     bgcolor="white"
-    source_hash="30fb5d353524ac29c5bdc5ec9f74e894803983af7f8f5dc972e371d5d6945a7a"
+    source_hash="b5ff6cb4081161bc2b07aa43f3b7a8d33ab7bb939c75089f2aae91c9d2cd6b20"
 
     node [fontname="Helvetica", fontsize=11, style="filled,rounded"]
     edge [fontname="Helvetica", fontsize=9]
@@ -30,7 +30,7 @@ digraph teamwork_standalone {
         fillcolor="#f9f9f9"
         color="#999999"
 
-        mod_hooks_teamwork [label="hooks-teamwork\n5 tool · ~302 tok", shape=box, fillcolor="#bbdefb", style="filled,rounded"]
+        mod_hooks_teamwork [label="hooks-teamwork", shape=box, fillcolor="#bbdefb", style="filled,rounded"]
     }
 
     subgraph cluster_legend {
