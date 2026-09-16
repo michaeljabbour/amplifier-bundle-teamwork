@@ -432,6 +432,14 @@ def announce(url, pointer, opened, minutes, stream=None):
         "",
         "  Stays open for " + str(minutes) + " minutes of inactivity. Nothing is shared until you submit it.",
     ]
+    port = urlsplit(url).port
+    if port:
+        lines.extend([
+            "  On a remote host, forward this loopback port from your own computer:",
+            "    ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:" + str(port) + ":127.0.0.1:" + str(port) + " USER@REMOTE_HOST",
+            "  Replace USER@REMOTE_HOST with the host running Amplifier, then open the SAME address above locally.",
+            "  Keep the tunnel open until you finish. Never expose this port publicly or share the one-time address.",
+        ])
     if pointer:
         lines.append("  Also saved to: " + str(pointer))
     lines.append("")
@@ -616,7 +624,7 @@ def private_browser_connect(base, home, stop, timeout=IDLE_TIMEOUT, notify=annou
 
 class TeamworkConnect:
     name = "teamwork_connect"
-    description = "Open a private local browser form to select a Teamwork project and explicitly enable sharing for this session. Use only when the user asks to connect. Never ask for credentials in chat or pass credentials to this tool. Requires a browser on the Amplifier host; the form's one-time address is also printed to the terminal. The form stays open for 15 minutes of inactivity and can be retried in place. Sharing begins with the next prompt."
+    description = "Open a private local browser form to select a Teamwork project and explicitly enable sharing for this session. Use only when the user asks to connect. Never ask for credentials in chat or pass credentials to this tool. Use a local browser, or forward the printed loopback port over SSH and open the one-time address on your computer. The form stays open for 15 minutes of inactivity and can be retried in place. Sharing begins with the next prompt."
     input_schema = {"type": "object", "properties": {}, "additionalProperties": False}
 
     def __init__(self, coordinator, config):
