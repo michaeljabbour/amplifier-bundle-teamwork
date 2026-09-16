@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -112,6 +113,29 @@ def hook_result(message=None):
     if not message:
         return HookResult(action="continue")
     return HookResult(action="continue", user_message=message, user_message_level="info", user_message_source="teamwork")
+
+
+async def display_notice(coordinator, message=None):
+    """Use the host display carried into the session by Foundation.
+
+    Some hosts do not render continue-result notices. A successful direct display
+    consumes the notice so hosts that also render results cannot show it twice.
+    Keep the legacy result when no usable display is available; display failure
+    must not undo context acceptance or the already durable acknowledgement.
+    """
+    if not message:
+        return hook_result()
+    try:
+        display = getattr(coordinator, "display_system", None)
+        show_message = getattr(display, "show_message", None)
+        if callable(show_message):
+            pending = show_message(message, level="info", source="teamwork")
+            if inspect.isawaitable(pending):
+                await pending
+            return hook_result()
+    except Exception:
+        logger.warning("Teamwork host display failed; notice retained in hook result")
+    return hook_result(message)
 
 
 def named(value):
@@ -910,7 +934,7 @@ class TeamworkHook:
                 filed = await asyncio.to_thread(self.file_reports)
             except Exception:
                 logger.warning("Teamwork could not file inbound messages locally; delivery is unaffected", exc_info=True)
-            return hook_result("\n".join([line for line in (notice, filed) if line]) or None)
+            return await display_notice(self.coordinator, "\n".join([line for line in (notice, filed) if line]) or None)
 
     def finish(self, response, response_state="final"):
         turn = self.state.get("turn")
@@ -1391,7 +1415,7 @@ async def mount(coordinator, config=None):
 
         async def _retired_notice(event, data):
             coordinator.hooks.unregister(name)
-            return hook_result(RETIRED_MESSAGE)
+            return await display_notice(coordinator, RETIRED_MESSAGE)
 
         coordinator.hooks.register("prompt:submit", _retired_notice, priority=50, name=name)
         return None

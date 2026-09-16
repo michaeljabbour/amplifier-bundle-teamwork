@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 import urllib.request
 import urllib.error
 import subprocess
@@ -28,6 +29,12 @@ class Coordinator:
     def __init__(self, context): self.context = context; self.tools = {}
     def get(self, name): return self.context if name == "context" else None
     async def mount(self, point, value, name): self.tools[name] = value
+
+
+class RecordingDisplay:
+    def __init__(self): self.messages = []
+    def show_message(self, message, level, source="hook"):
+        self.messages.append((message, level, source))
 
 
 class Client:
@@ -845,7 +852,7 @@ class InfluenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Brand new", unknown)
         self.assertIn("brand_new:n:1", unknown)
 
-    async def test_the_notice_reaches_the_user_through_the_hook_result(self):
+    async def test_missing_display_preserves_the_legacy_hook_result(self):
         result = await self.hook.on_submit("prompt:submit", {"prompt": "My prompt"})
         self.assertEqual(result.user_message_source, "teamwork")
         self.assertEqual(result.user_message_level, "info")
@@ -854,11 +861,76 @@ class InfluenceTests(unittest.IsolatedAsyncioTestCase):
         again = await self.hook.on_submit("prompt:submit", {"prompt": "Another prompt"})
         self.assertIsNone(again.user_message)
 
+    async def test_host_display_receives_arrival_once_after_context_acceptance(self):
+        display = RecordingDisplay()
+        def show_message(message, level, source="hook"):
+            self.assertIn("acknowledgements", [event for event, _ in self.events])
+            self.events.append(("display", message))
+            display.show_message(message, level, source)
+        self.hook.coordinator.display_system = SimpleNamespace(show_message=show_message)
+        result = await self.hook.on_submit("prompt:submit", {"prompt": "My prompt"})
+        self.assertEqual(result.action, "continue")
+        self.assertIsNone(result.user_message)  # A notice-aware host must not render it twice.
+        self.assertEqual(len(display.messages), 1)
+        notice, level, source = display.messages[0]
+        self.assertIn("Fixture goal", notice)
+        self.assertEqual((level, source), ("info", "teamwork"))
+        events = [event for event, _ in self.events]
+        self.assertLess(events.index("input_accepted"), events.index("acknowledgements"))
+        self.assertLess(events.index("acknowledgements"), events.index("display"))
+        again = await self.hook.on_submit("prompt:submit", {"prompt": "Another prompt"})
+        self.assertIsNone(again.user_message)
+        self.assertEqual(len(display.messages), 1)
+
+    async def test_async_host_display_is_awaited(self):
+        display = RecordingDisplay()
+        async def show_message(message, level, source="hook"):
+            await asyncio.sleep(0)
+            display.show_message(message, level, source)
+        self.hook.coordinator.display_system = SimpleNamespace(show_message=show_message)
+        result = await self.hook.on_submit("prompt:submit", {"prompt": "My prompt"})
+        self.assertIsNone(result.user_message)
+        self.assertEqual(len(display.messages), 1)
+
+    async def test_unusable_display_preserves_the_legacy_hook_result(self):
+        from amplifier_module_hooks_teamwork import display_notice
+        for display in (None, object(), SimpleNamespace(show_message=None)):
+            with self.subTest(display=display):
+                result = await display_notice(SimpleNamespace(display_system=display), "Fixture notice")
+                self.assertEqual(result.user_message, "Fixture notice")
+                self.assertEqual(result.user_message_source, "teamwork")
+
+    async def test_display_failure_does_not_undo_context_acceptance_or_leak_error_text(self):
+        def fail(*args, **kwargs):
+            raise RuntimeError("PRIVATE DISPLAY ERROR")
+        self.hook.coordinator.display_system = SimpleNamespace(show_message=fail)
+        with self.assertLogs("amplifier_module_hooks_teamwork", level="WARNING") as logs:
+            result = await self.hook.on_submit("prompt:submit", {"prompt": "My prompt"})
+        self.assertIn("Fixture goal", result.user_message)
+        self.assertNotIn("PRIVATE DISPLAY ERROR", " ".join(logs.output))
+        self.assertEqual(self.hook.state["turn"]["boundary"], "harness_input_accepted")
+        self.assertTrue(any(endpoint == "acknowledgements" for endpoint, _, _ in self.client.requests))
+
+    async def test_silent_arrivals_do_not_replay_when_host_display_is_enabled(self):
+        display = RecordingDisplay()
+        self.hook.coordinator.display_system = display
+        self.hook.level = "silent"
+        first = await self.hook.on_submit("prompt:submit", {"prompt": "My prompt"})
+        self.assertIsNone(first.user_message)
+        self.hook.level = "summary"
+        second = await self.hook.on_submit("prompt:submit", {"prompt": "Another prompt"})
+        self.assertIsNone(second.user_message)
+        self.assertEqual(display.messages, [])
+        self.assertTrue(any(endpoint == "acknowledgements" for endpoint, _, _ in self.client.requests))
+
     async def test_no_notice_when_nothing_was_accepted(self):
         self.hook.coordinator = Coordinator(Context(self.events, fail=True))
+        display = RecordingDisplay()
+        self.hook.coordinator.display_system = display
         result = await self.hook.on_submit("prompt:submit", {"prompt": "My prompt"})
         self.assertIsNone(result.user_message)
         self.assertFalse(self.hook.state.get("announced"))
+        self.assertEqual(display.messages, [])
 
 
 class ExcerptTests(unittest.TestCase):
@@ -994,6 +1066,19 @@ class RetiredHostTests(unittest.IsolatedAsyncioTestCase):
         event, handler = next(iter(root.hooks.handlers.values()))
         notice = await handler("prompt:submit", {})
         self.assertEqual(notice.user_message, RETIRED_MESSAGE)
+
+    async def test_retired_host_uses_host_display_once_without_registering_sharing(self):
+        root = self.Root()
+        root.display_system = RecordingDisplay()
+        result = await mount(root, {"share_visible_turns": True,
+                                   "base_url": "https://team.amplifier.run", "token": "fixture-token"})
+        self.assertIsNone(result)
+        _, handler = next(iter(root.hooks.handlers.values()))
+        notice = await handler("prompt:submit", {})
+        self.assertIsNone(notice.user_message)
+        self.assertEqual(root.display_system.messages, [(RETIRED_MESSAGE, "info", "teamwork")])
+        self.assertEqual(root.hooks.handlers, {})
+        self.assertNotIn("teamwork.session_id", root.capabilities)
 
 
 class MountTests(unittest.IsolatedAsyncioTestCase):
