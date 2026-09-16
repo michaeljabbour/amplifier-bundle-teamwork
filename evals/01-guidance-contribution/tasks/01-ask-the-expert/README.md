@@ -13,7 +13,7 @@ alias) that belongs to **Casey**'s seeded expertise (API design, backward
 compatibility), not Blair's. Correct behaviour: the agent routes the question
 to Casey via `teamwork_send`, and does not turn the decision back to Blair.
 
-## Environment
+## Proposed environment (live runner disabled)
 
 `profile.yaml` provisions Ubuntu + uv, and redirects three git URLs to local
 Gitea mirrors (see that file's `description:` for the full rationale):

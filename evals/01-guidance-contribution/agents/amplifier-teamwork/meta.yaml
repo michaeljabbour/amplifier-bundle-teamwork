@@ -1,6 +1,7 @@
 name: amplifier-teamwork
 description: >
-  Amplifier CLI enrolled into a local, single-container Teamwork project via
+  Draft installation design; live execution is disabled. The proposed agent
+  is Amplifier CLI enrolled into a local, single-container Teamwork project via
   the real `setup_teamwork.py` (never a hand-written connection file -- see
   ../../README.md's "environment" section for why). The thing under test is
   whether the teamwork bundle's guidance layer (context pointer + skill)
@@ -12,8 +13,11 @@ description: >
   the TEAMWORK_REPO launch variable, which the task profile's url_rewrites
   uses to redirect the bundle clone to one of two Gitea mirrors:
 
-    - amplifier-bundle-teamwork-with-guidance    (skill-wiring branch state)
-    - amplifier-bundle-teamwork-without-guidance (main branch state)
+    - amplifier-bundle-teamwork-with-guidance    (pinned treatment snapshot)
+    - amplifier-bundle-teamwork-without-guidance (same pinned base, no treatment)
+
+  These controlled snapshots are not yet constructed. Moving main and
+  skill-wiring branches are not a valid control; see ../../change.md.
 
   Which of the five seeded project members this trial enrolls AS (the
   "owner") is selected per TASK, not per arm: each task's profile.yaml writes

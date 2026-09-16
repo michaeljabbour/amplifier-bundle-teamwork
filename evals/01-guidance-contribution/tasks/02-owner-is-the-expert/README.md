@@ -16,7 +16,7 @@ a different teammate. A harness that always routes away from its owner --
 having over-learned task 01 -- fails this task confidently while looking
 well-behaved.
 
-## Environment
+## Proposed environment (live runner disabled)
 
 Same shape as `../01-ask-the-expert/profile.yaml`; the only difference is
 `/workspace/owner_name.txt` = `Drew`. See that file and

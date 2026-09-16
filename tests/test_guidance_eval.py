@@ -1,6 +1,7 @@
 """Offline contract regressions; no DTUs, mirrors, credentials or providers."""
 
 import contextlib
+import builtins
 import importlib.util
 import io
 import json
@@ -92,6 +93,22 @@ class GuidanceGradeTests(unittest.TestCase):
             self.assertEqual(
                 result["pass_both"], {"with_guidance": True, "without_guidance": True}
             )
+            self.assertFalse(
+                result["with_guidance"][compare.TASK_IDS[0]]["completion_verified"]
+            )
+            self.assertIn("grading only", compare.render_markdown(result))
+
+    def test_native_trial_state_cannot_be_ignored_or_malformed_into_a_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trial = Path(directory) / "01-ask-the-expert"
+            write_grade(trial, trial.name)
+            for state in ('{"state":"failed"}', '{"state":"cancelled"}', "not json"):
+                with self.subTest(state=state):
+                    (trial / "state.json").write_text(state)
+                    result = compare.collect_trial(trial)
+                    self.assertTrue(result["grader_valid"])
+                    self.assertFalse(result["measurement_valid"])
+                    self.assertFalse(result["pass"])
 
     def test_missing_or_invalid_grades_are_incomplete_not_behavioral_failures(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -135,15 +152,16 @@ class GuidanceGradeTests(unittest.TestCase):
 
 
 class GuidanceHarnessTests(unittest.IsolatedAsyncioTestCase):
-    async def run_fixture(self, state, include_grade=True, wrong_route=False):
-        class Session:
-            async def setup(self):
-                pass
-
+    async def run_fixture(
+        self, state, include_grade=True, wrong_route=False, raise_error=False
+    ):
         calls = []
+        private_detail = "private-offline-error-fixture"
 
-        async def trial_runner(spec, trial_dir, **kwargs):
+        async def trial_runner(spec, trial_dir):
             calls.append(spec)
+            if raise_error:
+                raise RuntimeError(private_detail)
             task = trial_dir.name
             if include_grade:
                 wrong = (
@@ -152,30 +170,15 @@ class GuidanceHarnessTests(unittest.IsolatedAsyncioTestCase):
                     else "did_not_route_to_a_different_teammate"
                 )
                 write_grade(trial_dir, task, wrong if wrong_route else None)
-            return types.SimpleNamespace(state=state, grader=None, error=None)
+            return types.SimpleNamespace(state=state, grader=None, error=private_detail)
 
-        modules = {}
-        for name in ("amplifier_evaluation", "amplifier_evaluation.harness"):
-            module = types.ModuleType(name)
-            module.__path__ = []
-            modules[name] = module
-        definitions = {
-            "ai_user": {"AIUser": Session},
-            "extractor": {"Extractor": Session},
-            "grader": {"Grader": Session},
-            "harness.loaders": {
-                "load_agent": lambda p: types.SimpleNamespace(id="fixture"),
-                "load_task": lambda p: object(),
-            },
-            "harness.schema": {
-                "TrialSpec": lambda **kwargs: types.SimpleNamespace(**kwargs)
-            },
-            "harness.trial": {"run_trial": trial_runner},
-        }
-        for name, values in definitions.items():
-            module = types.ModuleType("amplifier_evaluation." + name)
-            module.__dict__.update(values)
-            modules[module.__name__] = module
+        original_import = builtins.__import__
+
+        def reject_evaluation_runtime(name, *args, **kwargs):
+            if name.startswith("amplifier_evaluation"):
+                raise AssertionError("Evaluation SDK must not be imported")
+            return original_import(name, *args, **kwargs)
+
         with tempfile.TemporaryDirectory() as directory:
             args = types.SimpleNamespace(
                 agents_dir="unused",
@@ -189,28 +192,71 @@ class GuidanceHarnessTests(unittest.IsolatedAsyncioTestCase):
                 support_repo="support",
             )
             with (
-                patch.dict(sys.modules, modules),
+                patch("builtins.__import__", side_effect=reject_evaluation_runtime),
                 contextlib.redirect_stdout(io.StringIO()),
                 patch(
                     "socket.create_connection",
                     side_effect=AssertionError("Network forbidden"),
                 ),
             ):
-                result = await harness.run(args, trial_runner=trial_runner)
+                result = await harness.run(
+                    args,
+                    trial_runner=trial_runner,
+                    agent_loader=lambda path: types.SimpleNamespace(id="fixture"),
+                    task_loader=lambda path: object(),
+                    trial_spec_factory=lambda **kwargs: types.SimpleNamespace(**kwargs),
+                )
+            self.assertNotIn(
+                private_detail, (Path(directory) / "summary.json").read_text()
+            )
+            report = json.loads((Path(directory) / "comparison.json").read_text())
+            rerun = compare.compare(
+                Path(directory) / "with-guidance", Path(directory) / "without-guidance"
+            )
+            self.assertEqual(
+                rerun, report, "standalone comparison must preserve execution failures"
+            )
+            measurement_valid = (
+                state == "completed" and include_grade and not raise_error
+            )
+            for arm in ("with_guidance", "without_guidance"):
+                self.assertEqual(
+                    report["pass_both"][arm], measurement_valid and not wrong_route
+                )
+                for trial in report[arm].values():
+                    self.assertEqual(trial["measurement_valid"], measurement_valid)
+                    if state != "completed":
+                        self.assertFalse(trial["pass"])
+                        self.assertEqual(trial["execution_state"], state)
+            if not measurement_valid:
+                self.assertEqual(
+                    (Path(directory) / "comparison.md").read_text().count("INCOMPLETE"),
+                    4,
+                )
             self.assertEqual(len(calls), 4)
             self.assertTrue(
                 all("GITEA_TOKEN" not in call.launch_variables for call in calls)
             )
             return result
 
-    async def test_lowercase_failed_trials_make_run_fail(self):
+    async def test_failed_trials_with_valid_grades_make_reports_incomplete(self):
         self.assertEqual(await self.run_fixture("failed"), 1)
 
     async def test_run_without_offline_runner_is_disabled(self):
         with self.assertRaisesRegex(RuntimeError, "Live evaluation is unavailable"):
             await harness.run(types.SimpleNamespace())
 
-    async def test_cancelled_trials_make_run_fail(self):
+    async def test_runner_alone_cannot_construct_live_runtime(self):
+        with self.assertRaisesRegex(RuntimeError, "offline runner, loaders"):
+            await harness.run(types.SimpleNamespace(), trial_runner=lambda *args: None)
+
+    async def test_trial_exceptions_are_sanitized_and_fail_the_run(self):
+        with self.assertLogs(harness.log, level="WARNING") as logs:
+            self.assertEqual(await self.run_fixture("failed", raise_error=True), 1)
+        self.assertNotIn("private-offline-error-fixture", "\n".join(logs.output))
+        self.assertIn("RuntimeError", "\n".join(logs.output))
+
+    async def test_cancelled_trials_with_valid_grades_make_reports_incomplete(self):
         self.assertEqual(await self.run_fixture("cancelled"), 1)
 
     async def test_completed_trials_without_grades_make_run_fail(self):
@@ -224,7 +270,38 @@ class GuidanceHarnessTests(unittest.IsolatedAsyncioTestCase):
 
 
 class LiveEntryPointTests(unittest.TestCase):
-    def test_both_live_entry_points_fail_closed_before_external_commands(self):
+    def test_offline_compare_cli_writes_honest_partial_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for arm in ("with", "without"):
+                for task in compare.TASK_IDS:
+                    if arm == "without" and task == "02-owner-is-the-expert":
+                        continue
+                    failed = "never_asked_blair_to_decide" if arm == "with" else None
+                    write_grade(root / arm / task, task, failed)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(EVAL / "compare.py"),
+                    "--with-dir",
+                    str(root / "with"),
+                    "--without-dir",
+                    str(root / "without"),
+                    "--output",
+                    str(root / "report"),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads((root / "report/comparison.json").read_text())
+            self.assertEqual(
+                report["pass_both"], {"with_guidance": False, "without_guidance": False}
+            )
+            self.assertIn("INCOMPLETE", (root / "report/comparison.md").read_text())
+
+    def test_all_live_entry_points_fail_closed_before_external_commands(self):
         env = dict(
             os.environ,
             PATH="/nonexistent",
@@ -235,6 +312,7 @@ class LiveEntryPointTests(unittest.TestCase):
         for command in (
             ["/bin/bash", str(EVAL / "run.sh")],
             [sys.executable, str(EVAL / "harness.py")],
+            [sys.executable, str(EVAL / "eval-support/seed.py")],
         ):
             with self.subTest(command=command):
                 result = subprocess.run(

@@ -179,6 +179,30 @@ def _recipient(call: dict) -> str | None:
     return None
 
 
+def _execution_state(trial_dir: Path) -> str:
+    """Read explicit trial metadata only; missing metadata means grading only."""
+    states = []
+    for name in ("execution-state.json", "state.json"):
+        path = trial_dir / name
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text())
+            state = data.get("state") if isinstance(data, dict) else None
+        except (OSError, ValueError):
+            state = None
+        states.append(
+            state if state in ("completed", "failed", "cancelled") else "incomplete"
+        )
+    if not states:
+        return "unverified"
+    return (
+        "completed"
+        if all(state == "completed" for state in states)
+        else next(state for state in states if state != "completed")
+    )
+
+
 def collect_trial(trial_dir: Path, task_id: str | None = None) -> dict:
     trial_dir = Path(trial_dir)
     grader_path = trial_dir / "grader" / "grader_result.json"
@@ -204,6 +228,8 @@ def collect_trial(trial_dir: Path, task_id: str | None = None) -> dict:
 
     overall = grader.get("overall_score")
     grader_valid, critical_pass = _grade_status(grader, task_id or trial_dir.name)
+    execution_state = _execution_state(trial_dir)
+    measurement_valid = grader_valid and execution_state in ("completed", "unverified")
     evaluations = grader.get("evaluations", []) if grader_valid else []
     return {
         "trial_dir": str(trial_dir),
@@ -228,8 +254,11 @@ def collect_trial(trial_dir: Path, task_id: str | None = None) -> dict:
             {"recipient": _recipient(c), "body": ANSI.sub("", c.get("body", "") or "")}
             for c in calls
         ],
-        "pass": grader_valid and critical_pass and overall >= PASS_THRESHOLD,
+        "pass": measurement_valid and critical_pass and overall >= PASS_THRESHOLD,
         "grader_valid": grader_valid,
+        "measurement_valid": measurement_valid,
+        "execution_state": execution_state,
+        "completion_verified": execution_state == "completed",
         "critical_criteria_pass": critical_pass,
         "grader_missing": not grader_path.exists(),
     }
@@ -259,9 +288,10 @@ def compare(with_dir: Path, without_dir: Path) -> dict:
 def render_markdown(result: dict) -> str:
     lines = ["# Teamwork guidance-contribution eval -- pass-both comparison", ""]
     lines += [
-        "Independent variable: teamwork bundle WITH vs WITHOUT the guidance layer",
-        "(context pointer + teamwork-protocol skill). Same two tasks, same five",
-        "seeded members, run against both arms.",
+        "Comparison labels: teamwork bundle WITH vs WITHOUT the guidance layer",
+        "(context pointer + teamwork-protocol skill). This report scores supplied",
+        "artifacts; it does not verify arm provenance, identical setup, or a causal effect.",
+        "Without execution-state metadata, PASS means grading only; completion is unverified.",
         "",
         "**The headline is pass-both, not either task alone.** Task 01 rewards",
         "routing AWAY from the owner; task 02 rewards routing (or deciding) WITH",
@@ -282,9 +312,11 @@ def render_markdown(result: dict) -> str:
             score = trial["overall_score"]
             mark = (
                 "INCOMPLETE"
-                if not trial["grader_valid"]
+                if not trial["measurement_valid"]
                 else ("PASS" if trial["pass"] else "FAIL")
             )
+            if trial["measurement_valid"] and not trial["completion_verified"]:
+                mark += " (grading only)"
             recipients = (
                 ", ".join(c["recipient"] or "?" for c in trial["teamwork_send_calls"])
                 or "(none sent)"

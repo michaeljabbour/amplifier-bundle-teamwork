@@ -1,3 +1,5 @@
+# Draft reference configuration only; the supported live entrypoints are disabled.
+# Secure source transport and immutable arm manifests are required before use.
 requires:
   env:
     - ANTHROPIC_API_KEY

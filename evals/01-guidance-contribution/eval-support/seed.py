@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Seed the local Teamwork service with five fictional members and rich,
-distinguishing profiles for the guidance-contribution eval.
+"""Draft local-service fixture helpers; the seeding CLI is disabled.
 
-Run AFTER `python3 scripts/local_dev.py --port <PORT>` (from an
+These retained helpers describe five fictional member profiles for a future
+safe guidance-contribution runner. They are not invoked by offline comparison.
+
+The proposed seeding design assumed `python3 scripts/local_dev.py --port <PORT>` (from an
 amplifier-app-teamwork checkout) has created `.local/access.json` with member
-names and private login codes. This script:
+names and private login codes. The proposed steps were:
 
   1. Reads the login codes for the five fixed members (Alex, Blair, Casey,
      Drew, Ellis) from `access.json`.
@@ -21,14 +23,12 @@ tasks differ only in WHO is asking (the owner) and WHAT is being asked, never
 in who knows what. Task A's subject belongs to Casey; Task B's subject belongs
 to Drew, who is also that task's owner.
 
-Exit codes: 0 on success. Any failure raises with a plain message -- this
-script does not swallow errors, since a silently-unseeded profile would make
-the eval's routing signal meaningless.
+The CLI exits 2 before reading member codes, contacting a service, changing
+profiles, or printing a login code. Live transport and setup remain deferred.
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import sys
 import urllib.error
@@ -153,56 +153,13 @@ def load_access(access_json_path: str) -> dict[str, str]:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument(
-        "--port", type=int, required=True, help="port local_dev.py is listening on"
+    print(
+        "Live evaluation is unavailable: fixture seeding is disabled until "
+        "secure source transport and bounded setup are implemented. "
+        "No member code was read or profile changed; see ../README.md.",
+        file=sys.stderr,
     )
-    ap.add_argument(
-        "--access-json",
-        default=None,
-        help="path to access.json (default: <amplifier-app-teamwork checkout>/.local/access.json "
-        "resolved relative to --app-repo)",
-    )
-    ap.add_argument(
-        "--app-repo",
-        default="/workspace/amplifier-app-teamwork",
-        help="path to the amplifier-app-teamwork checkout (used to default --access-json)",
-    )
-    ap.add_argument(
-        "--owner",
-        default=None,
-        help="print this member's login code to stdout after seeding (for setup_teamwork.py)",
-    )
-    args = ap.parse_args()
-
-    access_path = args.access_json or f"{args.app_repo}/.local/access.json"
-    base_url = f"http://localhost:{args.port}"
-    origin = base_url
-
-    tokens = load_access(access_path)
-    missing = set(PROFILES) - set(tokens)
-    if missing:
-        raise SystemExit(f"access.json is missing expected members: {sorted(missing)}")
-
-    for name, value in PROFILES.items():
-        cookie = login(base_url, origin, name, tokens[name])
-        person = set_profile(base_url, origin, cookie, name, value)
-        if person.get("focus") != value["focus"]:
-            raise SystemExit(
-                f"profile for {name!r} did not read back as written: {person}"
-            )
-        print(
-            f"seeded profile: {name} -> focus={person.get('focus')!r}", file=sys.stderr
-        )
-
-    if args.owner:
-        if args.owner not in tokens:
-            raise SystemExit(f"--owner {args.owner!r} is not one of the seeded members")
-        # Deliberately the only line on stdout: consumed directly by the
-        # shell driving setup_teamwork.py (`OWNER_CODE=$(python3 seed.py ...)`).
-        print(tokens[args.owner])
-
-    return 0
+    return 2
 
 
 if __name__ == "__main__":

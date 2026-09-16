@@ -1,17 +1,20 @@
 # Eval 01: Does guidance change who gets asked?
 
-**Draft instrument; live execution is unavailable. No behavioral measurement has been run.**
+**Offline scoring and comparison are available. Live execution is disabled; no behavioral measurement has been run.**
 
-Both `run.sh` and the `harness.py` command exit with status 2 before reading
+The `run.sh`, `harness.py`, and `eval-support/seed.py` commands exit with status 2 before reading
 credentials, creating mirrors or starting trials. The previous launcher put a
 Gitea credential in process arguments, could mirror private service source into
 public repositories, and force-pushed fixed shared repository names. Its code
 remains in Git history, but those paths are no longer executable through this
 instrument. Approval alone does not fix these technical problems.
 
-The comparator and orchestration logic can be checked offline. The Python
+This change provides the comparator, critical-criterion gates, synthetic
+orchestration regressions, and the proposed task/rubric definitions. The Python
 `run()` function is retained as an internal test seam, exercised with synthetic
-trial runners; it is not a supported live entry point.
+trial runners, loaders and trial-spec factories; it imports no evaluation SDK
+and constructs no AIUser, Grader, Extractor, provider or DTU. It is not a
+supported live entry point.
 
 ## What this would measure
 
@@ -46,9 +49,16 @@ from hiding the routing failure the task is supposed to detect.
 
 Missing, malformed or incomplete critical grading data is reported as
 `INCOMPLETE`, never as a completed behavioral measurement. Failed/cancelled
-trials or missing valid grades produce harness status 1. A completed, validly
+trials or missing valid grades produce harness status 1 and `INCOMPLETE` reports,
+even when grade files remain after a failed or cancelled trial. A completed, validly
 graded run may return status 0 while `pass_both` is false: failed behavior and
 failed execution are different outcomes.
+
+The offline harness writes a minimal `execution-state.json` for each trial.
+Standalone comparison respects that file and the evaluation library's native
+`state.json` when present, so recomparison cannot turn an incomplete run into
+a pass. Without execution metadata, the report explicitly labels its results
+as grading only and leaves execution completion unverified.
 
 The comparator reads the current `tool:pre.data.tool_input` shape and retains
 legacy `arguments`/`input` support. Recipient extraction is supporting evidence;
@@ -94,8 +104,10 @@ that design requires resolving every item below.
    temporary runtime and credential is cleaned up. Calibration and paid trials
    remain unperformed; offline tests cannot establish model behavior.
 
-These are implementation and validation gaps, not permission prompts. The PR
-must remain unready until the instrument has a supported safe execution path.
+These are deferred implementation and validation requirements for a future
+live runner. They do not prevent using the offline comparator or running its
+synthetic regressions. Merging this offline instrument does not enable trials,
+validate the draft installation profiles, or establish a guidance effect.
 
 ## Offline validation
 
@@ -109,7 +121,7 @@ python scripts/validate_bundle.py
 
 The focused tests cover critical-criterion false positives, current tool input,
 failed/cancelled trials, incomplete grades, valid measurements with bad model
-behavior, and both disabled CLI entry points. They use synthetic files and
+behavior, and all three disabled live entry points. They use synthetic files and
 stub runners; no DTU, Gitea instance, provider or Teamwork service is contacted.
 
 For existing private trial artifacts, `compare.py` remains available:
