@@ -196,6 +196,71 @@ remove it yourself once you have confirmed you no longer need it.
 With no project configured the hook mounts **inert** -- it registers nothing and sends
 nothing -- until a session binds one.
 
+### Automatic decision detection (`detect_decisions`) -- off unless you ask
+
+**This is the one setting that makes the bundle call a model on its own and publish
+without you.** Read this section before enabling it; everything else in this bundle only
+moves text you already saw.
+
+```yaml
+# ~/.amplifier/settings.yaml
+overrides:
+  hooks-teamwork:
+    config:
+      share_visible_turns: true
+      detect_decisions: true      # default: false
+```
+
+Absent or `false` means **genuinely nothing**: no model call, no state written, no cost.
+Any other value is rejected at mount with the same explicit-opt-in error as
+`share_visible_turns`, rather than being guessed at.
+
+**What it does when on.** Some decisions are never asked about -- a session reaches a
+fork, picks correctly, acts, and the reasoning disappears when the session ends. With
+this on, the hook watches for those and publishes them to the project as attributed
+knowledge. The two scenarios that define what qualifies are
+[`08`](docs/scenarios/08-the-decision-the-session-made-itself.md) and its twin
+[`08b`](docs/scenarios/08b-the-path-taken-that-binds-nothing.md); they are the
+specification, not illustrations.
+
+**It spends your model budget.** Detection runs a short, separate in-process Amplifier
+session -- your configured provider, preferring the `fast` routing role -- on turns that
+trigger it. It never blocks or delays your turn, and a failure is logged and dropped
+rather than raised. But it is real spend against your own key, on a schedule you do not
+directly control, and that is the honest cost of the feature.
+
+**When it looks.** Two moments only:
+
+| signal | what it catches |
+|---|---|
+| a delegation about to be made | the moment a choice surfaces as work handed elsewhere |
+| the session ending | the retrospective -- what actually survived rather than what was momentarily decided |
+
+**What it cannot see, stated plainly:** a session that decides something and then does
+the work *itself*, with no delegation, is invisible to both signals. That is a known
+limit, not a bug to report.
+
+**What reaches the project.** One insight per detected decision: the claim, its basis,
+confidence, what it does *not* establish, and a locator for the window it came from. It
+is attributed to **this** session -- the judge never writes, so a record can never be
+attributed to the judgment session rather than to you.
+
+**It will sometimes be wrong.** Measured against the scenarios' own cases on
+`claude-haiku-4-5`: six windows whose reasons are stated, four runs -- one false positive
+across those runs; six windows whose reasons are *not* stated, three runs -- none. The
+design deliberately prefers missing a decision over publishing a wrong one, because the
+service has no retired state and no forward pointer yet: **a wrong record cannot be
+withdrawn, only added to.**
+
+**Duplicates.** The same decision surfacing at several later delegations is recorded once,
+matched on exact claim text. Paraphrases of the same decision are not caught. And when a
+write's outcome is genuinely unknown -- neither accepted nor refused -- it is treated as
+recorded and never retried, because retrying is what creates the duplicate. The attempted
+record id is logged so you can read it back and reconcile.
+
+To turn it off, remove the key or set it to `false`, then start a new session; a running
+session keeps the configuration it started with.
+
 ### How much the hook says about what arrived
 
 When project records the user has not been told about are accepted into a turn, the hook
