@@ -1,0 +1,52 @@
+name: eval01-ask-the-expert
+description: >
+  Ubuntu 24.04 with uv + git. Redirects three git URLs to local Gitea mirrors:
+  the teamwork bundle (arm selected PER TRIAL via the TEAMWORK_REPO launch
+  variable -- amplifier-bundle-teamwork-with-guidance or
+  amplifier-bundle-teamwork-without-guidance), the Teamwork service source
+  (amplifier-app-teamwork, fixed -- the service under test is the same
+  environment for both arms; only the bundle differs), and this eval's own
+  seed script (fixed). Writes /workspace/owner_name.txt so the shared
+  install.yaml (agent-level, identical for both tasks) knows which of the
+  five seeded members is THIS task's owner without needing a second launch
+  variable.
+
+base:
+  image: ubuntu:24.04
+
+url_rewrites:
+  auth:
+    username: admin
+    token_var: GITEA_TOKEN
+  rules:
+    - match: github.com/michaeljabbour/amplifier-bundle-teamwork
+      target: ${GITEA_URL}/admin/${TEAMWORK_REPO}
+    - match: github.com/michaeljabbour/amplifier-app-teamwork
+      target: ${GITEA_URL}/admin/${APP_REPO}
+    - match: github.com/microsoft/amplifier-teamwork-eval-support
+      target: ${GITEA_URL}/admin/${SUPPORT_REPO}
+
+passthrough:
+  allow_external: true
+  services:
+    - name: anthropic
+      key_env: ANTHROPIC_API_KEY
+
+provision:
+  setup_cmds:
+    - apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates python3 python3-pip && rm -rf /var/lib/apt/lists/*
+    - curl -LsSf https://astral.sh/uv/install.sh | sh
+    - mkdir -p /workspace
+    # Task A's owner: Blair. Blair is NOT the domain expert on the subject
+    # this task asks about (see task.yaml) -- the routing question is
+    # whether the agent recognizes that and routes to Casey instead of
+    # asking Blair (the running user) to decide it, or guessing.
+    - echo -n Blair > /workspace/owner_name.txt
+
+readiness:
+  - name: uv-installed
+    command: "PATH=/root/.local/bin:$PATH uv --version"
+  - name: workspace-exists
+    command: "test -d /workspace && echo OK"
+  - name: owner-file-written
+    command: "test -s /workspace/owner_name.txt && echo OK"

@@ -1,0 +1,46 @@
+name: eval01-owner-is-the-expert
+description: >
+  Same environment shape as ../01-ask-the-expert/profile.yaml (see that file
+  for the url_rewrites rationale). The only difference is the owner written
+  to /workspace/owner_name.txt: this task's owner is Drew, who is also the
+  domain expert on the subject this task asks about (see task.yaml) -- the
+  routing question this task tests is the mirror image of 01's.
+
+base:
+  image: ubuntu:24.04
+
+url_rewrites:
+  auth:
+    username: admin
+    token_var: GITEA_TOKEN
+  rules:
+    - match: github.com/michaeljabbour/amplifier-bundle-teamwork
+      target: ${GITEA_URL}/admin/${TEAMWORK_REPO}
+    - match: github.com/michaeljabbour/amplifier-app-teamwork
+      target: ${GITEA_URL}/admin/${APP_REPO}
+    - match: github.com/microsoft/amplifier-teamwork-eval-support
+      target: ${GITEA_URL}/admin/${SUPPORT_REPO}
+
+passthrough:
+  allow_external: true
+  services:
+    - name: anthropic
+      key_env: ANTHROPIC_API_KEY
+
+provision:
+  setup_cmds:
+    - apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates python3 python3-pip && rm -rf /var/lib/apt/lists/*
+    - curl -LsSf https://astral.sh/uv/install.sh | sh
+    - mkdir -p /workspace
+    # Task B's owner: Drew. Drew IS the domain expert on this task's subject.
+    # A harness that learned "never bother the owner" from task A fails this
+    # one confidently -- that's the whole point of running the pair.
+    - echo -n Drew > /workspace/owner_name.txt
+
+readiness:
+  - name: uv-installed
+    command: "PATH=/root/.local/bin:$PATH uv --version"
+  - name: workspace-exists
+    command: "test -d /workspace && echo OK"
+  - name: owner-file-written
+    command: "test -s /workspace/owner_name.txt && echo OK"

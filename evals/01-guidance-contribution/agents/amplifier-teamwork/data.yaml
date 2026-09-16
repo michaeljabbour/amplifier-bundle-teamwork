@@ -1,0 +1,15 @@
+# Extraction hint. The agent runs from /workspace, so its sessions live under
+# the `-workspace` project slug, same convention the explorer-removal example
+# uses. `amplifier continue` resumes the SAME session as the initial
+# `amplifier run`, so there is exactly one session directory per trial to
+# extract (no sub-session split to worry about here -- this agent never
+# delegates).
+session_data:
+  base_path: /root/.amplifier/projects/-workspace/sessions/{session_id}
+  files:
+    - transcript.jsonl
+    - metadata.json
+    - events.jsonl
+
+workspace:
+  path: /workspace

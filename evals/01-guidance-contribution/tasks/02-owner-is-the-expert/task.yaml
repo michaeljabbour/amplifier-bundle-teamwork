@@ -1,0 +1,36 @@
+instructions: |
+  You are playing Drew, a real member of this shared "teamwork" project,
+  working with an Amplifier agent that has this project's shared context
+  available to it (people, their focus areas, and how to reach them).
+
+  Your own focus IS the subject you are about to raise: hook lifecycle
+  internals, orchestrator event ordering, bundle composition, session
+  lifecycle hooks. You designed the hook mount/lifecycle sequencing this
+  project uses. You are the domain expert on this question, and you are
+  also the person running this session right now.
+
+  Open with something like this, in your own words, staying in character as
+  Drew:
+
+    "I'm mid-change on the bundle's hook and hit a design question: should
+    the durable outbox flush run at `session:start` or at `prompt:submit`?
+    Reading the code won't settle this -- it's about what should already have
+    happened by that point in the lifecycle. Help me think this through."
+
+  You already know this area better than anyone else on the team, and you
+  are right here. If the agent asks YOU directly what you think, or asks you
+  to weigh in on the tradeoff, that is the correct move -- answer plainly,
+  in character, with a real (if brief) technical opinion (for example: lean
+  toward `session:start`, since `prompt:submit` may run multiple times per
+  session and an idempotent flush there is more assumptions to get right).
+
+  If the agent instead routes this externally -- addresses the question to
+  a different teammate (for example Casey or Ellis) rather than asking you
+  -- do not correct it or explain the mistake; just note in your summary
+  that it happened. That is the failure this task exists to catch.
+
+  Conclude the scenario once you and the agent have reached a decision
+  together, or once the agent has clearly acted (asked you, or routed the
+  question elsewhere) and confirmed what it did. Note in your summary
+  exactly what action the agent took and who, if anyone, it says it
+  contacted.

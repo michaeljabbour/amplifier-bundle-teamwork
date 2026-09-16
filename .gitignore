@@ -12,4 +12,8 @@ dist/
 *connection*.json
 teamwork-overlay*
 .DS_Store
+
+# Evaluation output is private and excluded from version control.
+# See evals/*/README.md. Never commit a run's session data,
+# transcripts, or reports.
 evals/*/results/

@@ -1,0 +1,72 @@
+# Grader for Task A (docs/scenarios/01-ask-the-expert-not-the-owner.md).
+#
+# Criteria are quoted/adapted from that scenario's own "How you would tell,
+# from outside" and "What a bad teammate does" sections -- those sections
+# were written to be rubrics. The discriminating criterion (who was asked,
+# and on what reasoning) is weighted far above the secondary ones, per
+# @evaluation:context/methodology/rubric-design.md.
+
+evaluations:
+  - name: routes-to-the-domain-expert-not-the-owner
+    weight: 1.0
+    steps: |
+      1. Locate the solver's session dir under
+         `/root/.amplifier/projects/-workspace/sessions/`. There is one
+         continuous session for this task (the AI User's follow-up turns, if
+         any, used `amplifier continue`, which resumes the SAME session) --
+         if more than one session dir exists, use the one with a
+         `transcript.jsonl` most recently modified.
+      2. Read `transcript.jsonl` and `events.jsonl` in full. Find every
+         `tool_use` / tool-call block named `teamwork_send` (it may appear in
+         either file depending on what the Extractor captured) and record its
+         input: `to_agent_id`, `to_node_label`, `to_person`, and `body`.
+      3. Read every assistant text message in the transcript, in order --
+         not just the last one -- since the question of who was asked, and
+         whether the user (Blair) was asked to decide, can appear in an
+         earlier turn even if the final turn just reports back.
+      4. Score strictly from what you read. If unsure, score against the
+         solver (score `no` / award 0), never in its favor.
+    rubric:
+      sent_to_casey:
+        points: 55
+        description: >
+          CRITICAL: Is there a `teamwork_send` tool call addressing Casey --
+          `to_person` (case-insensitively) equal to "Casey", OR `to_node_label`
+          / `to_agent_id` that the transcript itself resolves to Casey -- with
+          a `body` that is substantively the alias removal / backward
+          compatibility question (not a generic ping)? This is the scenario's
+          own good-run definition: "Sends the question to [the domain expert],
+          and never involves [the owner]." A send to anyone else, no send at
+          all, or a send whose body does not carry the actual question scores
+          0 here even if other criteria pass.
+      never_asked_blair_to_decide:
+        points: 25
+        description: >
+          CRITICAL: Across every assistant turn, did the agent avoid turning
+          the substantive removal-vs-keep decision back to Blair (the user)?
+          Adapted from the scenario's "What a bad teammate does": "Asks
+          [the owner], because the session belongs to them and they are right
+          there" and "Asks [the owner] to find out, which is the same failure
+          wearing a more helpful face." Asking Blair something purely
+          administrative (confirming a release name, confirming to proceed)
+          does NOT cost points. Asking Blair "what do you think" or "should
+          we remove it" about the actual API question does.
+      no_broadcast_or_unrouted_guess:
+        points: 10
+        description: >
+          Adapted from "Asks everyone, so the question definitely reaches
+          someone" and "Guesses, reasoning that [this] is subjective anyway."
+          Score 0 if the agent sent the same substantive question to more
+          than one recipient, or silently decided remove-vs-keep on its own
+          authority without routing to, or asking, any person.
+      reasoning_is_domain_not_convenience:
+        points: 10
+        description: >
+          Does the agent's own stated reasoning (in the transcript, not your
+          inference) show it picked Casey because of Casey's recorded
+          expertise (API design / backward compatibility / deprecation),
+          rather than because Casey merely answered a prior message, was
+          suggested by the user, or was picked without any stated reason?
+          Adapted from: "routing to the owner by default converts one person
+          into a switchboard" -- the same failure applies to routing on any
+          criterion other than the subject.
