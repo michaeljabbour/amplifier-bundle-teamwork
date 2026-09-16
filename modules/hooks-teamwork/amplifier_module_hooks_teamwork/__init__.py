@@ -1494,7 +1494,8 @@ class RecordInsightTool:
 
     async def execute(self, input):
         from amplifier_core.models import ToolResult
-        claim = (input.get("claim") or "").strip()
+        raw_claim = input.get("claim")
+        claim = raw_claim.strip() if isinstance(raw_claim, str) else ""
         basis = input.get("basis")
         confidence = input.get("confidence")
         limitations = input.get("limitations")
@@ -1532,11 +1533,11 @@ class RecordInsightTool:
                 {"operations": [{"op": "insight.upsert", "id": record_id, "expected_version": 0, "data": data}]}, uid())
         except SyncError as error:
             if error.status == 403:
-                reason = ("this project's service does not allow this session to record knowledge "
-                          "(it needs the shared-write permission)")
+                reason = ("this project's service did not authorize this session to record knowledge; "
+                          "check its session-write permission and the service's knowledge-write support")
             elif error.status == 422:
                 server_message = (error.body.get("error") or {}).get("message") if isinstance(error.body, dict) else None
-                reason = ("the project service rejected the record: " + server_message if server_message
+                reason = ("the project service rejected the record: " + self.hook.clean(server_message) if server_message
                           else "the project service rejected the record")
             elif error.status == 409:
                 reason = "a record with that id already exists; this is a bug in the tool, not something you did"
@@ -1547,7 +1548,7 @@ class RecordInsightTool:
             return ToolResult(success=False, error={"message": "Not recorded: " + reason})
         return ToolResult(success=True, output={
             "recorded": record_id, "title": title or claim[:100],
-            "note": "Visible to the project. It can be revised by you; every earlier version is preserved."})
+            "note": "Visible to the project as a new insight. This tool does not edit earlier records."})
 
 
 async def mount(coordinator, config=None):

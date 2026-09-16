@@ -1852,11 +1852,37 @@ class RecordInsight(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.success)
         self.assertEqual(client.requests, [])
 
-    async def test_a_403_names_the_permission_rather_than_a_traceback(self):
+    async def test_a_403_does_not_request_broader_shared_write_permission(self):
         hook, client = self.build(fail_status=403)
         result = await RecordInsightTool(hook).execute(self.valid_input())
         self.assertFalse(result.success)
-        self.assertIn("shared-write permission", result.error["message"])
+        self.assertIn("session-write permission", result.error["message"])
+        self.assertNotIn("shared-write", result.error["message"])
+
+    async def test_non_string_claim_is_refused_before_any_request(self):
+        hook, client = self.build()
+        result = await RecordInsightTool(hook).execute(self.valid_input(claim={"text": "not a string"}))
+        self.assertFalse(result.success)
+        self.assertEqual(client.requests, [])
+
+    async def test_service_validation_error_cannot_echo_the_connection_credential(self):
+        hook, _ = self.build(fail_status=422, fail_body={"error": {
+            "message": "invalid value test-credential-no-real-secret",
+        }})
+        result = await RecordInsightTool(hook).execute(self.valid_input())
+        self.assertFalse(result.success)
+        self.assertNotIn(hook.connection["token"], result.error["message"])
+        self.assertIn("[REDACTED CREDENTIAL]", result.error["message"])
+
+    async def test_all_outbound_text_fields_redact_the_connection_credential(self):
+        hook, client = self.build()
+        secret = hook.connection["token"]
+        result = await RecordInsightTool(hook).execute(self.valid_input(
+            claim="claim " + secret, title="title " + secret, limitations="limit " + secret,
+            evidence=[{"kind": "external", "uri": "fixture://" + secret, "label": "label " + secret}],
+        ))
+        self.assertTrue(result.success)
+        self.assertNotIn(secret, json.dumps(client.requests))
 
     async def test_source_session_id_is_the_hooks_own_and_cannot_be_overridden(self):
         hook, client = self.build()

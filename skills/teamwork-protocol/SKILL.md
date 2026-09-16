@@ -161,9 +161,10 @@ If you have nothing to cite, you have a hunch — keep working until you have a 
 reason to. Most turns produce nothing worth keeping; a session that records something
 every time has stopped discriminating, and the cost lands on every future reader.
 
-**Correcting one.** You may revise an insight you authored — and you will need to, because
-`limitations` is exactly what a later finding corrects. Earlier versions are preserved, so
-a revision adds rather than erases.
+**Correcting one.** This tool creates a new insight; it does not expose record editing.
+When a later finding changes an earlier claim, create a correction with a record evidence
+reference to the original, and state what changed. The service also supports versioned
+revisions by an authorized author, but that operation is not exposed by this tool.
 
 Two limits, named because you will meet them: a superseded record has no way to point
 forward at what replaced it, and a reviewer who is asked for a verdict cannot record one

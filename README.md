@@ -257,7 +257,7 @@ bearer token.
 
 The native flow above replaces this manual enrollment path for local-browser users. The following compatibility helper remains available for existing overlays and development; it requires Python 3.11+ and Git.
 
-**This path cannot record knowledge.** `setup_teamwork.py` requests `context:read` and `session:write` only, while writing an `idea` or `insight` requires `shared:write`. So a session enrolled this way can *read* the project's accumulated knowledge and not add to it: `teamwork_record_insight` refuses with *"this project's service does not allow this session to record knowledge (it needs the shared-write permission)"*. Every other tool works normally. The native flow above mints all three scopes under one consent checkbox and has no such limit. Measured, not inferred -- a container enrolled by running this script against the live service was refused on a well-formed record.
+`setup_teamwork.py` requests `context:read` and `session:write`. Recording an insight with this narrow credential requires a service containing [app PR #53](https://github.com/michaeljabbour/amplifier-app-teamwork/pull/53), which authorizes a participant's own knowledge records with `session:write`. The source session must belong to the actual credential; another participant's records remain protected. Older services can refuse the write. Native enrollment and this compatibility helper do not need broader `shared:write` consent for this operation on an updated service.
 
 ### 1. Keep a persistent local checkout
 
