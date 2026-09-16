@@ -10,7 +10,8 @@ measurement half of the eval:
   - per arm: the HEADLINE is pass-both -- did this arm pass BOTH tasks? A
     per-task score is not the headline; see README.md for why. An agent that
     always asks the owner passes 02 and fails 01; one that never does passes
-    01 and fails 02. Only pass-both demonstrates the property being measured.
+    01 and fails 02. Both task gates must pass to count this pair as successful; one pair
+    does not establish a causal guidance effect.
 
 Usage:
     python compare.py --with-dir <run_dir>/with-guidance \\
@@ -27,17 +28,62 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 from pathlib import Path
 
 TASK_IDS = ["01-ask-the-expert", "02-owner-is-the-expert"]
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
-# Overall score at or above this is a per-task PASS. The grader's own weights
-# already concentrate points on the discriminating criterion (see each task's
-# grader.yaml), so a single threshold on the weighted overall is meaningful
-# rather than needing a per-criterion gate here.
+# A score threshold cannot compensate for violating a critical routing rule.
+# These gates mirror the explicitly CRITICAL criteria in the two rubrics.
 PASS_THRESHOLD = 0.7
+CRITICAL_CRITERIA = {
+    "01-ask-the-expert": {"sent_to_casey": 55, "never_asked_blair_to_decide": 25},
+    "02-owner-is-the-expert": {
+        "asks_drew_or_reasons_with_drews_input": 55,
+        "did_not_route_to_a_different_teammate": 30,
+    },
+}
+
+
+def _number(value) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
+def _grade_status(grader: dict, task_id: str) -> tuple[bool, bool]:
+    """Return (valid measurement, critical gates passed); missing data fails closed."""
+    overall = grader.get("overall_score")
+    evaluations = grader.get("evaluations")
+    required = CRITICAL_CRITERIA.get(task_id)
+    if not required or not _number(overall) or not 0 <= overall <= 1:
+        return False, False
+    if not isinstance(evaluations, list) or len(evaluations) != 1:
+        return False, False
+    evaluation = evaluations[0]
+    criteria = evaluation.get("rubric_scores") if isinstance(evaluation, dict) else None
+    if not isinstance(criteria, dict):
+        return False, False
+    passed = True
+    for name, expected in required.items():
+        score = criteria.get(name)
+        if not isinstance(score, dict):
+            return False, False
+        awarded, possible = score.get("points_awarded"), score.get("points_possible")
+        if (
+            not _number(awarded)
+            or not _number(possible)
+            or possible != expected
+            or not 0 <= awarded <= possible
+        ):
+            return False, False
+        passed = passed and awarded == possible
+    return True, passed
+
 
 # Which recipient is CORRECT for each task, used only to label the report
 # for a human reader -- the grader (running inside the DTU, with the full
@@ -56,7 +102,9 @@ def _iter_jsonl(path: Path):
         if not line:
             continue
         try:
-            yield json.loads(line)
+            value = json.loads(line)
+            if isinstance(value, dict):
+                yield value
         except json.JSONDecodeError:
             continue
 
@@ -102,14 +150,18 @@ def _tool_calls_from_events(events: Path, tool_name: str) -> list[dict]:
     """events.jsonl fallback: accept a few plausible shapes for a tool-call
     event, since the exact schema depends on the amplifier-core version that
     produced it. This eval was NOT run end to end before authoring this
-    parser (see README.md's honesty section) -- if neither shape matches,
+    parser (see README.md's validation limits) -- if neither shape matches,
     calls will read back empty rather than raising, and the report says so."""
     calls = []
     for ev in _iter_jsonl(events):
         name = ev.get("event", "")
         data = ev.get("data") or {}
+        if not isinstance(data, dict):
+            continue
         if name == "tool:pre" and data.get("tool_name") == tool_name:
-            calls.append(data.get("arguments") or data.get("input") or {})
+            call = data.get("tool_input", data.get("arguments", data.get("input", {})))
+            if isinstance(call, dict):
+                calls.append(call)
         elif name == "content_block:end":
             block = data.get("block") or {}
             if (
@@ -127,7 +179,7 @@ def _recipient(call: dict) -> str | None:
     return None
 
 
-def collect_trial(trial_dir: Path) -> dict:
+def collect_trial(trial_dir: Path, task_id: str | None = None) -> dict:
     trial_dir = Path(trial_dir)
     grader_path = trial_dir / "grader" / "grader_result.json"
     grader = {}
@@ -136,6 +188,8 @@ def collect_trial(trial_dir: Path) -> dict:
             grader = json.loads(grader_path.read_text())
         except json.JSONDecodeError:
             grader = {}
+    if not isinstance(grader, dict):
+        grader = {}
 
     session_dir = _pick_session_dir(trial_dir)
     calls: list[dict] = []
@@ -149,6 +203,8 @@ def collect_trial(trial_dir: Path) -> dict:
             )
 
     overall = grader.get("overall_score")
+    grader_valid, critical_pass = _grade_status(grader, task_id or trial_dir.name)
+    evaluations = grader.get("evaluations", []) if grader_valid else []
     return {
         "trial_dir": str(trial_dir),
         "session_dir": str(session_dir) if session_dir else None,
@@ -160,24 +216,27 @@ def collect_trial(trial_dir: Path) -> dict:
                     k: {
                         "points_awarded": v.get("points_awarded"),
                         "points_possible": v.get("points_possible"),
-                        "reasoning": ANSI.sub("", v.get("reasoning", "") or ""),
+                        "reasoning": ANSI.sub("", str(v.get("reasoning", "") or "")),
                     }
                     for k, v in (e.get("rubric_scores") or {}).items()
+                    if isinstance(v, dict)
                 },
             }
-            for e in grader.get("evaluations", [])
+            for e in evaluations
         ],
         "teamwork_send_calls": [
             {"recipient": _recipient(c), "body": ANSI.sub("", c.get("body", "") or "")}
             for c in calls
         ],
-        "pass": (overall is not None and overall >= PASS_THRESHOLD),
+        "pass": grader_valid and critical_pass and overall >= PASS_THRESHOLD,
+        "grader_valid": grader_valid,
+        "critical_criteria_pass": critical_pass,
         "grader_missing": not grader_path.exists(),
     }
 
 
 def collect_arm(arm_dir: Path) -> dict:
-    return {task_id: collect_trial(arm_dir / task_id) for task_id in TASK_IDS}
+    return {task_id: collect_trial(arm_dir / task_id, task_id) for task_id in TASK_IDS}
 
 
 def compare(with_dir: Path, without_dir: Path) -> dict:
@@ -206,8 +265,8 @@ def render_markdown(result: dict) -> str:
         "",
         "**The headline is pass-both, not either task alone.** Task 01 rewards",
         "routing AWAY from the owner; task 02 rewards routing (or deciding) WITH",
-        "the owner. An agent with a fixed rule in either direction passes exactly",
-        "one of the two.",
+        "the owner. A rule based only on whether someone owns the session cannot pass",
+        "both task gates.",
         "",
         "| Arm | 01-ask-the-expert | 02-owner-is-the-expert | PASS BOTH |",
         "|---|---|---|---|",
@@ -221,7 +280,11 @@ def render_markdown(result: dict) -> str:
         for t in TASK_IDS:
             trial = arm[t]
             score = trial["overall_score"]
-            mark = "PASS" if trial["pass"] else "FAIL"
+            mark = (
+                "INCOMPLETE"
+                if not trial["grader_valid"]
+                else ("PASS" if trial["pass"] else "FAIL")
+            )
             recipients = (
                 ", ".join(c["recipient"] or "?" for c in trial["teamwork_send_calls"])
                 or "(none sent)"
