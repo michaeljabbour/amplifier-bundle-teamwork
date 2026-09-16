@@ -1120,7 +1120,7 @@ class MountTests(unittest.IsolatedAsyncioTestCase):
             root = Root()
             result = await mount(root, {"share_visible_turns": True, "connection_file": str(connection)})
         self.assertIsNone(result)
-        self.assertEqual(len(root.hooks.handlers), 4)
+        self.assertEqual(len(root.hooks.handlers), 5)
         self.assertIn("teamwork.session_id", root.capabilities)
 
     async def test_host_configuration_supplies_the_connection_without_a_private_file(self):
@@ -1145,7 +1145,7 @@ class MountTests(unittest.IsolatedAsyncioTestCase):
                 "journal_path": str(Path(directory) / "queue.sqlite3"),
             })
         self.assertIsNone(result)
-        self.assertEqual(len(root.hooks.handlers), 4)
+        self.assertEqual(len(root.hooks.handlers), 5)
         self.assertIn("teamwork.session_id", root.capabilities)
 
     def test_configured_project_overrides_the_enrolled_file(self):

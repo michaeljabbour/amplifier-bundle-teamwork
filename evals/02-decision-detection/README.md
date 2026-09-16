@@ -76,3 +76,51 @@ permanently, because an automatic record has no undo yet. The console summary an
 JSON report under `results/` (gitignored -- run output is never committed) both lead
 with the **false-positive count** (SKIP cases judged RECORD) as a separate, named
 number, rather than folding everything into one accuracy figure that could hide it.
+
+## The harder set -- `cases_unstated.py` / `run_unstated.py`
+
+The six cases above all STATE their deciding reason in the assistant's own text.
+`docs/scenarios/08b`'s own open questions name this as letting the eval off easy: in a
+real transcript the reason is often never spoken -- the session just acts. This second
+set holds the same six underlying situations (mostly) but strips every stated
+"because", leaving only the action taken.
+
+`G` and `H` are additionally a **near-identical pair**: the assistant's response text
+is byte-for-byte identical between them (constructing a library call instead of
+shelling out); only the preceding `user_prompt` differs (a stated privacy requirement
+vs. a stated CLI/port conflict). If a detector cannot separate these two, that is not
+necessarily a prompt bug -- 08b's own open questions ask whether the distinction can be
+drawn from a turn's text at all.
+
+Run it the same way:
+
+```sh
+/path/to/amplifier-environment/bin/python evals/02-decision-detection/run_unstated.py
+```
+
+**Results actually observed** (claude-haiku-4-5, live runs on 2026-09-16):
+
+| Set | Runs | Correct | False positives (costly) | Misses (cheap) |
+|-----|------|---------|---------------------------|-----------------|
+| Original (`run.py`), stated reasons | 4 | 6/6, 5/6, 6/6, 6/6 | 1 run had 1 (case B) | 0 |
+| Unstated (`run_unstated.py`), after the case-I fix below | 3 | 6/6, 6/6, 6/6 | 0 | 0 |
+
+**Precision does not visibly collapse on unstated reasons** in these runs -- the
+near-identical G/H pair was correctly separated in every run, including on the
+contingent member (H), which is the direction that would have been the costly kind of
+mistake. The one false positive observed anywhere in this eval was on the *original*,
+self-explaining set (case B, one run out of four), which is a useful caution on its
+own: even the "easy" half of this eval is not perfectly reliable turn to turn with a
+small, fast judge model -- worth weighing when deciding whether `detect_decisions`
+should default toward a stronger model role than `"fast"` in production.
+
+**A real, reproducible construction defect was found and fixed, not hidden.** An
+earlier version of case `I` used an empty `user_prompt` (the same shape `cases.py`'s
+own `C` and `D` already use) paired with a single short assistant line. That specific
+combination made the small judge model repeatedly respond that no window had been
+given at all -- an unparseable refusal, not a wrong verdict -- in 3 of 4 live retries.
+Giving it a minimal, still reason-free `user_prompt` made it fully stable (4/4, then
+3/3 more in the full-set reruns above). This is documented in `cases_unstated.py`
+itself rather than silently smoothed over, because it is a real limit worth knowing:
+an empty `user_prompt` combined with very little assistant text is a fragile window
+shape for this judge model, independent of anything about stated-vs-unstated reasons.

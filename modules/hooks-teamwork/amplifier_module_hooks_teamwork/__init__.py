@@ -17,13 +17,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import reports
+from . import decision_judge, reports
 from .service_url import validate_service_url
 
 # The old default origin, severed in the hard cutover: everyone re-enrolls
 # against the new default via `amplifier update` then `teamwork_connect`.
 RETIRED_HOSTS = ("team.amplifier.run",)
 RETIRED_MESSAGE = "Teamwork moved \u2014 run `amplifier update`, then `teamwork_connect`."
+
+# The two tool names a delegation call is known to arrive under (see
+# docs/scenarios/08-the-decision-the-session-made-itself.md's open questions:
+# the `pre` of a delegation call is one of the two signals this module acts
+# on). "task" is kept alongside "delegate" because some hosts still expose
+# the older alias; matching both costs nothing and misses less.
+DELEGATION_TOOL_NAMES = ("delegate", "task")
 
 __amplifier_module_type__ = "hook"
 logger = logging.getLogger(__name__)
@@ -92,6 +99,13 @@ REPORT_BATCH = 5
 # durable copy, rather than silently retrying every turn for the life of the
 # session.
 MIRROR_MAX_ATTEMPTS = 5
+# The local, per-session buffer of completed turns kept for decision detection
+# (see decision_judge.py and docs/scenarios/08). Bounded well above
+# decision_judge.MAX_WINDOW_TURNS (10) so several delegation calls close
+# together, each advancing the watermark, still leave enough history for the
+# next window; anything already behind the watermark is dropped as it goes
+# (see TeamworkHook.detect_decision), so this bound is a ceiling, not a target.
+MAX_DECISION_TURN_BUFFER = 20
 
 
 def verbosity(config):
@@ -243,6 +257,13 @@ class Journal:
         with self.connect() as conn, conn:
             conn.execute("CREATE TABLE IF NOT EXISTS state (id TEXT PRIMARY KEY, body TEXT NOT NULL)")
             conn.execute("CREATE TABLE IF NOT EXISTS outbox (seq INTEGER PRIMARY KEY AUTOINCREMENT, session TEXT, endpoint TEXT, body TEXT, key TEXT UNIQUE)")
+            # Decision-detection state (docs/scenarios/08 and its twin 08b): a
+            # watermark bounding how much is re-examined, and fingerprints of
+            # what has already been recorded, bounding duplicate publication.
+            # Same db file and the same connect() as outbox above -- adding
+            # tables here rather than opening a second store.
+            conn.execute("CREATE TABLE IF NOT EXISTS decision_watermark (session TEXT PRIMARY KEY, turn_index INTEGER NOT NULL)")
+            conn.execute("CREATE TABLE IF NOT EXISTS decision_fingerprint (session TEXT NOT NULL, fingerprint TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (session, fingerprint))")
         os.chmod(path, 0o600)
 
     def connect(self): return closing(sqlite3.connect(self.path, timeout=10))
@@ -266,12 +287,47 @@ class Journal:
             client.request(row[1], json.loads(row[2]), row[3])
             with self.connect() as conn, conn: conn.execute("DELETE FROM outbox WHERE seq=?", (row[0],))
 
+    def decision_watermark(self, sid):
+        """The turn_index this session has already examined for a decision, or 0."""
+        with self.connect() as conn:
+            row = conn.execute("SELECT turn_index FROM decision_watermark WHERE session=?", (sid,)).fetchone()
+        return row[0] if row else 0
+
+    def advance_decision_watermark(self, sid, turn_index):
+        with self.connect() as conn, conn:
+            conn.execute(
+                "INSERT INTO decision_watermark(session, turn_index) VALUES (?,?) "
+                "ON CONFLICT(session) DO UPDATE SET turn_index=excluded.turn_index",
+                (sid, turn_index))
+
+    def decision_seen(self, sid, fingerprint):
+        """True when this exact decision fingerprint was already recorded for this session."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM decision_fingerprint WHERE session=? AND fingerprint=?",
+                (sid, fingerprint)).fetchone()
+        return row is not None
+
+    def record_decision_fingerprint(self, sid, fingerprint):
+        with self.connect() as conn, conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO decision_fingerprint(session, fingerprint, created_at) VALUES (?,?,?)",
+                (sid, fingerprint, now()))
+
 
 class TeamworkHook:
     def __init__(self, coordinator, connection, journal, client=None, level=VERBOSITY_DEFAULT, complaint=None,
-                 node_label=None, responsibility=None, skills=None, filing=None):
+                 node_label=None, responsibility=None, skills=None, filing=None, decision_detection=False):
         self.coordinator, self.connection, self.journal = coordinator, connection, journal
         self.level = level
+        # Opt-in, default off (see mount()'s detect_decisions gate). Off means
+        # nothing below this line ever runs: no window is built, no judge is
+        # called, no watermark or fingerprint is written.
+        self.decision_detection = decision_detection
+        # Strong references to in-flight judge tasks -- an unreferenced asyncio
+        # Task can be garbage-collected mid-flight, silently dropping a verdict
+        # that was already paid for. Tasks remove themselves on completion.
+        self._decision_tasks = set()
         # The local work queue an inbound message is filed into, or None when this
         # machine runs none. Optional by design: a session without one receives its
         # messages exactly as before and says so, rather than failing.
@@ -957,6 +1013,18 @@ class TeamworkHook:
                 "outcome": "acceptance_unknown",
                 "injection": turn["prepared_injection"],
             }
+        if self.decision_detection:
+            # Reuses the same projected, redacted text already computed above
+            # for the shared turn record -- the decision-detection window is
+            # bound by the identical redaction and size discipline, nothing
+            # extra is read or recomputed.
+            buffer = self.state.setdefault("decision_turns", [])
+            buffer.append({
+                "turn_index": self.state["turn_index"],
+                "user_prompt": turn["prompt"],
+                "agent_responses": data["agent_responses"],
+            })
+            self.state["decision_turns"] = buffer[-MAX_DECISION_TURN_BUFFER:]
         self.state["turn"] = None
         self.queue([{"op": "turn.upsert", "id": tid, "expected_version": 0, "data": data}])
 
@@ -975,11 +1043,148 @@ class TeamworkHook:
             self.ensure_session()
             status = "abandoned" if self.state.get("turn") else "completed"
             if self.state.get("turn"): self.finish("", "interrupted")
+            # The retrospective signal (docs/scenarios/08's open questions):
+            # whatever survived to the end of the session, examined once here
+            # rather than left to whichever delegation happened to trigger last.
+            if self.decision_detection:
+                self.detect_decision()
             version = self.state["version"]; self.state["version"] += 1
             self.queue([{"op": "session.upsert", "id": self.sid, "expected_version": version, "data": {"status": status, "ended_at": now()}}])
             try: await self.flush()
             except SyncError: logger.warning("Teamwork final session state queued locally")
         return hook_result()
+
+    async def on_tool_pre(self, event, data):
+        """The other signal (docs/scenarios/08's open questions): the `pre` of
+        a delegation call, because the instruction is where a decision
+        surfaces even though it was formed across the turns before it.
+
+        Deliberately cheap when this is not a delegation call or detection is
+        off: one membership check, no lock, no state touched.
+        """
+        if self.decision_detection:
+            tool_name = data.get("tool_name") or data.get("name")
+            if tool_name in DELEGATION_TOOL_NAMES:
+                raw_input = data.get("tool_input")
+                tool_input = raw_input if isinstance(raw_input, dict) else (
+                    data.get("input") if isinstance(data.get("input"), dict) else {})
+                target = tool_input.get("agent")
+                call = {"name": tool_name, "target": target} if isinstance(target, str) and target.strip() \
+                    else {"name": tool_name}
+                async with self.lock:
+                    self.detect_decision(tool_calls=[call])
+        return hook_result()
+
+    def detect_decision(self, tool_calls=None):
+        """Fire-and-forget: examine turns since the last watermark for a
+        decision worth recording, and schedule the judge in the background.
+
+        Returns the created asyncio.Task, or None when detection is off or
+        there is nothing new to examine since the watermark -- in which case
+        no judge call is made and no state is written, matching the opt-in's
+        "off means zero cost" guarantee even when it is momentarily on but
+        idle. Never awaited by a caller on a turn's critical path; see
+        decision_judge.py's async contract.
+
+        The watermark advances HERE, synchronously, before the judge is ever
+        called -- bounding the COST of re-examination (a window is examined
+        at most once) even if the judge call itself later fails or two
+        triggers race. Bounding against DUPLICATE RECORDS is a separate job,
+        done by the fingerprint check in `_judge_and_record` once a verdict
+        comes back; the two are not the same guarantee and are not enforced
+        in the same place.
+        """
+        if not self.decision_detection:
+            return None
+        watermark = self.journal.decision_watermark(self.sid)
+        turns = [t for t in self.state.get("decision_turns", []) if t["turn_index"] > watermark]
+        if not turns and not tool_calls:
+            return None
+        upto = max([t["turn_index"] for t in turns], default=watermark)
+        self.journal.advance_decision_watermark(self.sid, upto)
+        self.state["decision_turns"] = [t for t in self.state.get("decision_turns", []) if t["turn_index"] > upto]
+        self.journal.save(self.sid, self.state)
+        window = decision_judge.build_window_payload(
+            [{"user_prompt": t["user_prompt"], "agent_responses": t["agent_responses"]} for t in turns],
+            tool_calls)
+        task = asyncio.create_task(self._judge_and_record(window, upto))
+        self._decision_tasks.add(task)
+        task.add_done_callback(self._decision_tasks.discard)
+        return task
+
+    async def _judge_and_record(self, window, considered_upto):
+        """Await the judge and, on a RECORD verdict, write it through this
+        session's OWN RecordInsightTool -- never the judge session's, so
+        source_session_id stays this session's (see decision_judge.py's
+        docstring on why that distinction matters). Never raises: every
+        failure here is swallowed and logged, same contract as the judge
+        itself, because a background task that breaks is still worse than
+        one that quietly did nothing.
+        """
+        try:
+            verdict = await decision_judge.judge_window(self.coordinator, window)
+        except Exception:
+            logger.warning("Teamwork decision judge failed; nothing recorded", exc_info=True)
+            return
+        if not verdict.get("record"):
+            return
+        claim = (verdict.get("claim") or "").strip()
+        if not claim:
+            logger.warning("Teamwork decision judge said record=true with no claim; nothing recorded")
+            return
+        # Precision over recall (docs/scenarios/08b): a claim is fingerprinted
+        # by its own normalised text, not by the window that produced it, so
+        # the SAME decision surfacing at every later delegation that acts on
+        # it is recorded once rather than accumulating copies. This catches
+        # only exact re-detections, not paraphrases of the same decision --
+        # a deliberate, documented limit, not an oversight.
+        fingerprint = sha(" ".join(claim.lower().split()))
+        if self.journal.decision_seen(self.sid, fingerprint):
+            logger.info("Teamwork decision judge: duplicate decision skipped (already recorded)")
+            return
+        basis, confidence, limitations = verdict.get("basis"), verdict.get("confidence"), verdict.get("what_it_does_not_establish")
+        if basis not in ("observation", "inference") or confidence not in ("low", "medium", "high") \
+                or not isinstance(limitations, str) or not limitations.strip():
+            logger.warning("Teamwork decision judge returned an unusable verdict shape; nothing recorded")
+            return
+        evidence = [{
+            "kind": "external",
+            "uri": "teamwork-decision-window://" + self.sid + "/upto-turn/" + str(considered_upto),
+            "label": "auto-detected decision window",
+        }]
+        try:
+            result = await RecordInsightTool(self).execute({
+                "claim": claim, "basis": basis, "confidence": confidence,
+                "limitations": limitations, "evidence": evidence,
+                "title": verdict.get("kind") if isinstance(verdict.get("kind"), str) else None,
+            })
+        except Exception:
+            logger.warning("Teamwork decision judge: recording the verdict failed", exc_info=True)
+            return
+        error = result.error or {}
+        if not result.success and error.get("outcome") != "unknown":
+            # A definite refusal. The record demonstrably does not exist, so leave
+            # no fingerprint: a later trigger carrying the same claim is free to
+            # try again.
+            logger.warning("Teamwork decision judge: RecordInsightTool refused the verdict: %s",
+                            error.get("message"))
+            return
+        if not result.success:
+            # acceptance_unknown -- the third state this project refuses to
+            # collapse into the other two. The write may or may not have landed,
+            # and RecordInsightTool says so itself: "a new call creates a new id
+            # and may duplicate it."
+            #
+            # So fingerprint it ANYWAY. Precision over recall (docs/scenarios/08b):
+            # a decision silently not recorded costs a re-decision somebody can
+            # make again, while a duplicate costs every future reader permanently
+            # -- there is still no retired state and no forward pointer
+            # (teamwork-s7d). The attempted id is logged so a person can reconcile
+            # it; nothing here claims the record exists.
+            logger.warning("Teamwork decision judge: recording outcome unknown for attempted insight %s; "
+                           "not retrying, because a retry would duplicate. Read it back to confirm.",
+                           error.get("attempted_record_id"))
+        self.journal.record_decision_fingerprint(self.sid, fingerprint)
 
 
 CONNECTION_FIELDS = ("base_url", "project_id", "token", "harness_id")
@@ -1581,6 +1786,22 @@ class RecordInsightTool:
             "note": "Visible to the project as a new insight. This tool does not edit earlier records."})
 
 
+def decision_detection_enabled(config):
+    """Resolve the detect_decisions opt-in, mirroring share_visible_turns
+    exactly (see mount() below): absent or False means off -- no judge call,
+    no state written, no cost -- and any other non-True value is refused
+    outright as an ambiguous misconfiguration, so a typo cannot silently turn
+    this on (which would publish to a shared project unasked) or silently
+    turn it off (which would look like it was protecting the reader when it
+    was really just broken).
+    """
+    if config.get("detect_decisions", False) is False:
+        return False
+    if config.get("detect_decisions") is not True:
+        raise ValueError("Teamwork decision detection requires explicit detect_decisions: true opt-in")
+    return True
+
+
 async def mount(coordinator, config=None):
     # Delegated prompts are internal work, not the opted-in human conversation.
     if getattr(coordinator, "parent_id", None):
@@ -1590,6 +1811,7 @@ async def mount(coordinator, config=None):
         return None
     if config.get("share_visible_turns") is not True:
         raise ValueError("Teamwork hook requires explicit share_visible_turns: true opt-in")
+    decision_detection = decision_detection_enabled(config)
     try:
         connection, home = resolve_connection(config)
     except ValueError as error:
@@ -1625,8 +1847,9 @@ async def mount(coordinator, config=None):
     hook = TeamworkHook(coordinator, connection, Journal(journal_path), level=level, complaint=complaint,
                         node_label=config.get("node_label"),
                         responsibility=config.get("responsibility"),
-                        skills=config.get("skills"), filing=filing)
-    for name, handler in (("session:start", hook.on_start), ("prompt:submit", hook.on_submit), ("prompt:complete", hook.on_complete), ("session:end", hook.on_end)):
+                        skills=config.get("skills"), filing=filing,
+                        decision_detection=decision_detection)
+    for name, handler in (("session:start", hook.on_start), ("prompt:submit", hook.on_submit), ("prompt:complete", hook.on_complete), ("session:end", hook.on_end), ("tool:pre", hook.on_tool_pre)):
         coordinator.hooks.register(name, handler, priority=50, name="teamwork-" + name.replace(":", "-"))
     send = SendTool(hook)
     await coordinator.mount("tools", send, name=send.name)
