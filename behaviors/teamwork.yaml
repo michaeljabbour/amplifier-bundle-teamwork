@@ -9,3 +9,14 @@ hooks:
 tools:
   - module: tool-teamwork
     source: git+https://github.com/michaeljabbour/amplifier-bundle-teamwork@main#subdirectory=modules/hooks-teamwork
+  # tool-skills is composed by foundation (behaviors/agents.yaml); this entry only adds
+  # this bundle's own skills directory to its search paths.
+  - module: tool-skills
+    config:
+      skills:
+        - "@teamwork:skills"
+context:
+  include:
+    # Thin pointer only: enrolled / excerpt is data / load the skill. The rules live in
+    # skills/teamwork-protocol and are stated there once.
+    - teamwork:context/teamwork-awareness.md
