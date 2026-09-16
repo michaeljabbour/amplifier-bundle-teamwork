@@ -1797,6 +1797,7 @@ class RecordInsight(unittest.IsolatedAsyncioTestCase):
                       "token": "test-credential-no-real-secret"}
         client = SendClient(fail_status, fail_body=fail_body)
         hook = TeamworkHook(Coordinator(Context([])), connection, Journal(Path(tmp.name) / "q.db"), client)
+        hook.entered = True  # Normal tool calls follow the hook's first prompt.
         return hook, client
 
     def valid_input(self, **extra):
@@ -1864,6 +1865,48 @@ class RecordInsight(unittest.IsolatedAsyncioTestCase):
         result = await RecordInsightTool(hook).execute(self.valid_input(claim={"text": "not a string"}))
         self.assertFalse(result.success)
         self.assertEqual(client.requests, [])
+
+    async def test_mid_session_binding_registers_and_flushes_source_before_insight(self):
+        hook, client = self.build()
+        hook.entered = False
+        result = await RecordInsightTool(hook).execute(self.valid_input())
+        self.assertTrue(result.success)
+        ops = [op for endpoint, body, _ in client.requests if endpoint == "publish"
+               for op in body["operations"]]
+        self.assertEqual([op["op"] for op in ops], ["session.upsert", "insight.upsert"])
+        self.assertEqual(ops[0]["id"], ops[1]["data"]["source_session_id"])
+
+    async def test_unknown_write_outcome_retains_attempted_id_and_warns_about_duplicates(self):
+        for status in (0, 500, 503):
+            with self.subTest(status=status):
+                hook, client = self.build()
+                def fail(endpoint, body, key=None):
+                    client.requests.append((endpoint, body, key))
+                    raise SyncError(status)
+                client.request = fail
+                result = await RecordInsightTool(hook).execute(self.valid_input())
+                self.assertFalse(result.success)
+                self.assertEqual(result.error["outcome"], "unknown")
+                self.assertEqual(result.error["attempted_record_id"], client.requests[0][1]["operations"][0]["id"])
+                self.assertIn("before retrying", result.error["message"])
+                self.assertNotIn("Not recorded", result.error["message"])
+
+    async def test_malformed_success_response_cannot_claim_a_record_was_stored(self):
+        for response in ({}, {"results": []}, {"results": [{"id": "wrong", "version": 1}]}):
+            with self.subTest(response=response):
+                hook, client = self.build()
+                client.request = lambda *args: response
+                result = await RecordInsightTool(hook).execute(self.valid_input())
+                self.assertFalse(result.success)
+                self.assertEqual(result.error["outcome"], "unknown")
+
+    async def test_malformed_422_body_uses_a_safe_generic_refusal(self):
+        for body in ({"error": "invalid"}, {"error": {"message": {"private": "details"}}}):
+            with self.subTest(body=body):
+                hook, _ = self.build(fail_status=422, fail_body=body)
+                result = await RecordInsightTool(hook).execute(self.valid_input())
+                self.assertFalse(result.success)
+                self.assertEqual(result.error["message"], "Not recorded: the project service rejected the record")
 
     async def test_service_validation_error_cannot_echo_the_connection_credential(self):
         hook, _ = self.build(fail_status=422, fail_body={"error": {
