@@ -17,7 +17,8 @@ awaited inline on a turn's critical path. Callers should fire it with
 `asyncio.create_task(judge_window(...))` (or use `spawn_judge_window()` below,
 which does exactly that) and inspect the result later -- at the next turn, at
 `session:end`, wherever the caller's own lifecycle wiring decides to look. Both
-paths are safe: `judge_window()` itself never raises. Every failure -- a
+paths turn operational failures into unavailable verdicts. Cancellation propagates
+after session cleanup. An operational failure -- a
 provider error, a coordinator that cannot be read, a response that will not
 parse as a verdict -- degrades to `no_verdict(...)`, because a judge that
 breaks a turn is worse than no judge.
@@ -53,6 +54,15 @@ import logging
 import re
 
 logger = logging.getLogger(__name__)
+CLEANUP_TIMEOUT_SECONDS = 5
+
+
+async def _cleanup_session(session):
+    """Bound cooperative cleanup without retaining provider failure details."""
+    try:
+        await asyncio.wait_for(session.cleanup(), timeout=CLEANUP_TIMEOUT_SECONDS)
+    except Exception as error:
+        logger.warning("decision judge: session cleanup failed (%s)", type(error).__name__)
 
 # ---------------------------------------------------------------------------
 # Verdict shape
@@ -76,17 +86,15 @@ VERDICT_FIELDS = (
     "reason",
 )
 
-_VALID_BASIS = (None, "observation", "inference")
-_VALID_CONFIDENCE = (None, "low", "medium", "high")
-
-
 def no_verdict(reason):
     """The sentinel returned whenever this module cannot honestly say RECORD or SKIP.
 
+    `available` is False so evaluation cannot mistake a failure for a valid SKIP.
     `record` is False so a caller that only checks `verdict["record"]` degrades
     safely to "do nothing" rather than "do something on bad information."
     """
     return {
+        "available": False,
         "record": False,
         "kind": None,
         "claim": None,
@@ -276,16 +284,23 @@ def _parse_verdict(raw):
                 data = json.loads(text[start : end + 1])
             except (json.JSONDecodeError, TypeError, ValueError):
                 data = None
-    if not isinstance(data, dict) or not isinstance(data.get("record"), bool):
+    if (not isinstance(data, dict) or not isinstance(data.get("record"), bool)
+            or not all(field in data for field in VERDICT_FIELDS)):
         return None
     verdict = {field: data.get(field) for field in VERDICT_FIELDS}
-    if verdict["basis"] not in _VALID_BASIS:
-        verdict["basis"] = None
-    if verdict["confidence"] not in _VALID_CONFIDENCE:
-        verdict["confidence"] = None
-    for field in ("kind", "claim", "what_it_does_not_establish", "reason"):
-        if verdict[field] is not None and not isinstance(verdict[field], str):
-            verdict[field] = str(verdict[field])
+    if (verdict["confidence"] not in ("low", "medium", "high")
+            or not isinstance(verdict["reason"], str) or not verdict["reason"].strip()):
+        return None
+    if verdict["record"]:
+        if verdict["basis"] not in ("observation", "inference"):
+            return None
+        if any(not isinstance(verdict[field], str) or not verdict[field].strip()
+               for field in ("kind", "claim", "what_it_does_not_establish")):
+            return None
+    elif any(verdict[field] is not None
+             for field in ("kind", "claim", "basis", "what_it_does_not_establish")):
+        return None
+    verdict["available"] = True
     return verdict
 
 
@@ -347,10 +362,10 @@ async def _resolve_providers(parent_coordinator, model_role):
     except Exception as error:
         return (
             providers,
-            "model_role_resolver.resolve(%r) raised %r; using the calling session's provider unchanged"
+            "model_role_resolver.resolve(%r) failed (%s); using the calling session's provider unchanged"
             % (
                 model_role,
-                error,
+                type(error).__name__,
             ),
         )
     if not preferences:
@@ -382,7 +397,10 @@ async def _resolve_providers(parent_coordinator, model_role):
         if _bare_module(spec.get("module", "")) == pref_provider:
             spec["config"] = dict(spec.get("config") or {})
             spec["config"]["default_model"] = pref_model
-            return providers, "model_role %r resolved to %s/%s" % (
+            # The loop chooses the lowest provider priority. Restrict this
+            # child to the exact resolved provider so a parent's higher-priority
+            # expensive provider cannot silently override the fast-role choice.
+            return [spec], "model_role %r resolved to %s/%s" % (
                 model_role,
                 pref_provider,
                 pref_model,
@@ -417,6 +435,10 @@ async def build_judge_session(
     docstring for why that distinction matters for `RecordInsightTool`
     specifically.
 
+    Uses Foundation's standard loop-streaming/context-simple modules, reusing
+    the parent's module-source resolver when available. The loop is bounded to
+    one model iteration. Host approval policy is carried into the child.
+
     Returns `(session, note)`. The caller owns the session and must call
     `await session.cleanup()` when done with it; `judge_window()` below does
     this for you.
@@ -426,18 +448,34 @@ async def build_judge_session(
     parent_id = getattr(parent_coordinator, "session_id", None)
     providers, note = await _resolve_providers(parent_coordinator, model_role)
     config = {
-        "session": {"orchestrator": "loop-agent", "context": "context-simple"},
+        "session": {
+            "orchestrator": {"module": "loop-streaming", "config": {"max_iterations": 1}},
+            "context": "context-simple",
+        },
         "providers": providers,
         "tools": [],
         "hooks": [],
     }
-    session = AmplifierSession(config, parent_id=parent_id)
-    await session.initialize()
-    for tool in extra_tools or []:
-        name = getattr(tool, "name", None)
-        if not name:
-            continue
-        await session.coordinator.mount("tools", tool, name=name)
+    # Follow Foundation's create_session seam: mount its source resolver before
+    # initialization. The child retains its own loader, coordinator, and state.
+    session = AmplifierSession(
+        config, parent_id=parent_id,
+        approval_system=getattr(parent_coordinator, "approval_system", None),
+    )
+    try:
+        get_mount = getattr(parent_coordinator, "get", None)
+        resolver = get_mount("module-source-resolver") if callable(get_mount) else None
+        if resolver is not None:
+            await session.coordinator.mount("module-source-resolver", resolver)
+        await session.initialize()
+        for tool in extra_tools or []:
+            name = getattr(tool, "name", None)
+            if not name:
+                continue
+            await session.coordinator.mount("tools", tool, name=name)
+    except BaseException:
+        await _cleanup_session(session)
+        raise
     return session, note
 
 
@@ -447,35 +485,32 @@ async def build_judge_session(
 
 
 async def judge_window(parent_coordinator, window, *, extra_tools=None):
-    """Classify ONE window as RECORD or SKIP. Never raises.
+    """Classify ONE window; operational failures return an unavailable verdict.
 
     See this module's docstring for the async contract: this performs a real
     provider call and must not be awaited inline on a turn's critical path.
 
-    On any failure -- session construction, the provider call, or a response
+    On an operational failure -- session construction, the provider call, or a response
     that will not parse as a verdict -- returns `no_verdict(reason)` rather
-    than raising, because a judge that breaks a turn is worse than no judge.
+    than raising. Cancellation propagates after owned-session cleanup.
     """
     try:
         session, note = await build_judge_session(
             parent_coordinator, extra_tools=extra_tools
         )
     except Exception as error:
-        logger.warning("decision judge: could not build a judge session", exc_info=True)
-        return no_verdict("could not build a judge session: %r" % (error,))
+        logger.warning("decision judge: could not build a judge session (%s)", type(error).__name__)
+        return no_verdict("could not build a judge session (%s)" % type(error).__name__)
     logger.debug("decision judge: provider inheritance -- %s", note)
 
     try:
         try:
             raw = await session.execute(_prompt_for(window))
         except Exception as error:
-            logger.warning("decision judge: the provider call failed", exc_info=True)
-            return no_verdict("the judge's provider call failed: %r" % (error,))
+            logger.warning("decision judge: the provider call failed (%s)", type(error).__name__)
+            return no_verdict("the judge's provider call failed (%s)" % type(error).__name__)
     finally:
-        try:
-            await session.cleanup()
-        except Exception:
-            logger.warning("decision judge: session cleanup failed", exc_info=True)
+        await _cleanup_session(session)
 
     verdict = _parse_verdict(raw)
     if verdict is None:
@@ -488,10 +523,9 @@ def spawn_judge_window(parent_coordinator, window, *, extra_tools=None):
 
     Returns the `asyncio.Task` immediately without awaiting it, so a caller on
     a turn's critical path (e.g. a hook handler) can call this and return
-    right away. `judge_window()` itself never raises, so the returned task is
-    safe to leave unawaited (its result is simply never collected) or to await
-    later for its verdict -- either way nothing here can surface an exception
-    into the event loop's default unhandled-exception handler.
+    right away. The caller owns the task and should retain it, collect its
+    verdict, and cancel/await it during caller shutdown. Operational failures
+    return unavailable verdicts; cancellation remains observable to the caller.
     """
     return asyncio.create_task(
         judge_window(parent_coordinator, window, extra_tools=extra_tools)

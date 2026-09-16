@@ -21,6 +21,18 @@ Their "What the good one knows" sections are the decision rule the judge in
 `AmplifierSession`, constructed fresh for every call. **Not** wired into any hook
 lifecycle event; this eval calls the function directly.
 
+The judge uses Foundation's standard `loop-streaming` and `context-simple` modules,
+inherits the parent's source resolver and approval policy, and allows one model
+iteration. It does not require the Attractor `loop-agent` module. Missing or invalid
+verdicts are `UNAVAILABLE`, never successful `SKIP` outcomes; the runner reports
+them separately and exits nonzero when any case is unavailable.
+
+Local regression coverage exercises an actual stock-Core session with an offline
+fixture provider. That verifies the integration boundary, not model discrimination.
+The original six-case Haiku result reported in PR #42 was not rerun after these
+repairs. Every case states its deciding reason, so even a fresh six-case pass would
+not establish inference of unstated reasons or calibrated confidence.
+
 ## The six cases
 
 `cases.py` holds six single-turn windows, each drawn from a real decision this project

@@ -15,7 +15,11 @@ same style `tests/test_hook.py` already uses.
 """
 
 import sys
+import asyncio
+import importlib.util
+import json
 import tempfile
+from types import SimpleNamespace
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -121,7 +125,7 @@ class JudgeNeverRaises(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(verdict["claim"], "narrow the scope")
         self.assertEqual(verdict["confidence"], "high")
 
-    async def test_an_invalid_enum_value_degrades_that_field_not_the_whole_verdict(
+    async def test_an_invalid_enum_value_makes_the_verdict_unavailable(
         self,
     ):
         raw = (
@@ -135,7 +139,8 @@ class JudgeNeverRaises(unittest.IsolatedAsyncioTestCase):
             AsyncMock(return_value=(fake, "note")),
         ):
             verdict = await decision_judge.judge_window(object(), EMPTY_WINDOW)
-        self.assertTrue(verdict["record"])
+        self.assertFalse(verdict["record"])
+        self.assertFalse(verdict["available"])
         self.assertIsNone(verdict["basis"])
         self.assertIsNone(verdict["confidence"])
 
@@ -188,6 +193,138 @@ class WindowPayloadTests(unittest.TestCase):
         self.assertEqual(window["turns"], [])
 
 
+class HonestJudgeFailures(unittest.IsolatedAsyncioTestCase):
+    async def test_failure_details_are_not_returned_or_logged(self):
+        private_detail = "private-provider-request-and-credential-fixture"
+        fake = FakeJudgeSession(execute_error=RuntimeError(private_detail))
+        with patch.object(decision_judge, "build_judge_session", AsyncMock(return_value=(fake, "note"))):
+            with self.assertLogs(decision_judge.logger, level="WARNING") as logs:
+                verdict = await decision_judge.judge_window(object(), EMPTY_WINDOW)
+        self.assertFalse(verdict["available"])
+        self.assertNotIn(private_detail, json.dumps(verdict))
+        self.assertNotIn(private_detail, "\n".join(logs.output))
+
+    async def test_incomplete_record_cannot_be_a_valid_verdict(self):
+        fake = FakeJudgeSession(execute_result='{"record": true}')
+        with patch.object(decision_judge, "build_judge_session", AsyncMock(return_value=(fake, "note"))):
+            verdict = await decision_judge.judge_window(object(), EMPTY_WINDOW)
+        self.assertFalse(verdict["available"])
+        self.assertFalse(verdict["record"])
+
+    async def test_failed_initialization_cleans_up_partial_session(self):
+        fake = SimpleNamespace(initialize=AsyncMock(side_effect=RuntimeError("fixture failure")),
+                               cleanup=AsyncMock())
+        with patch("amplifier_core.AmplifierSession", return_value=fake):
+            with self.assertRaises(RuntimeError):
+                await decision_judge.build_judge_session(object())
+        fake.cleanup.assert_awaited_once()
+
+    async def test_cancelled_initialization_cleans_up_and_preserves_cancellation(self):
+        fake = SimpleNamespace(initialize=AsyncMock(side_effect=asyncio.CancelledError()),
+                               cleanup=AsyncMock())
+        with patch("amplifier_core.AmplifierSession", return_value=fake):
+            with self.assertRaises(asyncio.CancelledError):
+                await decision_judge.judge_window(object(), EMPTY_WINDOW)
+        fake.cleanup.assert_awaited_once()
+
+    async def test_hanging_cleanup_is_bounded_after_cancellation(self):
+        async def hanging_cleanup():
+            await asyncio.Event().wait()
+        fake = SimpleNamespace(initialize=AsyncMock(side_effect=asyncio.CancelledError()),
+                               cleanup=AsyncMock(side_effect=hanging_cleanup))
+        with patch("amplifier_core.AmplifierSession", return_value=fake):
+            with patch.object(decision_judge, "CLEANUP_TIMEOUT_SECONDS", 0.01):
+                with self.assertLogs(decision_judge.logger, level="WARNING"):
+                    with self.assertRaises(asyncio.CancelledError):
+                        await asyncio.wait_for(decision_judge.judge_window(object(), EMPTY_WINDOW), timeout=1)
+        fake.cleanup.assert_awaited_once()
+
+    async def test_resolved_fast_provider_cannot_lose_to_parent_priority(self):
+        config = {"providers": [
+            {"module": "provider-expensive", "config": {"priority": 1, "default_model": "large"}},
+            {"module": "provider-cheap", "config": {"priority": 100, "default_model": "old"}},
+        ]}
+        snapshot = json.dumps(config, sort_keys=True)
+        resolver = SimpleNamespace(resolve=AsyncMock(return_value=[{"provider": "cheap", "model": "small"}]))
+        parent = SimpleNamespace(config=config, get_capability=lambda name: resolver)
+        providers, _ = await decision_judge._resolve_providers(parent, "fast")
+        self.assertEqual([spec["module"] for spec in providers], ["provider-cheap"])
+        self.assertEqual(providers[0]["config"]["default_model"], "small")
+        self.assertEqual(json.dumps(config, sort_keys=True), snapshot)
+
+    async def test_unavailable_output_is_not_credited_as_a_correct_skip(self):
+        path = Path(__file__).resolve().parents[1] / "evals/02-decision-detection/run.py"
+        spec = importlib.util.spec_from_file_location("decision_eval_runner", path)
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        result = runner.assess_case({"id": "fixture", "expected": "SKIP", "note": "fixture"},
+                                    decision_judge.no_verdict("provider unavailable"))
+        self.assertEqual(result["judged"], "UNAVAILABLE")
+        self.assertFalse(result["correct"])
+
+        fake = SimpleNamespace(initialize=AsyncMock(side_effect=RuntimeError("fixture setup")),
+                               cleanup=AsyncMock())
+        with patch("amplifier_core.AmplifierSession", return_value=fake):
+            with self.assertRaises(RuntimeError):
+                await runner._build_root_session()
+        fake.cleanup.assert_awaited_once()
+
+
+class StandardFoundationSession(unittest.IsolatedAsyncioTestCase):
+    async def test_standard_loop_executes_one_offline_call_with_parent_source_resolver(self):
+        import amplifier_module_context_simple
+        import amplifier_module_loop_streaming
+        from amplifier_core.message_models import ChatResponse, TextBlock
+        from amplifier_core.models import ProviderInfo
+
+        class OfflineProvider:
+            name = "offline-fixture"
+            priority = 1
+            context_window = 32000
+            max_output_tokens = 256
+            calls = 0
+
+            def get_info(self):
+                return ProviderInfo(id=self.name, display_name=self.name)
+
+            async def complete(self, request, **kwargs):
+                self.calls += 1
+                return ChatResponse(content=[TextBlock(text=json.dumps({
+                    "record": False, "kind": None, "claim": None, "basis": None,
+                    "what_it_does_not_establish": None, "confidence": "high",
+                    "reason": "A synthetic fixture with no durable decision.",
+                }))])
+
+            def parse_tool_calls(self, response):
+                return []
+
+        sources = {
+            "loop-streaming": Path(amplifier_module_loop_streaming.__file__).parent.parent,
+            "context-simple": Path(amplifier_module_context_simple.__file__).parent.parent,
+        }
+        class LocalResolver:
+            def resolve(self, module_id, **kwargs):
+                return SimpleNamespace(resolve=lambda: sources[module_id])
+        resolver = LocalResolver()
+        parent = SimpleNamespace(session_id="offline-parent", config={"providers": []},
+                                 get=lambda name: resolver if name == "module-source-resolver" else None,
+                                 approval_system=object())
+        session, _ = await decision_judge.build_judge_session(parent)
+        provider = OfflineProvider()
+        try:
+            self.assertIs(session.coordinator.get("module-source-resolver"), resolver)
+            self.assertIs(session.coordinator.approval_system, parent.approval_system)
+            self.assertEqual(session.parent_id, parent.session_id)
+            self.assertEqual(session.config["session"]["orchestrator"]["config"]["max_iterations"], 1)
+            await session.coordinator.mount("providers", provider, name=provider.name)
+            raw = await session.execute(decision_judge._prompt_for(EMPTY_WINDOW))
+            self.assertEqual(provider.calls, 1)
+            self.assertTrue(decision_judge._parse_verdict(raw)["available"])
+            self.assertIsNone(session.coordinator.get_capability("teamwork.session_id"))
+        finally:
+            await session.cleanup()
+
+
 class ChildSessionExcludesTeamworkHook(unittest.IsolatedAsyncioTestCase):
     """A real child session with parent_id set never mounts the teamwork hook --
     the exact mechanism build_judge_session relies on instead of a second guard.
@@ -197,7 +334,7 @@ class ChildSessionExcludesTeamworkHook(unittest.IsolatedAsyncioTestCase):
         from amplifier_core import AmplifierSession
 
         config = {
-            "session": {"orchestrator": "loop-agent", "context": "context-simple"},
+            "session": {"orchestrator": "loop-streaming", "context": "context-simple"},
             "providers": [],
             "tools": [],
             "hooks": [],
@@ -300,7 +437,8 @@ class ToolMountingTests(unittest.IsolatedAsyncioTestCase):
 
             def request(self, endpoint, body, key=None):
                 self.requests.append((endpoint, body, key))
-                return {"stored": True}
+                return {"results": [{"id": op["id"], "version": 1}
+                                    for op in body["operations"]]}
 
         parent_coordinator = FakeParentCoordinator()
         journal = Journal(Path(tmp.name) / "q.db")
@@ -331,7 +469,8 @@ class ToolMountingTests(unittest.IsolatedAsyncioTestCase):
                 }
             )
             self.assertTrue(result.success, result.error)
-            op = client.requests[0][1]["operations"][0]
+            op = next(op for _, body, _ in client.requests for op in body["operations"]
+                      if op["op"] == "insight.upsert")
             self.assertEqual(op["data"]["source_session_id"], parent_hook.sid)
             self.assertNotEqual(op["data"]["source_session_id"], session.session_id)
         finally:

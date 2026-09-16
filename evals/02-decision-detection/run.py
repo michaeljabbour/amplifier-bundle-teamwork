@@ -72,7 +72,7 @@ async def _build_root_session():
     from amplifier_core import AmplifierSession
 
     config = {
-        "session": {"orchestrator": "loop-agent", "context": "context-simple"},
+        "session": {"orchestrator": "loop-streaming", "context": "context-simple"},
         "providers": [
             {"module": "provider-anthropic", "config": {"default_model": JUDGE_MODEL}}
         ],
@@ -80,8 +80,23 @@ async def _build_root_session():
         "hooks": [],
     }
     session = AmplifierSession(config)
-    await session.initialize()
+    try:
+        await session.initialize()
+    except BaseException:
+        await decision_judge._cleanup_session(session)
+        raise
     return session
+
+
+def assess_case(case, verdict):
+    """Unavailable or malformed model output cannot count as a correct SKIP."""
+    available = isinstance(verdict, dict) and verdict.get("available") is True
+    judged = ("RECORD" if verdict.get("record") else "SKIP") if available else "UNAVAILABLE"
+    return {
+        "id": case["id"], "expected": case["expected"], "judged": judged,
+        "correct": available and judged == case["expected"],
+        "note": case["note"], "verdict": verdict,
+    }
 
 
 async def run():
@@ -101,24 +116,15 @@ async def run():
             verdict = await decision_judge.judge_window(
                 root.coordinator, case["window"]
             )
-            judged = "RECORD" if verdict.get("record") else "SKIP"
-            results.append(
-                {
-                    "id": case["id"],
-                    "expected": case["expected"],
-                    "judged": judged,
-                    "correct": judged == case["expected"],
-                    "note": case["note"],
-                    "verdict": verdict,
-                }
-            )
+            results.append(assess_case(case, verdict))
     finally:
-        await root.cleanup()
+        await decision_judge._cleanup_session(root)
 
     false_positives = [
         r for r in results if r["expected"] == "SKIP" and r["judged"] == "RECORD"
     ]
     misses = [r for r in results if r["expected"] == "RECORD" and r["judged"] == "SKIP"]
+    unavailable = [r for r in results if r["judged"] == "UNAVAILABLE"]
     correct = sum(1 for r in results if r["correct"])
 
     report = {
@@ -130,6 +136,8 @@ async def run():
         "false_positives": [r["id"] for r in false_positives],
         "miss_count": len(misses),
         "misses": [r["id"] for r in misses],
+        "unavailable_count": len(unavailable),
+        "unavailable": [r["id"] for r in unavailable],
         "results": results,
     }
 
@@ -141,6 +149,7 @@ async def run():
     out_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
     print("Decision-detection spike -- %d/%d correct" % (correct, len(results)))
+    print("Unavailable verdicts (never counted as correct): %d" % len(unavailable))
     print(
         "False positives (SKIP judged RECORD), the costly direction: %d -- %s"
         % (len(false_positives), [r["id"] for r in false_positives])
@@ -162,7 +171,7 @@ async def run():
             )
         )
     print("Report written to %s" % out_path)
-    return 0
+    return 1 if unavailable else 0
 
 
 if __name__ == "__main__":
