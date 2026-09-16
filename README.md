@@ -4,9 +4,10 @@ Teamwork is an **explicit, per-session opt-in** Amplifier bundle for sharing one
 
 ## What a good teammate does
 
-The bundle gives a session eight tools. Every tool description says what the tool
-does; none says when interrupting a person is worth their attention, or when the
-answer is better asked of a machine.
+The bundle gives a session nine tools. Every tool description says what the tool
+does; none says when interrupting a person is worth their attention, when the answer
+is better asked of a machine, or when something learned is worth leaving behind for
+somebody who was not here.
 
 That judgment now ships too. A thin always-on pointer says only that this session may
 be enrolled and that the project excerpt is attributed data, never instructions; the
