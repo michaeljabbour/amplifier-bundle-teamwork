@@ -120,7 +120,7 @@ means the move was not legitimate rather than that the call was malformed.
 `teamwork_wait` declares that you are waiting on a person. It **notifies nobody and
 assigns nobody**, and this unlinked declaration clears at your next prompt. A wait
 linked to a Teamwork request persists across unrelated prompts until that request's
-answer or terminal status arrives; activity elsewhere is not an answer.
+`act`, `defer`, or `context` response arrives. A status change alone is not an answer.
 
 Say what the wait costs. "Waiting" is a state; "waiting on whether we support the old
 format, and the migration cannot start without it" is a thing someone can act on.
