@@ -261,6 +261,84 @@ record id is logged so you can read it back and reconcile.
 To turn it off, remove the key or set it to `false`, then start a new session; a running
 session keeps the configuration it started with.
 
+### Automatic lesson detection (`detect_lessons`) -- off unless you ask
+
+**Same category of setting as `detect_decisions` above: it makes the bundle call a model
+on its own and publish without you.** Read this section before enabling it.
+
+```yaml
+# ~/.amplifier/settings.yaml
+overrides:
+  hooks-teamwork:
+    config:
+      share_visible_turns: true
+      detect_lessons: true      # default: false
+```
+
+Absent or `false` means **genuinely nothing**: no model call, no state written, no cost.
+Any other value is rejected at mount with the same explicit-opt-in error as
+`share_visible_turns` and `detect_decisions`.
+
+**What it does when on.** A lesson is different from a decision: not a choice among
+alternatives, but something learned that generalises past this task, for teammates who
+were never in the session. With this on, the hook watches for those and publishes them
+to the project as attributed knowledge. The two scenarios that define what qualifies are
+[`06`](docs/scenarios/06-record-the-lesson-not-the-incident.md) and its twin
+[`06b`](docs/scenarios/06b-the-lesson-that-is-only-true-on-your-machine.md); they are the
+specification, not illustrations. 06b matters as much as 06 here: a lesson can be real,
+correctly learned, and still wrong to record, because its evidence does not reach as far
+as the claim would (a build failure on one un-provisioned checkout is not "the build is
+broken for everyone").
+
+**It spends your model budget**, the same way `detect_decisions` does -- a short,
+separate in-process Amplifier session, preferring the `fast` routing role, never
+blocking your turn, a failure logged and dropped rather than raised.
+
+**When it looks.** ONE moment only, and this is the one place lesson detection differs
+structurally from decision detection:
+
+| signal | what it catches |
+|---|---|
+| the session ending | the retrospective sweep over this session's own turns |
+
+There is deliberately no delegation-time trigger. A lesson is not tied to handing work
+off (see 06's own open questions), so `session:end` is the only signal that fires it.
+
+**What it cannot see, stated plainly:** anything that happens in a session that never
+reaches `session:end` cleanly is invisible to this detector for that session (an abandoned
+session still runs `on_end`'s retrospective sweep, so an interrupted session is still
+examined -- but nothing mid-session ever triggers early, unlike decision detection's
+delegation signal).
+
+**What reaches the project.** One insight per detected lesson: the claim, its basis,
+confidence, what it does *not* establish, and a locator for the window it came from.
+Attributed to **this** session, never the judge session -- same guarantee
+`detect_decisions` gives.
+
+**It will sometimes be wrong** -- though less often than that hedge might suggest.
+Measured against `evals/03-lesson-detection`'s six cases (three RECORD, drawn from real
+incidents in this repository; three SKIP, 06b-shaped) on `claude-haiku-4-5`: five live
+runs, 6/6 correct in every run, zero false positives and zero misses across all thirty
+individual case judgments. See that eval's README for the cases themselves, and for the
+grading limit 06 names explicitly: **a rubric derived from 06 can only score a pair** --
+a run that records and a later run that benefits or does not -- and this eval, like the
+judge itself, answers only the narrower question of whether one window can be classified
+correctly in isolation. A clean score on six curated cases is not a guarantee against a
+harder or more ambiguous real transcript.
+
+**Duplicates.** The same lesson claim text recorded once, matched on exact text --
+identical dedup rule to `detect_decisions`, and the same unknown-outcome handling: a
+write whose outcome is genuinely unknown is treated as recorded and never retried,
+because retrying is what creates the duplicate.
+
+**Independent of `detect_decisions`.** The two flags are unrelated: enabling one never
+turns the other on, and each keeps its own buffer, watermark, and fingerprint state (the
+lesson state reuses the SAME watermark/fingerprint tables as decision detection, keyed
+under a namespaced session id, so enabling both costs no additional schema).
+
+To turn it off, remove the key or set it to `false`, then start a new session; a running
+session keeps the configuration it started with.
+
 ### How much the hook says about what arrived
 
 When project records the user has not been told about are accepted into a turn, the hook

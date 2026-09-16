@@ -106,6 +106,19 @@ MIRROR_MAX_ATTEMPTS = 5
 # next window; anything already behind the watermark is dropped as it goes
 # (see TeamworkHook.detect_decision), so this bound is a ceiling, not a target.
 MAX_DECISION_TURN_BUFFER = 20
+# The same buffer, kept separately for lesson detection (see decision_judge.py
+# and docs/scenarios/06/06b). A *separate* state key rather than a shared one:
+# decision detection prunes turns behind ITS OWN watermark as it examines them
+# (see TeamworkHook.detect_decision), and lesson detection has its own,
+# independent watermark -- sharing one buffer would let one detector silently
+# consume turns the other has not yet examined. Same ceiling; no reason for a
+# different one.
+MAX_LESSON_TURN_BUFFER = MAX_DECISION_TURN_BUFFER
+# The namespacing suffix Journal's lesson_* methods append to a session id
+# before reusing the decision_watermark/decision_fingerprint tables -- see
+# Journal.lesson_watermark's comment for why a composite key was chosen over
+# a schema column.
+LESSON_KEY_SUFFIX = ":lesson"
 
 
 def verbosity(config):
@@ -314,20 +327,51 @@ class Journal:
                 "INSERT OR IGNORE INTO decision_fingerprint(session, fingerprint, created_at) VALUES (?,?,?)",
                 (sid, fingerprint, now()))
 
+    # -- Lesson detection reuses the SAME tables and the SAME four methods
+    # above, keyed by a namespaced session id (sid + LESSON_KEY_SUFFIX)
+    # rather than a new `kind` schema column. The `session` column is
+    # already free text with no consumer that parses its structure (see
+    # e.g. the synthetic "root-session-decision-detect" ids tests already
+    # use), so a composite key needs no migration, no ALTER TABLE, and no
+    # risk to an existing installation's journal on upgrade -- a schema
+    # column would need exactly that, since the current PRIMARY KEY is
+    # (session) alone on decision_watermark and adding a `kind` column
+    # without changing that key would make a lesson watermark silently
+    # overwrite a decision watermark for the same real session id.
+    def lesson_watermark(self, sid):
+        return self.decision_watermark(sid + LESSON_KEY_SUFFIX)
+
+    def advance_lesson_watermark(self, sid, turn_index):
+        self.advance_decision_watermark(sid + LESSON_KEY_SUFFIX, turn_index)
+
+    def lesson_seen(self, sid, fingerprint):
+        return self.decision_seen(sid + LESSON_KEY_SUFFIX, fingerprint)
+
+    def record_lesson_fingerprint(self, sid, fingerprint):
+        self.record_decision_fingerprint(sid + LESSON_KEY_SUFFIX, fingerprint)
+
 
 class TeamworkHook:
     def __init__(self, coordinator, connection, journal, client=None, level=VERBOSITY_DEFAULT, complaint=None,
-                 node_label=None, responsibility=None, skills=None, filing=None, decision_detection=False):
+                 node_label=None, responsibility=None, skills=None, filing=None, decision_detection=False,
+                 lesson_detection=False):
         self.coordinator, self.connection, self.journal = coordinator, connection, journal
         self.level = level
         # Opt-in, default off (see mount()'s detect_decisions gate). Off means
         # nothing below this line ever runs: no window is built, no judge is
         # called, no watermark or fingerprint is written.
         self.decision_detection = decision_detection
+        # Opt-in, default off (see mount()'s detect_lessons gate), same "off
+        # means zero cost" contract as decision_detection above -- but its
+        # own flag, buffer, tasks and journal keys, so enabling one detector
+        # never turns the other on and disabling one never disturbs the
+        # other's state.
+        self.lesson_detection = lesson_detection
         # Strong references to in-flight judge tasks -- an unreferenced asyncio
         # Task can be garbage-collected mid-flight, silently dropping a verdict
         # that was already paid for. Tasks remove themselves on completion.
         self._decision_tasks = set()
+        self._lesson_tasks = set()
         # The local work queue an inbound message is filed into, or None when this
         # machine runs none. Optional by design: a session without one receives its
         # messages exactly as before and says so, rather than failing.
@@ -1013,18 +1057,27 @@ class TeamworkHook:
                 "outcome": "acceptance_unknown",
                 "injection": turn["prepared_injection"],
             }
-        if self.decision_detection:
+        if self.decision_detection or self.lesson_detection:
             # Reuses the same projected, redacted text already computed above
-            # for the shared turn record -- the decision-detection window is
-            # bound by the identical redaction and size discipline, nothing
-            # extra is read or recomputed.
-            buffer = self.state.setdefault("decision_turns", [])
-            buffer.append({
+            # for the shared turn record -- both detectors' windows are bound
+            # by the identical redaction and size discipline, nothing extra
+            # is read or recomputed. One entry, appended to whichever
+            # detector-specific buffers are actually on -- see
+            # MAX_LESSON_TURN_BUFFER's comment for why these are separate
+            # buffers rather than one shared one.
+            entry = {
                 "turn_index": self.state["turn_index"],
                 "user_prompt": turn["prompt"],
                 "agent_responses": data["agent_responses"],
-            })
-            self.state["decision_turns"] = buffer[-MAX_DECISION_TURN_BUFFER:]
+            }
+            if self.decision_detection:
+                buffer = self.state.setdefault("decision_turns", [])
+                buffer.append(entry)
+                self.state["decision_turns"] = buffer[-MAX_DECISION_TURN_BUFFER:]
+            if self.lesson_detection:
+                buffer = self.state.setdefault("lesson_turns", [])
+                buffer.append(entry)
+                self.state["lesson_turns"] = buffer[-MAX_LESSON_TURN_BUFFER:]
         self.state["turn"] = None
         self.queue([{"op": "turn.upsert", "id": tid, "expected_version": 0, "data": data}])
 
@@ -1048,6 +1101,18 @@ class TeamworkHook:
             # rather than left to whichever delegation happened to trigger last.
             if self.decision_detection:
                 self.detect_decision()
+            # session:end is the ONLY trigger for lesson detection -- unlike a
+            # decision, a lesson is not tied to handing work off (see
+            # docs/scenarios/06's open questions), so there is no tool:pre
+            # analogue here. A second candidate signal exists in principle --
+            # the moment RecordInsightTool itself is called, since that is
+            # already "a claim worth recording" by the model's own hand -- but
+            # that would fire the lesson judge on the judge's own output when
+            # decision detection's _record_verdict calls RecordInsightTool,
+            # which is not a session boundary and not what 06/06b describe.
+            # Left as session:end only, not registered as a new event type.
+            if self.lesson_detection:
+                self.detect_lesson()
             version = self.state["version"]; self.state["version"] += 1
             self.queue([{"op": "session.upsert", "id": self.sid, "expected_version": version, "data": {"status": status, "ended_at": now()}}])
             try: await self.flush()
@@ -1112,45 +1177,112 @@ class TeamworkHook:
         task.add_done_callback(self._decision_tasks.discard)
         return task
 
+    def detect_lesson(self):
+        """Fire-and-forget: examine this session's turns for a lesson worth
+        recording, and schedule the judge in the background.
+
+        Unlike detect_decision, this has exactly ONE caller: on_end()'s
+        retrospective sweep. A lesson is not tied to handing work off (see
+        docs/scenarios/06's open questions), so there is no tool:pre trigger
+        here -- see on_end()'s comment for why no second signal was added.
+
+        Same watermark-then-judge structure as detect_decision (see its own
+        docstring for why the watermark advances synchronously, before the
+        judge call, and why that is a COST bound rather than a duplicate-
+        record bound): returns the created asyncio.Task, or None when
+        detection is off or there is nothing new since the watermark, in
+        which case no judge call is made and no state is written.
+        """
+        if not self.lesson_detection:
+            return None
+        watermark = self.journal.lesson_watermark(self.sid)
+        turns = [t for t in self.state.get("lesson_turns", []) if t["turn_index"] > watermark]
+        if not turns:
+            return None
+        upto = max(t["turn_index"] for t in turns)
+        self.journal.advance_lesson_watermark(self.sid, upto)
+        self.state["lesson_turns"] = [t for t in self.state.get("lesson_turns", []) if t["turn_index"] > upto]
+        self.journal.save(self.sid, self.state)
+        window = decision_judge.build_window_payload(
+            [{"user_prompt": t["user_prompt"], "agent_responses": t["agent_responses"]} for t in turns])
+        task = asyncio.create_task(self._judge_and_record_lesson(window, upto))
+        self._lesson_tasks.add(task)
+        task.add_done_callback(self._lesson_tasks.discard)
+        return task
+
     async def _judge_and_record(self, window, considered_upto):
-        """Await the judge and, on a RECORD verdict, write it through this
-        session's OWN RecordInsightTool -- never the judge session's, so
-        source_session_id stays this session's (see decision_judge.py's
-        docstring on why that distinction matters). Never raises: every
-        failure here is swallowed and logged, same contract as the judge
-        itself, because a background task that breaks is still worse than
-        one that quietly did nothing.
+        """Await the DECISION judge and, on a RECORD verdict, record it.
+        See `_record_verdict`'s docstring for the shared write path.
         """
         try:
             verdict = await decision_judge.judge_window(self.coordinator, window)
         except Exception:
             logger.warning("Teamwork decision judge failed; nothing recorded", exc_info=True)
             return
+        await self._record_verdict(
+            verdict, considered_upto,
+            uri_scheme="teamwork-decision-window://",
+            seen=lambda fp: self.journal.decision_seen(self.sid, fp),
+            mark_seen=lambda fp: self.journal.record_decision_fingerprint(self.sid, fp),
+            log_label="decision",
+        )
+
+    async def _judge_and_record_lesson(self, window, considered_upto):
+        """Await the LESSON judge and, on a RECORD verdict, record it.
+        See `_record_verdict`'s docstring for the shared write path.
+        """
+        try:
+            verdict = await decision_judge.judge_lesson_window(self.coordinator, window)
+        except Exception:
+            logger.warning("Teamwork lesson judge failed; nothing recorded", exc_info=True)
+            return
+        await self._record_verdict(
+            verdict, considered_upto,
+            uri_scheme="teamwork-lesson-window://",
+            seen=lambda fp: self.journal.lesson_seen(self.sid, fp),
+            mark_seen=lambda fp: self.journal.record_lesson_fingerprint(self.sid, fp),
+            log_label="lesson",
+        )
+
+    async def _record_verdict(self, verdict, considered_upto, *, uri_scheme, seen, mark_seen, log_label):
+        """Shared by both detectors: write a RECORD verdict through this
+        session's OWN RecordInsightTool -- never the judge session's, so
+        source_session_id stays this session's (see decision_judge.py's
+        docstring on why that distinction matters). Never raises: every
+        failure here is swallowed and logged, same contract as the judge
+        itself, because a background task that breaks is still worse than
+        one that quietly did nothing.
+
+        `seen`/`mark_seen` are the caller's own journal-lookup closures
+        (decision_seen/record_decision_fingerprint or their lesson_*
+        counterparts), so this method never needs to know which detector
+        called it beyond `log_label` and `uri_scheme`.
+        """
         if not verdict.get("record"):
             return
         claim = (verdict.get("claim") or "").strip()
         if not claim:
-            logger.warning("Teamwork decision judge said record=true with no claim; nothing recorded")
+            logger.warning("Teamwork %s judge said record=true with no claim; nothing recorded", log_label)
             return
-        # Precision over recall (docs/scenarios/08b): a claim is fingerprinted
-        # by its own normalised text, not by the window that produced it, so
-        # the SAME decision surfacing at every later delegation that acts on
-        # it is recorded once rather than accumulating copies. This catches
-        # only exact re-detections, not paraphrases of the same decision --
-        # a deliberate, documented limit, not an oversight.
+        # Precision over recall (docs/scenarios/08b for decisions, 06/06b for
+        # lessons): a claim is fingerprinted by its own normalised text, not
+        # by the window that produced it, so the SAME thing surfacing at
+        # every later trigger that re-observes it is recorded once rather
+        # than accumulating copies. This catches only exact re-detections,
+        # not paraphrases -- a deliberate, documented limit, not an oversight.
         fingerprint = sha(" ".join(claim.lower().split()))
-        if self.journal.decision_seen(self.sid, fingerprint):
-            logger.info("Teamwork decision judge: duplicate decision skipped (already recorded)")
+        if seen(fingerprint):
+            logger.info("Teamwork %s judge: duplicate skipped (already recorded)", log_label)
             return
         basis, confidence, limitations = verdict.get("basis"), verdict.get("confidence"), verdict.get("what_it_does_not_establish")
         if basis not in ("observation", "inference") or confidence not in ("low", "medium", "high") \
                 or not isinstance(limitations, str) or not limitations.strip():
-            logger.warning("Teamwork decision judge returned an unusable verdict shape; nothing recorded")
+            logger.warning("Teamwork %s judge returned an unusable verdict shape; nothing recorded", log_label)
             return
         evidence = [{
             "kind": "external",
-            "uri": "teamwork-decision-window://" + self.sid + "/upto-turn/" + str(considered_upto),
-            "label": "auto-detected decision window",
+            "uri": uri_scheme + self.sid + "/upto-turn/" + str(considered_upto),
+            "label": "auto-detected " + log_label + " window",
         }]
         try:
             result = await RecordInsightTool(self).execute({
@@ -1159,15 +1291,15 @@ class TeamworkHook:
                 "title": verdict.get("kind") if isinstance(verdict.get("kind"), str) else None,
             })
         except Exception:
-            logger.warning("Teamwork decision judge: recording the verdict failed", exc_info=True)
+            logger.warning("Teamwork %s judge: recording the verdict failed", log_label, exc_info=True)
             return
         error = result.error or {}
         if not result.success and error.get("outcome") != "unknown":
             # A definite refusal. The record demonstrably does not exist, so leave
             # no fingerprint: a later trigger carrying the same claim is free to
             # try again.
-            logger.warning("Teamwork decision judge: RecordInsightTool refused the verdict: %s",
-                            error.get("message"))
+            logger.warning("Teamwork %s judge: RecordInsightTool refused the verdict: %s",
+                            log_label, error.get("message"))
             return
         if not result.success:
             # acceptance_unknown -- the third state this project refuses to
@@ -1175,16 +1307,16 @@ class TeamworkHook:
             # and RecordInsightTool says so itself: "a new call creates a new id
             # and may duplicate it."
             #
-            # So fingerprint it ANYWAY. Precision over recall (docs/scenarios/08b):
-            # a decision silently not recorded costs a re-decision somebody can
-            # make again, while a duplicate costs every future reader permanently
-            # -- there is still no retired state and no forward pointer
-            # (teamwork-s7d). The attempted id is logged so a person can reconcile
-            # it; nothing here claims the record exists.
-            logger.warning("Teamwork decision judge: recording outcome unknown for attempted insight %s; "
+            # So fingerprint it ANYWAY. Precision over recall: a thing silently
+            # not recorded costs a re-detection somebody can make again, while a
+            # duplicate costs every future reader permanently -- there is still
+            # no retired state and no forward pointer (teamwork-s7d). The
+            # attempted id is logged so a person can reconcile it; nothing here
+            # claims the record exists.
+            logger.warning("Teamwork %s judge: recording outcome unknown for attempted insight %s; "
                            "not retrying, because a retry would duplicate. Read it back to confirm.",
-                           error.get("attempted_record_id"))
-        self.journal.record_decision_fingerprint(self.sid, fingerprint)
+                           log_label, error.get("attempted_record_id"))
+        mark_seen(fingerprint)
 
 
 CONNECTION_FIELDS = ("base_url", "project_id", "token", "harness_id")
@@ -1802,6 +1934,19 @@ def decision_detection_enabled(config):
     return True
 
 
+def lesson_detection_enabled(config):
+    """Resolve the detect_lessons opt-in -- identical rule to
+    decision_detection_enabled above, same reasoning, its own independent
+    flag. Absent or False means off; any other non-True value is refused
+    outright as an ambiguous misconfiguration.
+    """
+    if config.get("detect_lessons", False) is False:
+        return False
+    if config.get("detect_lessons") is not True:
+        raise ValueError("Teamwork lesson detection requires explicit detect_lessons: true opt-in")
+    return True
+
+
 async def mount(coordinator, config=None):
     # Delegated prompts are internal work, not the opted-in human conversation.
     if getattr(coordinator, "parent_id", None):
@@ -1812,6 +1957,7 @@ async def mount(coordinator, config=None):
     if config.get("share_visible_turns") is not True:
         raise ValueError("Teamwork hook requires explicit share_visible_turns: true opt-in")
     decision_detection = decision_detection_enabled(config)
+    lesson_detection = lesson_detection_enabled(config)
     try:
         connection, home = resolve_connection(config)
     except ValueError as error:
@@ -1848,7 +1994,8 @@ async def mount(coordinator, config=None):
                         node_label=config.get("node_label"),
                         responsibility=config.get("responsibility"),
                         skills=config.get("skills"), filing=filing,
-                        decision_detection=decision_detection)
+                        decision_detection=decision_detection,
+                        lesson_detection=lesson_detection)
     for name, handler in (("session:start", hook.on_start), ("prompt:submit", hook.on_submit), ("prompt:complete", hook.on_complete), ("session:end", hook.on_end), ("tool:pre", hook.on_tool_pre)):
         coordinator.hooks.register(name, handler, priority=50, name="teamwork-" + name.replace(":", "-"))
     send = SendTool(hook)
