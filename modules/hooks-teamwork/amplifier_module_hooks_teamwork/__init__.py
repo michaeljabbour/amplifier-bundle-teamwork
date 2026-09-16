@@ -1527,16 +1527,40 @@ class RecordInsightTool:
         if title:
             data["title"] = title
         record_id = uid()
+        submitted = False
+
+        def unknown_outcome():
+            return ToolResult(success=False, error={
+                "message": "Recording outcome unknown. Read back insight " + record_id +
+                           " before retrying; a new call creates a new id and may duplicate it.",
+                "outcome": "unknown", "attempted_record_id": record_id,
+            })
+
         try:
-            await asyncio.to_thread(
-                self.hook.client.request, "publish",
-                {"operations": [{"op": "insight.upsert", "id": record_id, "expected_version": 0, "data": data}]}, uid())
+            async with self.hook.lock:
+                # A hook can be enabled after the current prompt began. Confirm
+                # its source session before sending a record attributed to it.
+                self.hook.ensure_session()
+                await self.hook.flush()
+                data["source_session_id"] = self.hook.sid
+                submitted = True
+                response = await asyncio.to_thread(
+                    self.hook.client.request, "publish",
+                    {"operations": [{"op": "insight.upsert", "id": record_id, "expected_version": 0, "data": data}]}, uid())
         except SyncError as error:
+            if not submitted:
+                return ToolResult(success=False, error={"message":
+                    "Insight not submitted: the source session registration could not be confirmed."})
+            if not error.status or error.status >= 500:
+                return unknown_outcome()
             if error.status == 403:
                 reason = ("this project's service did not authorize this session to record knowledge; "
                           "check its session-write permission and the service's knowledge-write support")
             elif error.status == 422:
-                server_message = (error.body.get("error") or {}).get("message") if isinstance(error.body, dict) else None
+                detail = error.body.get("error") if isinstance(error.body, dict) else None
+                server_message = detail.get("message") if isinstance(detail, dict) else None
+                if not isinstance(server_message, str):
+                    server_message = None
                 reason = ("the project service rejected the record: " + self.hook.clean(server_message) if server_message
                           else "the project service rejected the record")
             elif error.status == 409:
@@ -1546,6 +1570,12 @@ class RecordInsightTool:
             else:
                 reason = "the project service could not be reached"
             return ToolResult(success=False, error={"message": "Not recorded: " + reason})
+        results = response.get("results") if isinstance(response, dict) else None
+        if not isinstance(results, list) or not any(
+                isinstance(item, dict) and item.get("id") == record_id
+                and isinstance(item.get("version"), int) and not isinstance(item["version"], bool)
+                and item["version"] >= 1 for item in results):
+            return unknown_outcome()
         return ToolResult(success=True, output={
             "recorded": record_id, "title": title or claim[:100],
             "note": "Visible to the project as a new insight. This tool does not edit earlier records."})
