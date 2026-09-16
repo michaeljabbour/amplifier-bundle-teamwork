@@ -58,3 +58,28 @@ scenario is probably two scenarios.
 | `03-say-what-changes-what-someone-else-would-do` | drafted; twin `03b` named, unwritten |
 | `04-ask-the-machine-that-knows` | drafted; twin `04b` named, unwritten; depends on `03` |
 | `05` -- handing work to another harness | named, unwritten |
+| `06-record-the-lesson-not-the-incident` | drafted; twin `06b` named, unwritten. **Argues for a capability the bundle does not have** -- see below |
+
+### What `06` broke, recorded rather than smoothed over
+
+`06` is the first scenario here about **contributing** knowledge rather than routing a
+question or publishing status, and writing it strained this directory's own shape in two
+places worth knowing before the next one is written.
+
+**The outside tell is displaced in time.** The table above maps *how you'd tell them
+apart from outside* onto *the rubric that grades it*, and that mapping assumes the tell
+is visible in the run that produced the behaviour. For `01`-`04` it is: you look at who
+was asked, or what was published. `06`'s tell is a *different session, weeks later*,
+either benefiting from the record or repeating the mistake. So a rubric derived from it
+**cannot score a single run** -- it can only score a pair. An evaluation built the usual
+way against `06` will silently measure nothing.
+
+**The twin survived.** This was the part expected to break and did not: `06b` is a clean
+same-signal-opposite-move pair (a lesson that is only true on your own machine), so the
+pairing discipline in this README holds for knowledge scenarios unchanged.
+
+**It is a capability argument, not only a guidance argument.** `01`-`04` all argue about
+judgment over tools the bundle already ships. `06` argues for a write path that does not
+exist: the service carries `idea` and `insight` as first-class record types and the hook
+already reads them into the excerpt, but none of the eight tools writes one. A session
+can consume the team's knowledge and contribute none.
