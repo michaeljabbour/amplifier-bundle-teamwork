@@ -627,7 +627,45 @@ def _bare_module(module_id):
     )
 
 
-async def _resolve_providers(parent_coordinator, model_role):
+async def _resolve_providers(parent_coordinator, model_role, explicit_model=None):
+    """Resolve the judge's providers: try the role, then an operator-named model.
+
+    The role is a PREFERENCE and in practice it often cannot be honored -- two
+    real failures, both measured: a resolver that resolves `fast` to a glob
+    (`claude-haiku-*`) whose live model-list lookup fails, and a session with no
+    `model_role_resolver` capability registered at all. Both fall back to the
+    CALLING session's provider, which is typically a frontier model, on every
+    judged turn.
+
+    `explicit_model` is the operator's answer to that: a concrete
+    `"provider/model"` or bare `"model"` from config, used ONLY when the role
+    could not be honored. It turns a silent cost regression into a named choice.
+    Never raises.
+    """
+    providers, note, honored = await _resolve_by_role(parent_coordinator, model_role)
+    if honored or not explicit_model:
+        return providers, note, honored
+    want_provider, _, want_model = str(explicit_model).rpartition("/")
+    if not want_model:
+        return providers, note, honored
+    for spec in providers:
+        if want_provider and _bare_module(spec.get("module", "")) != want_provider:
+            continue
+        spec["config"] = dict(spec.get("config") or {})
+        spec["config"]["default_model"] = want_model
+        # Restrict to this one spec for the same reason the role path does: a
+        # parent's higher-priority expensive provider must not silently win.
+        return [spec], (
+            "model_role %r could not be honored (%s); using the configured "
+            "detection_model %r instead" % (model_role, note, explicit_model)
+        ), True
+    return providers, (
+        "%s -- and the configured detection_model %r names a provider that is not "
+        "among the calling session's providers" % (note, explicit_model)
+    ), False
+
+
+async def _resolve_by_role(parent_coordinator, model_role):
     """Build this session's provider list, inherited from the calling session.
 
     Returns `(providers, note)`. `note` explains what happened -- a `fast`
@@ -729,7 +767,7 @@ async def _resolve_providers(parent_coordinator, model_role):
 
 
 async def build_judge_session(
-    parent_coordinator, *, extra_tools=None, model_role="fast"
+    parent_coordinator, *, extra_tools=None, model_role="fast", explicit_model=None
 ):
     """Construct and initialize an in-process judgment session.
 
@@ -756,7 +794,7 @@ async def build_judge_session(
     from amplifier_core import AmplifierSession  # lazy: amplifier-core is host-supplied
 
     parent_id = getattr(parent_coordinator, "session_id", None)
-    providers, note, role_honored = await _resolve_providers(parent_coordinator, model_role)
+    providers, note, role_honored = await _resolve_providers(parent_coordinator, model_role, explicit_model)
     config = {
         "session": {
             "orchestrator": {"module": "loop-streaming", "config": {"max_iterations": 1}},
@@ -794,7 +832,7 @@ async def build_judge_session(
 # ---------------------------------------------------------------------------
 
 
-async def _judge(parent_coordinator, window, prompt_builder, *, extra_tools=None, log_label="decision judge"):
+async def _judge(parent_coordinator, window, prompt_builder, *, extra_tools=None, log_label="decision judge", explicit_model=None):
     """Shared body for `judge_window()` and `judge_lesson_window()`: classify
     ONE window using whichever `prompt_builder(window)` the caller supplies;
     operational failures return an unavailable verdict.
@@ -808,7 +846,7 @@ async def _judge(parent_coordinator, window, prompt_builder, *, extra_tools=None
     """
     try:
         session, note, role_honored = await build_judge_session(
-            parent_coordinator, extra_tools=extra_tools
+            parent_coordinator, extra_tools=extra_tools, explicit_model=explicit_model
         )
     except Exception as error:
         logger.warning("%s: could not build a judge session (%s)", log_label, type(error).__name__)
@@ -837,21 +875,23 @@ async def _judge(parent_coordinator, window, prompt_builder, *, extra_tools=None
     return verdict
 
 
-async def judge_window(parent_coordinator, window, *, extra_tools=None):
+async def judge_window(parent_coordinator, window, *, extra_tools=None, explicit_model=None):
     """Classify ONE window as a DECISION verdict (docs/scenarios/08, 08b)."""
     return await _judge(
-        parent_coordinator, window, _prompt_for, extra_tools=extra_tools, log_label="decision judge"
+        parent_coordinator, window, _prompt_for, extra_tools=extra_tools,
+        log_label="decision judge", explicit_model=explicit_model,
     )
 
 
-async def judge_lesson_window(parent_coordinator, window, *, extra_tools=None):
+async def judge_lesson_window(parent_coordinator, window, *, extra_tools=None, explicit_model=None):
     """Classify ONE window as a LESSON verdict (docs/scenarios/06, 06b).
 
     Same contract as `judge_window()` in every respect but the prompt: the
     verdict shape, `no_verdict` sentinel, and failure handling are identical.
     """
     return await _judge(
-        parent_coordinator, window, _prompt_for_lesson, extra_tools=extra_tools, log_label="lesson judge"
+        parent_coordinator, window, _prompt_for_lesson, extra_tools=extra_tools,
+        log_label="lesson judge", explicit_model=explicit_model,
     )
 
 

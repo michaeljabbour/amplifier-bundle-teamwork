@@ -229,6 +229,30 @@ trigger it. It never blocks or delays your turn, and a failure is logged and dro
 rather than raised. But it is real spend against your own key, on a schedule you do not
 directly control, and that is the honest cost of the feature.
 
+**Name the model, or expect to pay frontier rates.** The `fast` role is a *preference*,
+and in practice it often cannot be honored -- measured twice: a resolver that resolves
+`fast` to a glob (`claude-haiku-*`) whose live model-list lookup fails, and a session
+with no `model_role_resolver` registered at all. **In both cases the judge falls back to
+the model your own session runs on**, which is typically the expensive one, on every
+turn that triggers detection.
+
+```yaml
+      detect_decisions: true
+      detection_model: anthropic/claude-haiku-4-5   # or a bare model name
+```
+
+`detection_model` is used **only** when the role could not be honored, so it never
+overrides a routing matrix that is working. Leave it unset and you get today's behaviour
+-- the fallback still happens, and now says so at WARNING:
+
+```
+decision judge: requested model role was NOT honored -- model_role 'fast' resolved to
+no candidates; using the calling session's provider unchanged
+```
+
+A present-but-not-a-string value is refused at mount rather than coerced. A typo here
+does not fail visibly; it just quietly bills a frontier model on every judged turn.
+
 **When it looks.** Two moments only:
 
 | signal | what it catches |

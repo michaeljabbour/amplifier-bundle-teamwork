@@ -30,6 +30,7 @@ from amplifier_module_hooks_teamwork import (
     RecordInsightTool,
     TeamworkHook,
     decision_judge,
+    detection_model_setting,
 )
 from amplifier_module_hooks_teamwork import mount as teamwork_mount
 
@@ -656,3 +657,61 @@ class ToolMountingTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConfiguredDetectionModelTakesOverWhenTheRoleCannotBeHonored(unittest.IsolatedAsyncioTestCase):
+    """The `fast` role is a preference, and in practice it is usually NOT
+    honored -- measured twice: a resolver that resolves it to a glob whose
+    live model-list lookup fails, and a session with no resolver registered.
+    Both then run the judge on the CALLING session's frontier model, on every
+    judged turn. `detection_model` is the operator's answer, and it applies
+    only where the role already failed.
+    """
+
+    def _parent(self, resolver=None):
+        config = {"providers": [
+            {"module": "provider-anthropic", "config": {"priority": 1, "default_model": "claude-opus-5"}},
+        ]}
+        return SimpleNamespace(config=config, get_capability=lambda name: resolver)
+
+    async def test_no_resolver_at_all_falls_back_to_the_configured_model(self):
+        providers, note, honored = await decision_judge._resolve_providers(
+            self._parent(resolver=None), "fast", "anthropic/claude-haiku-4-5")
+        self.assertTrue(honored)
+        self.assertEqual(providers[0]["config"]["default_model"], "claude-haiku-4-5")
+        self.assertIn("detection_model", note)
+
+    async def test_a_glob_the_judge_cannot_expand_falls_back_to_the_configured_model(self):
+        resolver = SimpleNamespace(resolve=AsyncMock(return_value=[{"provider": "anthropic", "model": "claude-haiku-*"}]))
+        providers, _note, honored = await decision_judge._resolve_providers(
+            self._parent(resolver), "fast", "claude-haiku-4-5")
+        self.assertTrue(honored)
+        self.assertEqual(providers[0]["config"]["default_model"], "claude-haiku-4-5")
+
+    async def test_a_role_that_DOES_resolve_wins_over_the_configured_model(self):
+        resolver = SimpleNamespace(resolve=AsyncMock(return_value=[{"provider": "anthropic", "model": "resolved-small"}]))
+        providers, _note, honored = await decision_judge._resolve_providers(
+            self._parent(resolver), "fast", "anthropic/ignored-me")
+        self.assertTrue(honored)
+        self.assertEqual(providers[0]["config"]["default_model"], "resolved-small")
+
+    async def test_without_a_configured_model_todays_behaviour_is_unchanged(self):
+        providers, _note, honored = await decision_judge._resolve_providers(
+            self._parent(resolver=None), "fast", None)
+        self.assertFalse(honored)
+        self.assertEqual(providers[0]["config"]["default_model"], "claude-opus-5")
+
+    async def test_a_configured_provider_not_among_the_parents_is_refused_not_invented(self):
+        providers, note, honored = await decision_judge._resolve_providers(
+            self._parent(resolver=None), "fast", "openai/gpt-nope")
+        self.assertFalse(honored)
+        self.assertEqual(providers[0]["config"]["default_model"], "claude-opus-5")
+        self.assertIn("not", note)
+
+    def test_the_setting_refuses_an_ambiguous_value_rather_than_coercing_it(self):
+        self.assertIsNone(detection_model_setting({}))
+        self.assertEqual(detection_model_setting({"detection_model": "  anthropic/x  "}), "anthropic/x")
+        with self.assertRaisesRegex(ValueError, "non-empty string"):
+            detection_model_setting({"detection_model": True})
+        with self.assertRaisesRegex(ValueError, "non-empty string"):
+            detection_model_setting({"detection_model": "   "})

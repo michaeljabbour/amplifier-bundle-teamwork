@@ -354,7 +354,7 @@ class Journal:
 class TeamworkHook:
     def __init__(self, coordinator, connection, journal, client=None, level=VERBOSITY_DEFAULT, complaint=None,
                  node_label=None, responsibility=None, skills=None, filing=None, decision_detection=False,
-                 lesson_detection=False):
+                 lesson_detection=False, detection_model=None):
         self.coordinator, self.connection, self.journal = coordinator, connection, journal
         self.level = level
         # Opt-in, default off (see mount()'s detect_decisions gate). Off means
@@ -367,6 +367,14 @@ class TeamworkHook:
         # never turns the other on and disabling one never disturbs the
         # other's state.
         self.lesson_detection = lesson_detection
+        # The concrete model a judge should use when the `fast` ROLE cannot be
+        # honored -- which, measured twice, is the common case rather than the
+        # exception (a resolver that resolves `fast` to a glob whose live
+        # model-list lookup fails; a session with no resolver registered at
+        # all). Without it the judge silently runs on the calling session's
+        # frontier model on every judged turn. None keeps exactly that old
+        # behaviour, now at WARNING rather than in silence.
+        self.detection_model = detection_model
         # Strong references to in-flight judge tasks -- an unreferenced asyncio
         # Task can be garbage-collected mid-flight, silently dropping a verdict
         # that was already paid for. Tasks remove themselves on completion.
@@ -1253,7 +1261,8 @@ class TeamworkHook:
         See `_record_verdict`'s docstring for the shared write path.
         """
         try:
-            verdict = await decision_judge.judge_window(self.coordinator, window)
+            verdict = await decision_judge.judge_window(
+                self.coordinator, window, explicit_model=self.detection_model)
         except Exception:
             logger.warning("Teamwork decision judge failed; nothing recorded", exc_info=True)
             return
@@ -1270,7 +1279,8 @@ class TeamworkHook:
         See `_record_verdict`'s docstring for the shared write path.
         """
         try:
-            verdict = await decision_judge.judge_lesson_window(self.coordinator, window)
+            verdict = await decision_judge.judge_lesson_window(
+                self.coordinator, window, explicit_model=self.detection_model)
         except Exception:
             logger.warning("Teamwork lesson judge failed; nothing recorded", exc_info=True)
             return
@@ -2009,6 +2019,27 @@ def decision_detection_enabled(config):
     return True
 
 
+def detection_model_setting(config):
+    """Resolve `detection_model`: the concrete model a judge uses when the
+    `fast` role cannot be honored.
+
+    Absent means None -- the judge asks for the role, and if that fails it runs
+    on the calling session's own provider, which is what happens today and is
+    now logged at WARNING rather than silently. A present-but-not-a-string
+    value is refused outright rather than coerced, for the same reason the
+    opt-in flags refuse an ambiguous value: a typo here does not fail visibly,
+    it just quietly bills a frontier model on every judged turn.
+
+    Accepts `"provider/model"` or a bare `"model"`.
+    """
+    value = config.get("detection_model")
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("Teamwork detection_model must be a non-empty string like 'anthropic/claude-haiku-4-5'")
+    return value.strip()
+
+
 def lesson_detection_enabled(config):
     """Resolve the detect_lessons opt-in -- identical rule to
     decision_detection_enabled above, same reasoning, its own independent
@@ -2033,6 +2064,7 @@ async def mount(coordinator, config=None):
         raise ValueError("Teamwork hook requires explicit share_visible_turns: true opt-in")
     decision_detection = decision_detection_enabled(config)
     lesson_detection = lesson_detection_enabled(config)
+    detection_model = detection_model_setting(config)
     try:
         connection, home = resolve_connection(config)
     except ValueError as error:
@@ -2070,7 +2102,8 @@ async def mount(coordinator, config=None):
                         responsibility=config.get("responsibility"),
                         skills=config.get("skills"), filing=filing,
                         decision_detection=decision_detection,
-                        lesson_detection=lesson_detection)
+                        lesson_detection=lesson_detection,
+                        detection_model=detection_model)
     for name, handler in (("session:start", hook.on_start), ("prompt:submit", hook.on_submit), ("prompt:complete", hook.on_complete), ("session:end", hook.on_end), ("tool:pre", hook.on_tool_pre)):
         coordinator.hooks.register(name, handler, priority=50, name="teamwork-" + name.replace(":", "-"))
     send = SendTool(hook)

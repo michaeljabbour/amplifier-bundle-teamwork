@@ -304,7 +304,7 @@ class WatermarkBoundsReExamination(unittest.IsolatedAsyncioTestCase):
         add_turn(hook, "u2", "r2")
         captured = []
 
-        async def fake_judge(coordinator, window):
+        async def fake_judge(coordinator, window, **kwargs):
             captured.append(window)
             return decision_judge.no_verdict("test probe")
 
@@ -343,7 +343,7 @@ class JudgeFailureIsolation(unittest.IsolatedAsyncioTestCase):
         hook, client, _journal = build(self)
         add_turn(hook, "u1", "r1")
 
-        async def boom(coordinator, window):
+        async def boom(coordinator, window, **kwargs):
             raise RuntimeError("the provider is unreachable")
 
         with patch.object(decision_judge, "judge_lesson_window", boom):
@@ -438,7 +438,7 @@ class TallyReachesTheLessonJudge(unittest.IsolatedAsyncioTestCase):
         add_turn(hook, "u1", "r1")
         captured = []
 
-        async def fake_judge(coordinator, window):
+        async def fake_judge(coordinator, window, **kwargs):
             captured.append(window)
             return decision_judge.no_verdict("test probe")
 
@@ -460,7 +460,7 @@ class TallyReachesTheLessonJudge(unittest.IsolatedAsyncioTestCase):
         add_turn(hook, "u1", "r1")
         captured = []
 
-        async def fake_judge(coordinator, window):
+        async def fake_judge(coordinator, window, **kwargs):
             captured.append(window)
             return decision_judge.no_verdict("test probe")
 
@@ -475,7 +475,7 @@ class TallyReachesTheLessonJudge(unittest.IsolatedAsyncioTestCase):
         add_turn(hook, "u1", "r1")
         captured = []
 
-        async def fake_judge(coordinator, window):
+        async def fake_judge(coordinator, window, **kwargs):
             captured.append(window)
             return decision_judge.no_verdict("test probe")
 
