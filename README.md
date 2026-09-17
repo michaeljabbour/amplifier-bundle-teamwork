@@ -483,11 +483,17 @@ TEAMWORK_HOME="$HOME/.config/amplifier-teamwork/teamwork"
 mkdir -p "$TEAMWORK_HOME"
 
 python3 setup_teamwork.py \
-  --project teamwork \
   --bundle "$BASE_BUNDLE" \
   --connection-file "$TEAMWORK_HOME/connection.json" \
   --output "$TEAMWORK_HOME/teamwork-overlay.yaml"
 ```
+
+**`--project` is optional and usually unnecessary.** Omit it and the script reads the id the
+service publishes at `GET /api/config`, which is unauthenticated and happens before any
+prompt. Pass it explicitly to pin a different project, or when the service cannot be read;
+an unreachable or unparseable response falls back to `teamwork` rather than failing the
+enrollment. The line the script prints on success names the project that actually received
+your consent, whichever way it was resolved.
 
 The script asks for the member code without saving it, enrolls a separate project-scoped harness credential, writes a private connection file, and writes the overlay. Existing output files are not overwritten. Keep the connection file, SQLite journal, and overlay outside the repository and out of source control.
 
