@@ -157,10 +157,38 @@ def enroll_and_save(post, base, project, base_bundle, label, name, code, path, o
     return path, output
 
 
+def discover_project(base):
+    """Return the project id the service publishes at /api/config.
+
+    The service already knows its own project id and publishes it
+    unauthenticated; asking a person to retype it is asking them to guess
+    something the other end could have said. This reads it.
+
+    NEVER fatal. A 401/403 means an auth layer sits in front of the service's
+    own config -- the same "unavailable" the SSO path already tolerates, not a
+    misconfiguration. Any other failure is equally non-fatal here: enrollment
+    with the historical default is strictly better than refusing to enroll
+    because an optional convenience read did not work. The explicit --project
+    flag always wins and skips this entirely.
+    """
+    try:
+        request = urllib.request.Request(base + "/api/config", headers={"Accept": "application/json"})
+        opener = urllib.request.build_opener(NoRedirect()).open
+        with opener(request, timeout=COLD_START_SECONDS) as response:
+            published = json.loads(response.read().decode("utf-8"))
+        value = published.get("project_id") if isinstance(published, dict) else None
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    except Exception:
+        pass
+    return "teamwork"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
-    parser.add_argument("--project", default="teamwork")
+    parser.add_argument("--project", help="Project id; omit to use the one the service publishes "
+                        "at /api/config (falls back to 'teamwork' when it cannot be read)")
     parser.add_argument("--bundle", required=True, help="Your existing bundle name or path; never guessed")
     parser.add_argument("--label", default="Amplifier harness", help="Optional label; no machine hostname is collected")
     parser.add_argument("--output")
@@ -180,7 +208,8 @@ def main():
         origin = service_origin(args.origin) if args.origin else service_origin(base)
     except ValueError as error:
         raise SystemExit(str(error)) from None
-    default_connection, default_overlay = project_paths(args.project)
+    project = args.project or discover_project(base)
+    default_connection, default_overlay = project_paths(project)
     path = Path(args.connection_file).expanduser().resolve() if args.connection_file else default_connection.resolve()
     if path.exists(): raise SystemExit("Connection file already exists; choose a new --connection-file (existing credential preserved)")
     output = Path(args.output).expanduser().resolve() if args.output else default_overlay.resolve()
@@ -189,16 +218,19 @@ def main():
     name = input("Name or email: ").strip()
     token = getpass.getpass("Private member login code (not saved): ")
     def post(endpoint, body, cookie=None):
-        headers = {"Content-Type": "application/json", "Origin": origin, "X-Teamwork-Project": args.project}
+        headers = {"Content-Type": "application/json", "Origin": origin, "X-Teamwork-Project": project}
         if cookie: headers["Cookie"] = cookie
         request = urllib.request.Request(base + endpoint, data=json.dumps(body).encode(), headers=headers)
         try:
             return send(request)
         except urllib.error.HTTPError as error:
             status = error.code; error.close(); raise SystemExit(f"Enrollment HTTP {status}; check login and project membership") from None
-    path, output = enroll_and_save(post, base, args.project, args.bundle, args.label, name, token, path, output)
+    path, output = enroll_and_save(post, base, project, args.bundle, args.label, name, token, path, output)
     print("Created opt-in overlay:", output)
-    print("Enrolled project:", args.project)
+    # The RESOLVED project, not the flag: --project is now None whenever it was
+    # omitted, and this is the one line that tells a person which project just
+    # received their consent. Printing None there is worse than printing nothing.
+    print("Enrolled project:", project)
     print("Start a NEW session: amplifier run --bundle " + output.as_uri())
     print("Visible prompts/responses will be shared to this project. No active session or default bundle changed.")
 

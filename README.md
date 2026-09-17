@@ -82,7 +82,7 @@ A session that is already running keeps the tool set it started with, so `teamwo
 2. Ask: **Connect this session to Teamwork.** Amplifier invokes `teamwork_connect`, which opens a private local browser form.
 3. The form supports three enrollment methods, tried in this order for whatever you fill in and submit:
    1. **Portal credential (current default path).** In Teamwork's web portal, open Account menu → Harnesses & agents, mint a harness credential (shown once), and paste it into the form's **Credential from the portal** field along with the exact project ID. This never touches `/api/login` or `az`; it is verified with the service directly and, if accepted, stored the same as any other enrollment. If it is rejected, or if the service cannot confirm it, the form re-renders asking to try again. If a connection is already saved for that project, the new credential is not used -- an existing saved connection is never overwritten -- and the form tells you so explicitly, with how to rotate it.
-   2. **Microsoft sign-in (`az login`), when the service advertises it.** If you have run `az login` and left both the credential and member-code fields blank, the form offers Microsoft sign-in. When this directory has a usable GitHub remote, the form shows the exact repository URL that will be sent and the project ID becomes optional -- Teamwork resolves the project from that repository. **This path requires the service to advertise Entra bearer support (`api_app_id`) via `/api/config`, which is pending server-side work; until then, sign-in enrollment is not offered and the form falls back to the credential or member-code fields instead.**
+   2. **Microsoft sign-in (`az login`), when the service advertises it.** With the portal-credential and member-code fields blank, the form can use your Azure CLI sign-in. A usable GitHub remote makes the project ID optional: Teamwork resolves the project from the displayed repository URL. The canonical service advertises `api_app_id`, `tenant_id`, and `project_id` through `/api/config` (verified 2026-09-17). A live test reported in [PR #48](https://github.com/michaeljabbour/amplifier-bundle-teamwork/pull/48) acquired a token for the advertised audience and tenant, then received `403 not_a_member` from enrollment; member-code enrollment succeeded in that test. This response identifies a miss in the operator-managed email/alias roster after token validation. The affected sign-in identity and roster mapping still need reconciliation. Use the member-code or portal-credential fields if Microsoft sign-in is refused. Project auto-discovery in `setup_teamwork.py` does not repair that roster mapping.
    3. **Private member code (fallback, always available).** Enter the exact project ID you joined, your name/email and private member code, and confirm sharing. Never paste the code into chat.
    On later sessions, select the same project and leave the credential/login fields blank to reuse its saved connection.
    If the browser tab does not appear, open the one-time address Amplifier prints to the terminal. It is also written to `~/.config/amplifier-teamwork/native/pending-form-url.txt` (mode 0600) while the form is open, and removed when it closes. That address contains a private code, so treat it like the form itself.
@@ -483,11 +483,17 @@ TEAMWORK_HOME="$HOME/.config/amplifier-teamwork/teamwork"
 mkdir -p "$TEAMWORK_HOME"
 
 python3 setup_teamwork.py \
-  --project teamwork \
   --bundle "$BASE_BUNDLE" \
   --connection-file "$TEAMWORK_HOME/connection.json" \
   --output "$TEAMWORK_HOME/teamwork-overlay.yaml"
 ```
+
+**`--project` is optional and usually unnecessary.** Omit it and the script reads the id the
+service publishes at `GET /api/config`, which is unauthenticated and happens before any
+prompt. Pass it explicitly to pin a different project, or when the service cannot be read;
+an unreachable or unparseable response falls back to `teamwork` rather than failing the
+enrollment. The line the script prints on success names the project that actually received
+your consent, whichever way it was resolved.
 
 The script asks for the member code without saving it, enrolls a separate project-scoped harness credential, writes a private connection file, and writes the overlay. Existing output files are not overwritten. Keep the connection file, SQLite journal, and overlay outside the repository and out of source control.
 

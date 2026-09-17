@@ -233,13 +233,36 @@ class SSOEnrollmentTests(unittest.TestCase):
             def open(self, request, **kwargs):
                 if request.full_url.endswith('/api/config'):
                     return Response({'api_app_id': 'fixture-app-id'})
-                error_body = json.dumps({'error': 'entra_unmapped'}).encode()
+                error_body = json.dumps({'error': {'code': 'not_a_member', 'message': 'untrusted service text'}}).encode()
                 raise urllib.error.HTTPError(request.full_url, 403, 'Forbidden', {}, io.BytesIO(error_body))
         with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', return_value=Opener()):
             with self.assertRaises(ConsentError) as raised:
                 connect({'project': 'selected', 'consent': 'yes'}, BASE, Path(home))
         self.assertEqual(raised.exception.field, 'name')
         self.assertIn('member code', raised.exception.hint.lower())
+        self.assertIn('Ask a workspace maintainer to add it', str(raised.exception))
+        self.assertNotIn('untrusted service text', str(raised.exception))
+
+    def test_other_entra_refusals_do_not_claim_missing_membership(self):
+        for status, code, expected, field in (
+            (401, 'unauthorized', 'could not be verified', 'name'),
+            (403, 'forbidden', 'not allowed to enroll', 'project'),
+        ):
+            with self.subTest(status=status):
+                class Opener:
+                    def open(self, request, **kwargs):
+                        if request.full_url.endswith('/api/config'):
+                            return Response({'api_app_id': 'fixture-app-id'})
+                        body = json.dumps({'error': {'code': code, 'message': 'untrusted service text'}}).encode()
+                        raise urllib.error.HTTPError(request.full_url, status, 'Refused', {}, io.BytesIO(body))
+                with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', return_value=Opener()):
+                    with self.assertRaises(ConsentError) as raised:
+                        connect({'project': 'selected', 'consent': 'yes'}, BASE, Path(home))
+                    self.assertEqual(list(Path(home).rglob('connection.json')), [])
+                self.assertIn(expected, str(raised.exception))
+                self.assertEqual(raised.exception.field, field)
+                self.assertNotIn('not a member', str(raised.exception))
+                self.assertNotIn('untrusted service text', str(raised.exception))
 
     def test_sso_conflict_revokes_the_new_credential_and_reuses_the_saved_one(self):
         with tempfile.TemporaryDirectory() as home:
@@ -909,3 +932,89 @@ class AutoBindTests(unittest.IsolatedAsyncioTestCase):
 
 
 if __name__ == '__main__': unittest.main()
+
+
+class ProjectIdIsDiscoveredNotAssumed(unittest.TestCase):
+    """The service publishes its own project id unauthenticated at /api/config.
+    Asking a person to retype it is asking them to guess something the other end
+    could have said -- it was the first question real onboarding produced.
+    """
+
+    def _module(self, source_transform=lambda s: s):
+        import importlib.util
+        path = Path(__file__).resolve().parents[1] / "setup_teamwork.py"
+        spec = importlib.util.spec_from_file_location("setup_probe", path)
+        module = importlib.util.module_from_spec(spec)
+        exec(compile(source_transform(path.read_text()), str(path), "exec"), module.__dict__)
+        return module
+
+    def test_a_published_project_id_is_used(self):
+        module = self._module()
+        published = json.dumps({"project_id": "some-other-project"}).encode()
+        with patch.object(module.urllib.request, "build_opener") as opener:
+            opener.return_value.open.return_value.__enter__.return_value.read.return_value = published
+            self.assertEqual(module.discover_project("https://svc.example.invalid"), "some-other-project")
+
+    def test_an_unreachable_service_falls_back_and_never_raises(self):
+        # A convenience read must not be able to stop an enrollment that would
+        # otherwise succeed -- 401/403 (an auth layer in front of the service's
+        # own config) included, which is the same "unavailable" the SSO path
+        # already tolerates.
+        module = self._module()
+        with patch.object(module.urllib.request, "build_opener", side_effect=OSError("down")):
+            self.assertEqual(module.discover_project("https://svc.example.invalid"), "teamwork")
+
+    def test_a_blank_or_non_string_project_id_is_not_trusted(self):
+        module = self._module()
+        for bad in (json.dumps({"project_id": "   "}).encode(),
+                    json.dumps({"project_id": 7}).encode(),
+                    b"not json at all"):
+            with patch.object(module.urllib.request, "build_opener") as opener:
+                opener.return_value.open.return_value.__enter__.return_value.read.return_value = bad
+                self.assertEqual(module.discover_project("https://svc.example.invalid"), "teamwork")
+
+
+class TheSuccessLineNamesTheProjectThatGotConsent(unittest.TestCase):
+    """Regression for a bug this suite could not have caught: every use site of
+    the project was moved to the resolved variable EXCEPT the success line, so
+    the discovery path printed `Enrolled project: None` directly above "Visible
+    prompts/responses will be shared to this project."
+
+    Nothing asserted the output, so 463 green tests said nothing about the one
+    line whose entire job is telling a person which project just received their
+    consent. The live enrollment run that "proved" discovery had exercised the
+    PREVIOUS commit, not this code.
+    """
+
+    def _run_main(self, argv, tmp):
+        import importlib.util, io, contextlib
+        path = Path(__file__).resolve().parents[1] / "setup_teamwork.py"
+        spec = importlib.util.spec_from_file_location("setup_main_probe", path)
+        module = importlib.util.module_from_spec(spec)
+        exec(compile(path.read_text(), str(path), "exec"), module.__dict__)
+        buffer = io.StringIO()
+        with patch.object(module, "discover_project", return_value="discovered-project"), \
+             patch.object(module, "enroll_and_save",
+                          side_effect=lambda *a, **k: (Path(tmp) / "c.json", Path(tmp) / "o.yaml")), \
+             patch.object(module, "input", create=True, return_value="Someone"), \
+             patch.object(module, "getpass", create=True, return_value="code"), \
+             patch.object(sys, "argv", argv), contextlib.redirect_stdout(buffer):
+            module.main()
+        return buffer.getvalue()
+
+    def test_an_omitted_project_flag_prints_the_discovered_id_not_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self._run_main(
+                ["setup_teamwork.py", "--bundle", "b.yaml",
+                 "--connection-file", str(Path(tmp) / "c.json"),
+                 "--output", str(Path(tmp) / "o.yaml")], tmp)
+        self.assertIn("Enrolled project: discovered-project", out)
+        self.assertNotIn("None", out)
+
+    def test_an_explicit_project_flag_still_wins_and_is_printed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self._run_main(
+                ["setup_teamwork.py", "--bundle", "b.yaml", "--project", "typed-project",
+                 "--connection-file", str(Path(tmp) / "c.json"),
+                 "--output", str(Path(tmp) / "o.yaml")], tmp)
+        self.assertIn("Enrolled project: typed-project", out)
