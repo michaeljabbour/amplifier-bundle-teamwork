@@ -53,6 +53,41 @@ class ConsentAborted(RuntimeError):
     """Self-authored message safe to return to the model; never service text."""
 
 
+class ConsentAttempt:
+    """Cancel pending work, or seal a completed connection, under one lock."""
+
+    def __init__(self, stop):
+        self.stop = stop
+        self.lock = threading.Lock()
+        self.requested = False
+        self.completed = False
+
+    def check(self):
+        with self.lock:
+            if self.requested or self.stop.is_set():
+                raise ConsentAborted("The connection was cancelled before completion.")
+
+    def complete(self):
+        with self.lock:
+            if self.completed:
+                return
+            if self.requested or self.stop.is_set():
+                raise ConsentAborted("The connection was cancelled before completion.")
+            self.completed = True
+
+    def cancel(self):
+        with self.lock:
+            if self.completed:
+                return False
+            self.requested = True
+            return True
+
+
+def _check_attempt(attempt, *, complete=False):
+    if attempt is not None:
+        attempt.complete() if complete else attempt.check()
+
+
 class _MintError(Exception):
     """An HTTP error response from a bearer-authenticated mint/revoke call."""
 
@@ -108,7 +143,7 @@ def _safe_directory(home, base, project):
     return directory
 
 
-def _reuse_saved_connection(path, base, project):
+def _reuse_saved_connection(path, base, project, *, verify=True, attempt=None):
     if path.is_symlink() or (os.name != "nt" and path.stat().st_mode & 0o077):
         raise ConsentError("The saved connection file is not private.", None,
                            "Restore mode 0600 on the saved connection file, then retry.")
@@ -117,9 +152,12 @@ def _reuse_saved_connection(path, base, project):
     except ValueError:
         raise ConsentError("The saved connection file is unreadable.", None,
                            "Revoke that harness in Teamwork, delete the saved file, then enroll again.") from None
-    if saved.get("base_url") != base or saved.get("project_id") != project or not saved.get("token"):
+    if not isinstance(saved, dict) or saved.get("base_url") != base or saved.get("project_id") != project or not saved.get("token"):
         raise ConsentError("A different connection is already saved for this project.", "project",
                            "Revoke that harness in Teamwork and delete its saved file before re-enrolling.")
+    if verify:
+        _verify_connection(base, project, saved["token"], saved=True, attempt=attempt)
+        _check_attempt(attempt, complete=True)
     return path, project
 
 
@@ -139,7 +177,42 @@ def _write_recovery_breadcrumb(directory, harness_id):
         json.dump({"harness_id": harness_id, "action": "Revoke in Teamwork harness controls"}, output)
 
 
-def _mint_member(form, base, home, project, repository, origin=None):
+def _member_request(base, endpoint, body, headers, origin):
+    """Translate known stage/status pairs, never render arbitrary service text."""
+    try:
+        return _http(base, endpoint, body, headers, origin=origin)
+    except urllib.error.HTTPError as error:
+        status = error.code
+        error.close()
+        if endpoint == "/api/login" and status == 401:
+            raise ConsentError("Your name/email or personal access code was not accepted.", "code",
+                               "Use the personal access code supplied for your account, not a portal agent credential.") from None
+        if endpoint == "/api/harnesses" and status == 404:
+            raise ConsentError("Sign-in succeeded, but this account has no access to that project.", "project",
+                               "Check the project ID and ask a project owner to grant access if needed.") from None
+        if endpoint == "/api/harnesses" and status == 403:
+            raise ConsentError("Sign-in succeeded, but this account cannot enroll an agent in that project.", "project",
+                               "Agent enrollment requires contributor or owner access to the selected project.") from None
+        if endpoint == "/api/harnesses" and status not in (401, 429):
+            raise ConsentError("The enrollment outcome is unknown; a new agent credential may have been created.", None,
+                               "Review Harnesses & agents in the portal and revoke any credential from this attempt before retrying.") from None
+        if status == 429:
+            raise ConsentError("Too many sign-in attempts. Try again shortly.", None,
+                               "Wait a minute before submitting again.") from None
+        if status in (301, 302, 303, 307, 308, 401, 403):
+            raise ConsentError("The service refused this sign-in request.", None,
+                               "Check the configured Teamwork web service URL. No credential was forwarded to a redirect.") from None
+        raise ConsentError("The Teamwork service is unavailable for enrollment.", None,
+                           "Try again later. If a previous attempt was interrupted, review your portal's agent credentials first.") from None
+    except (OSError, ValueError):
+        if endpoint == "/api/harnesses":
+            raise ConsentError("The enrollment outcome is unknown; a new agent credential may have been created.", None,
+                               "Review Harnesses & agents in the portal and revoke any credential from this attempt before retrying.") from None
+        raise ConsentError("The Teamwork service is unavailable for enrollment.", None,
+                           "Check your connection and the configured service URL, then try again.") from None
+
+
+def _mint_member(form, base, home, project, repository, origin=None, attempt=None):
     """Member-code path: reserve the file before issuing a credential; never overwrite.
 
     `origin` is threaded to every request here because this path is the one
@@ -151,7 +224,10 @@ def _mint_member(form, base, home, project, repository, origin=None):
     directory = _safe_directory(home, base, project)
     path = directory / "connection.json"
     if path.exists():
-        return _reuse_saved_connection(path, base, project)
+        if form.get("name", "").strip() or form.get("code"):
+            raise ConsentError("This project already has a saved connection; your new login details were not used.", "name",
+                               "Clear the name and personal access code to verify and reuse it, or review the saved agent credential in the portal before reconnecting.")
+        return _reuse_saved_connection(path, base, project, attempt=attempt)
     if not form.get("name", "").strip() or not form.get("code"):
         raise ConsentError("First enrollment needs your name and private member code.",
                            "name" if not form.get("name", "").strip() else "code",
@@ -161,20 +237,32 @@ def _mint_member(form, base, home, project, repository, origin=None):
     cookie = None
     try:
         with os.fdopen(fd, "w") as output:
-            _, headers = _http(base, "/api/login", {"name": form["name"].strip(), "token": form["code"]},
-                               {"X-Teamwork-Project": project}, origin=origin)
+            _check_attempt(attempt)
+            _, headers = _member_request(base, "/api/login", {"name": form["name"].strip(), "token": form["code"]},
+                                         {"X-Teamwork-Project": project}, origin)
             cookie = headers["Set-Cookie"].split(";")[0]
-            credential, _ = _http(base, "/api/harnesses", {"label": "Amplifier native", "scopes": SCOPES},
-                                  {"X-Teamwork-Project": project, "Cookie": cookie}, origin=origin)
+            _check_attempt(attempt)
+            credential, _ = _member_request(base, "/api/harnesses", {"label": "Amplifier native", "scopes": SCOPES},
+                                            {"X-Teamwork-Project": project, "Cookie": cookie}, origin)
+            _check_attempt(attempt)
             _write_connection(output, base, project, credential, repository)
+        _check_attempt(attempt, complete=True)
     except BaseException:
+        cleanup_failed = False
         if credential:
             try:
                 _http(base, "/api/harnesses/revoke", {"id": credential["id"]},
                      {"X-Teamwork-Project": project, "Cookie": cookie}, origin=origin)
             except Exception:
-                _write_recovery_breadcrumb(directory, credential["id"])
+                cleanup_failed = True
+                try:
+                    _write_recovery_breadcrumb(directory, credential["id"])
+                except Exception:
+                    pass
         path.unlink(missing_ok=True)
+        if cleanup_failed:
+            raise ConsentError("The new agent credential could not be revoked after enrollment stopped.", None,
+                               "Review Harnesses & agents in the portal and revoke the new credential before retrying.") from None
         raise
     return path, project
 
@@ -204,7 +292,7 @@ def _fetch_service_config(base):
     return config or {}
 
 
-def _mint_sso(form, base, home, project, repository):
+def _mint_sso(form, base, home, project, repository, attempt=None):
     """Entra-authenticated enrollment.
 
     The directory key `sha(base + "\\0" + project)` is unknowable before the mint
@@ -213,11 +301,13 @@ def _mint_sso(form, base, home, project, repository):
     the minted project) revokes the new credential with the same bearer and
     reuses the saved connection instead of overwriting it.
     """
+    _check_attempt(attempt)
     api_app_id = _fetch_service_config(base).get("api_app_id") or ""
     if not api_app_id:
         raise ConsentError("Microsoft sign-in enrollment is not enabled on this service yet.", "code",
                            "Enter your name and private member code below, then submit again.")
     try:
+        _check_attempt(attempt)
         bearer = entra.access_token("api://" + api_app_id + "/.default")
     except entra.EntraUnavailable as error:
         raise ConsentError(str(error), "code",
@@ -231,10 +321,18 @@ def _mint_sso(form, base, home, project, repository):
         body["repository_url"] = repository
 
     try:
+        _check_attempt(attempt)
         credential = _http_bearer(base, "/api/harnesses", body, bearer, extra_headers)[0]
     except _MintError as error:
         if error.status == 409:
-            candidates = error.payload.get("projects") or []
+            detail = error.payload.get("error")
+            choices = detail.get("choices", []) if isinstance(detail, dict) else []
+            candidates = []
+            if isinstance(choices, list):
+                for choice in choices[:20]:
+                    pid = choice.get("id") if isinstance(choice, dict) else None
+                    if isinstance(pid, str) and 0 < len(pid) <= 200 and not any(ord(c) < 32 for c in pid) and pid not in candidates:
+                        candidates.append(pid)
             raise ConsentError(
                 "That repository does not identify exactly one Teamwork project.", "project",
                 ("Type one of these project ids: " + ", ".join(candidates))
@@ -259,74 +357,91 @@ def _mint_sso(form, base, home, project, repository):
             ) from None
         raise
 
-    minted_project = project or next(iter(credential.get("projects") or []), None)
-    if not minted_project:
-        raise ConsentError("Microsoft sign-in did not return a project.", "project",
-                           "Enter the project ID you joined.")
+    directory = path = None
+    created = False
+    revoke_needed = True
 
-    directory = _safe_directory(home, base, minted_project)
-    path = directory / "connection.json"
-    try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
+    def revoke_new():
+        nonlocal revoke_needed
+        revoke_needed = False
         try:
             _http_bearer(base, "/api/harnesses/revoke", {"id": credential["id"]}, bearer)
         except Exception:
-            _write_recovery_breadcrumb(directory, credential["id"])
-        return _reuse_saved_connection(path, base, minted_project)
+            if directory is not None:
+                try:
+                    _write_recovery_breadcrumb(directory, credential["id"])
+                except Exception:
+                    pass
+            raise ConsentError("Enrollment could not be saved and its new agent credential could not be revoked.", None,
+                               "Review Harnesses & agents in the Teamwork portal and revoke the new credential before retrying.") from None
+
     try:
+        _check_attempt(attempt)
+        projects = credential.get("projects")
+        minted_project = project or (projects[0] if isinstance(projects, list) and len(projects) == 1 else None)
+        if not isinstance(minted_project, str) or not minted_project:
+            raise ConsentError("Microsoft sign-in did not return one project.", "project",
+                               "Enter the project ID you joined.")
+        directory = _safe_directory(home, base, minted_project)
+        path = directory / "connection.json"
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            revoke_new()
+            return _reuse_saved_connection(path, base, minted_project, attempt=attempt)
+        created = True
         with os.fdopen(fd, "w") as output:
             _write_connection(output, base, minted_project, credential, repository)
+        _check_attempt(attempt, complete=True)
     except BaseException:
         try:
-            _http_bearer(base, "/api/harnesses/revoke", {"id": credential["id"]}, bearer)
-        except Exception:
-            _write_recovery_breadcrumb(directory, credential["id"])
-        path.unlink(missing_ok=True)
+            if revoke_needed:
+                revoke_new()
+        finally:
+            if created:
+                path.unlink(missing_ok=True)
         raise
     return path, minted_project
 
 
-def _verify_portal_credential(base, project, token):
-    """Verify a portal-minted credential with the least side-effecting
-    authenticated call available: a publish batch with zero operations.
+def _verify_connection(base, project, token, *, saved=False, attempt=None):
+    """Require both sharing scopes using requests that cannot retrieve or publish.
 
-    Empirically confirmed against the live web origin (2026-09-10, reading
-    an already-enrolled native connection file's token in-process, token
-    never logged): this endpoint validates auth and project scope BEFORE it
-    ever inspects the operations list, so a genuinely valid token scoped to
-    this exact project returns 422 `invalid_request` ("Supply 1-20
-    operations") for a zero-operation batch -- not 2xx. An invalid token
-    returns 401 regardless of project. A valid token against the WRONG
-    project returns 404. So 422 (or an unexpected outright 2xx, should the
-    service's behavior ever change) is the positive signal; 401/403 is an
-    explicit rejection; anything else -- 404, 5xx, or a transport failure --
-    proves nothing either way and must not be treated as verified.
+    The app checks auth, project membership, then scope before these deliberate
+    validation failures. Exceptions roll back the transaction, including last-use
+    metadata. Only the exact known envelopes prove access; unrelated 404/422 or
+    even an unexpected 2xx are not evidence. No session, cursor or work is created.
     """
-    endpoint = "/api/v1/projects/" + project + "/publish"
-    try:
-        _http_bearer(base, endpoint, {"operations": []}, token)
-    except _MintError as error:
-        if error.status in (401, 403):
-            raise ConsentError(
-                "That credential was rejected.", "credential",
-                "Copy a fresh credential from the portal (Account menu \u2192 Harnesses & agents), "
-                "then submit again.",
-            ) from None
-        if error.status == 422:
-            return
-        raise ConsentError(
-            "Could not verify that credential with the service; try again.", "credential",
-            "The service did not confirm or reject the credential. Try again in a moment.",
-        ) from None
-    except Exception as error:
-        raise ConsentError(
-            "Could not verify that credential with the service; try again.", "credential",
-            "The service did not confirm or reject the credential. Try again in a moment.",
-        ) from error
+    label = "The saved connection" if saved else "That credential"
+    recovery = ("The saved file was kept unchanged. Review this project's agent credentials in the portal before reconnecting."
+                if saved else "Use a portal agent credential with context:read and session:write for this project.")
+    probes = [("context", {}, 404, "session_not_found", "Session not found"),
+              ("publish", {"operations": []}, 422, "invalid_request", "Supply 1–20 operations")]
+    for endpoint, body, status, code, message in probes:
+        _check_attempt(attempt)
+        try:
+            _http_bearer(base, "/api/v1/projects/" + urllib.parse.quote(project, safe="") + "/" + endpoint, body, token)
+        except _MintError as error:
+            detail = error.payload.get("error")
+            if isinstance(detail, dict) and error.status == status and detail.get("code") == code and detail.get("message") == message:
+                continue
+            if error.status == 401:
+                raise ConsentError(label + " was rejected or has expired.", "credential", recovery) from None
+            if error.status == 403:
+                raise ConsentError(label + " lacks the permissions needed to share and receive context.", "credential", recovery) from None
+            if error.status == 404 and isinstance(detail, dict) and detail.get("code") == "not_found":
+                raise ConsentError(label + " has no access to that project.", "project", recovery) from None
+        except Exception:
+            pass
+        raise ConsentError("Could not verify that credential with the service; try again.", "credential",
+                           "No new connection was saved. Check service availability and try again.") from None
 
 
-def _mint_credential(form, base, home, project, repository, token):
+def _verify_portal_credential(base, project, token, attempt=None):
+    _verify_connection(base, project, token, attempt=attempt)
+
+
+def _mint_credential(form, base, home, project, repository, token, attempt=None):
     """Portal-issued credential: verify it, then reserve. No /api/login, no az.
 
     Requires an explicit project id: unlike SSO's mint response, a manually
@@ -344,14 +459,15 @@ def _mint_credential(form, base, home, project, repository, token):
     directory = _safe_directory(home, base, project)
     path = directory / "connection.json"
     if path.exists():
-        _reuse_saved_connection(path, base, project)  # validates private/readable/matching; raises on mismatch
+        _reuse_saved_connection(path, base, project, verify=False)  # Do not use or replace either credential.
         raise ConsentError(
             "A connection for this project is already saved on this machine; the pasted credential was not used.",
             "credential",
             "To use a different credential, revoke the old harness in Teamwork, delete the saved connection "
             "file for this project, then reconnect.",
         )
-    _verify_portal_credential(base, project, token)
+    _verify_portal_credential(base, project, token, attempt=attempt)
+    _check_attempt(attempt)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(fd, "w") as output:
@@ -361,13 +477,14 @@ def _mint_credential(form, base, home, project, repository, token):
             json.dump(data, output)
             output.flush()
             os.fsync(output.fileno())
+        _check_attempt(attempt, complete=True)
     except BaseException:
         path.unlink(missing_ok=True)
         raise
     return path, project
 
 
-def connect(form, base, home, repository=None, origin=None):
+def connect(form, base, home, repository=None, origin=None, attempt=None):
     """Called only with private browser input, never model-supplied credentials.
 
     No network call happens before consent. Dispatch order: (1) a portal
@@ -386,6 +503,7 @@ def connect(form, base, home, repository=None, origin=None):
     if form.get("consent") != "yes":
         raise ConsentError("Consent is required before anything is shared.", "consent",
                            "Tick the consent box to enable sharing for this session.")
+    _check_attempt(attempt)
     project = form.get("project", "").strip()
     if len(project) > 200:
         raise ConsentError("That project ID is too long.", "project", "Project IDs are at most 200 characters.")
@@ -393,27 +511,30 @@ def connect(form, base, home, repository=None, origin=None):
     if credential:
         # Takes precedence: a portal credential is a complete, already-minted
         # answer, so neither SSO nor the member-code fields are consulted.
-        return _mint_credential(form, base, home, project, repository, credential)
+        return _mint_credential(form, base, home, project, repository, credential, attempt=attempt)
     use_sso = not form.get("code") and entra.available()
 
     if project:
         # The directory key is known upfront, so an existing saved connection
-        # is checked (and reused) before anything is minted, for either
-        # auth method -- no network call happens for an already-enrolled project.
+        # is verified before anything is minted, for either auth method. A stale
+        # credential must not silently report a working connection.
         directory = _safe_directory(home, base, project)
         path = directory / "connection.json"
         if path.exists():
-            return _reuse_saved_connection(path, base, project)
+            if form.get("name", "").strip() or form.get("code"):
+                raise ConsentError("This project already has a saved connection; your new login details were not used.", "name",
+                                   "Clear the name and personal access code to verify and reuse it, or review the saved agent credential in the portal before reconnecting.")
+            return _reuse_saved_connection(path, base, project, attempt=attempt)
         if use_sso:
-            return _mint_sso(form, base, home, project, repository)
+            return _mint_sso(form, base, home, project, repository, attempt=attempt)
         if not form.get("name", "").strip() or not form.get("code"):
             raise ConsentError("First enrollment needs your name and private member code.",
                                "name" if not form.get("name", "").strip() else "code",
                                "This project is not enrolled yet on this machine, so both fields are required.")
-        return _mint_member(form, base, home, project, repository, origin=origin)
+        return _mint_member(form, base, home, project, repository, origin=origin, attempt=attempt)
 
     if use_sso:
-        return _mint_sso(form, base, home, project, repository)
+        return _mint_sso(form, base, home, project, repository, attempt=attempt)
     raise ConsentError("Enter the project ID you joined.", "project",
                        "Use the exact project ID shown in Teamwork.")
 
@@ -470,6 +591,9 @@ def private_browser_connect(base, home, stop, timeout=IDLE_TIMEOUT, notify=annou
     minutes = max(1, round(timeout / 60))
     sso = entra.available()
     outcome, cancelled, expired = [], [], []
+    cancellation_errors = []
+    attempt = ConsentAttempt(stop)
+    active = threading.Event()
     activity = [0]
     guard = threading.Lock()
 
@@ -571,10 +695,13 @@ def private_browser_connect(base, home, stop, timeout=IDLE_TIMEOUT, notify=annou
             except Exception:
                 return self.form(400, **malformed)
             if form.get("action") == "cancel":
+                if not attempt.cancel():
+                    return self.done()
                 cancelled.append(True)
                 return self.reply(200, result_page(
-                    style_nonce, "warn", "Cancelled", "No connection was made.",
-                    "Nothing was shared and no credential was created.",
+                    style_nonce, "warn", "Cancelled", "Sharing was not enabled.",
+                    "An enrollment request is still finishing. A new credential may need cleanup; review Harnesses & agents before retrying."
+                    if active.is_set() else "No new connection was saved.",
                     "Close this tab and return to Amplifier."))
             # Echo back only what the user typed into this local form, never the code.
             kept = {"project": form.get("project", ""), "name": form.get("name", "")}
@@ -582,8 +709,22 @@ def private_browser_connect(base, home, stop, timeout=IDLE_TIMEOUT, notify=annou
                 with guard:
                     if outcome:
                         return self.done()
-                    outcome.append(connect(form, base, home, repository=repository, origin=origin))
+                    attempt.check()
+                    active.set()
+                    try:
+                        result = connect(form, base, home, repository=repository, origin=origin, attempt=attempt)
+                        attempt.complete()
+                        outcome.append(result)
+                    finally:
+                        active.clear()
+            except ConsentAborted:
+                cancelled.append(True)
+                return self.reply(410, result_page(
+                    style_nonce, "warn", "Cancelled", "Sharing was not enabled.",
+                    "The pending connection was cancelled. No new connection was saved."))
             except ConsentError as error:
+                if cancelled or expired or stop.is_set():
+                    cancellation_errors.append(str(error) + " " + (error.hint or ""))
                 return self.form(400, kept, str(error), error.field, error.hint)
             except Exception:
                 # Never echo service errors, submitted values, cookies or credentials.
@@ -616,16 +757,29 @@ def private_browser_connect(base, home, stop, timeout=IDLE_TIMEOUT, notify=annou
                     seen = activity[0]
                     deadline = time.monotonic() + timeout
             if not outcome and not cancelled and not stop.is_set():
+                attempt.cancel()
                 expired.append(True)
                 grace = time.monotonic() + min(20.0, timeout)
                 while time.monotonic() < grace and not stop.is_set():
                     server.handle_request()
         finally:
+            if not outcome:
+                attempt.cancel()
             if pointer:
                 Path(pointer).unlink(missing_ok=True)
     if cancelled:
-        raise ConsentAborted("You cancelled the connection in the browser form. Nothing was shared.")
+        if cancellation_errors:
+            raise ConsentAborted(cancellation_errors[-1] + " Sharing was not enabled.")
+        if active.is_set():
+            raise ConsentAborted("Cancellation was requested while enrollment was in progress. A new credential may still need cleanup; review Harnesses & agents before retrying. Sharing was not enabled.")
+        raise ConsentAborted("The connection was cancelled. Sharing was not enabled.")
     if not outcome or stop.is_set():
+        if attempt.completed:
+            raise ConsentAborted("The connection finished before cancellation. Its saved credential was kept, but sharing was not enabled.")
+        if cancellation_errors:
+            raise ConsentAborted(cancellation_errors[-1] + " Sharing was not enabled.")
+        if active.is_set():
+            raise ConsentAborted("The consent form closed while enrollment was in progress. A new credential may still need cleanup; review Harnesses & agents before retrying. Sharing was not enabled.")
         raise ConsentAborted(
             "The consent form closed before it was submitted"
             + ("" if opened else "; a browser could not be opened on this machine")
