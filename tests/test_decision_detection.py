@@ -455,6 +455,7 @@ class VerdictLinksReachEvidence(unittest.IsolatedAsyncioTestCase):
 
     async def test_valid_links_become_additional_record_kind_evidence(self):
         hook, client, _journal = build(self)
+        hook.state["cache"] = {"insight:i1": {"record": {"record_type": "insight", "id": "i1", "version": 2, "content": {"claim": "Prior claim"}}}}
         add_turn(hook, "u1", "r1")
         verdict = dict(RECORD_VERDICT, links=[
             {"record_type": "insight", "record_id": "i1", "version": 2},
@@ -470,6 +471,7 @@ class VerdictLinksReachEvidence(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_malformed_link_is_dropped_and_the_record_still_lands(self):
         hook, client, _journal = build(self)
+        hook.state["cache"] = {"insight:keep": {"record": {"record_type": "insight", "id": "keep", "version": 1, "content": {"claim": "Prior claim"}}}}
         add_turn(hook, "u1", "r1")
         verdict = dict(RECORD_VERDICT, links=[
             {"record_type": "insight", "record_id": "keep", "version": 1},
