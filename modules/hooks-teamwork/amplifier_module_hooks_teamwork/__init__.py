@@ -406,6 +406,7 @@ class TeamworkHook:
         self._detection_closing = False
         self._detection_publish_closed = False
         self._session_ended = False
+        self._shutdown_binding = None
         # The local work queue an inbound message is filed into, or None when this
         # machine runs none. Optional by design: a session without one receives its
         # messages exactly as before and says so, rather than failing.
@@ -1131,14 +1132,13 @@ class TeamworkHook:
         return hook_result()
 
     async def on_end(self, event, data):
-        await self._end_shared_session()
         # Outside the publication lock: judges use this same lock to record.
         await self.cleanup()
         return hook_result()
 
-    async def _end_shared_session(self):
+    async def _end_shared_session(self, binding):
         async with self.lock:
-            if self._session_ended:
+            if self._session_ended or not self.detection_binding_current(binding):
                 return
             self._session_ended = True
             self.ensure_session()
@@ -1195,7 +1195,12 @@ class TeamworkHook:
         """Drain owned tasks at shutdown, then cancel and await their cleanup."""
         # Released Rust hosts run module cleanup BEFORE session:end; other hosts
         # emit the event first. One idempotent finalizer supports either order.
-        await self._end_shared_session()
+        # Pin once before awaiting the lock or flush. A concurrent rebind must
+        # not turn this shutdown (or a later cleanup callback) into writes to
+        # the newly selected project. Rebind deliberately does not reset this.
+        if self._shutdown_binding is None:
+            self._shutdown_binding = self.detection_binding()
+        await self._end_shared_session(self._shutdown_binding)
         self._detection_closing = True
         tasks = self._decision_tasks | self._lesson_tasks
         if not tasks:
