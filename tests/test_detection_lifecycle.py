@@ -74,11 +74,12 @@ class DetectionLifecycle(unittest.IsolatedAsyncioTestCase):
 
     async def test_concurrent_identical_verdicts_make_one_request(self):
         hook, client, journal = self.fixture()
-        calls, ready = 0, asyncio.Event()
+        calls, ready, first_started = 0, asyncio.Event(), asyncio.Event()
 
         async def judge(*args, **kwargs):
             nonlocal calls
             calls += 1
+            first_started.set()
             if calls == 2:
                 ready.set()
             await ready.wait()
@@ -86,6 +87,7 @@ class DetectionLifecycle(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(teamwork.decision_judge, "judge_window", judge):
             first = hook.detect_decision(tool_calls=[{"name": "delegate", "target": "a"}])
+            await asyncio.wait_for(first_started.wait(), 1)
             add_turn(hook, "Second completed window", "The same decision restated")
             second = hook.detect_decision(tool_calls=[{"name": "delegate", "target": "b"}])
             await asyncio.gather(first, second)
@@ -209,15 +211,19 @@ class DetectionLifecycle(unittest.IsolatedAsyncioTestCase):
     async def test_task_limit_retains_unexamined_turns_without_spawning_more_work(self):
         hook, _, journal = self.fixture()
         release = asyncio.Event()
+        started = asyncio.Queue()
 
         async def judge(*args, **kwargs):
+            started.put_nowait(True)
             await release.wait()
             return {"record": False}
 
         with patch.object(teamwork.decision_judge, "judge_window", judge):
             first = hook.detect_decision()
+            await asyncio.wait_for(started.get(), 1)
             add_turn(hook, "second", "second")
             second = hook.detect_decision()
+            await asyncio.wait_for(started.get(), 1)
             add_turn(hook, "third", "third")
             self.assertIsNone(hook.detect_decision())
             self.assertEqual(journal.decision_watermark(hook.sid), 2)

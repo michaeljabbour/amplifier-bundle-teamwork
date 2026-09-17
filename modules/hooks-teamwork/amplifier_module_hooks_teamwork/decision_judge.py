@@ -1,16 +1,30 @@
 """An in-process judgment session that classifies one window as RECORD or SKIP.
 
-Specification: docs/scenarios/08-the-decision-the-session-made-itself.md and its
-twin 08b-the-path-taken-that-binds-nothing.md. Read those first -- their "What
-the good one knows" sections are the decision rule this module encodes into a
-prompt, not a re-derivation of it.
+Two judges share this module: a DECISION judge and a LESSON judge. Same
+machinery throughout -- session construction, the verdict shape, the
+no-verdict sentinel, `available` handling, cleanup, provider inheritance --
+differing only in which rule/output-instructions text is put in front of the
+model. See `_RULE`/`_OUTPUT_INSTRUCTIONS` (decision) and
+`_LESSON_RULE`/`_LESSON_OUTPUT_INSTRUCTIONS` (lesson) below.
+
+Decision specification: docs/scenarios/08-the-decision-the-session-made-itself.md
+and its twin 08b-the-path-taken-that-binds-nothing.md.
+
+Lesson specification: docs/scenarios/06-record-the-lesson-not-the-incident.md
+and its twin 06b-the-lesson-that-is-only-true-on-your-machine.md. Read those
+first -- their "What the good one knows" sections are the lesson rule
+`_LESSON_RULE` encodes, not a re-derivation of it. 06 itself names a grading
+limit that also bounds this module: a rubric derived from it cannot score a
+single run, only a pair (a run that records, and a later run that benefits or
+does not) -- `judge_lesson_window()` classifies one window and cannot, by
+itself, prove the lesson transferred; see evals/03-lesson-detection/README.md.
 
 NOT WIRED INTO ANY HOOK LIFECYCLE EVENT. This module is a library the hook (or
 anything else in-process) can call; it does not subscribe to `prompt:submit`,
-`session:end`, or anything else on its own. That wiring -- what fires this, a
-watermark so one decision is not re-detected at every later delegation, and the
+`session:end`, or anything else on its own. That wiring -- what fires each
+judge, a watermark so nothing is re-detected at every later trigger, and the
 "recorded by whom" question below -- is out of scope here on purpose (see the
-open questions in 08 and 08b).
+open questions in 08/08b and 06/06b).
 
 ASYNC CONTRACT. `judge_window()` performs a real provider call and must never be
 awaited inline on a turn's critical path. Callers should fire it with
@@ -233,9 +247,73 @@ before or after it -- with exactly these keys:
   "reason": one or two sentences on why, naming whether the deciding reason was
           structural or contingent"""
 
+# The lesson rule, distilled from 06 and 06b's "What the good one knows"
+# sections -- quoted, not paraphrased, where 06/06b state the test in their
+# own words. A lesson is a different question from a decision: not "a choice
+# among alternatives that constrains future work" but "something learned that
+# generalises past this task, for teammates who were never in this session."
+# 06b's twin is about REACH, not durability -- a lesson can be real, correctly
+# learned, and still fail to transfer because the evidence for it does not
+# reach as far as the claim would. That is a different failure from the
+# decision judge's structural-vs-contingent test above, so this is its own
+# rule text rather than the same one with nouns swapped.
+_LESSON_RULE = """You are judging ONE window of a session's turns to decide whether it contains a
+LESSON that should be recorded to a shared project's durable knowledge, or whether it
+should be skipped. You will see only this window -- no other cases, no history.
 
-def _prompt_for(window):
-    lines = [_RULE, "", "WINDOW:"]
+A lesson worth recording is something learned that generalises past this task, for
+teammates who were never in this session -- not a narration of what happened, and not
+a fact about this task alone. The test is not "is this true" or "did I just learn it" --
+both are true of a fact that is only about this task and of the whole investigation that
+produced it. It is: record what will still be true when this task is forgotten -- would
+this change what somebody does on a DIFFERENT task? The incident is the evidence, not
+the lesson: a lesson with no incident attached is an opinion and must be refused; a
+lesson that is only its incident has not been generalised and will not be found by
+anybody who did not live it.
+
+The test that actually separates RECORD from SKIP is NOT how surprising the discovery
+felt, and not merely whether it sounds like a rule someone else could reuse. Something
+learned in this session can be real, correctly learned, and still not transfer, because
+its evidence does not reach as far as the claim it would license. The test is:
+
+    Could what I observed differ between my environment and the one my claim is about?
+
+  - NO, the evidence reaches as far as the claim -> RECORD, stated so it is usable by
+    somebody who was never near this task -- e.g. "a negative result from a search is
+    bounded by what the search can see" holds regardless of whose machine, whose
+    version, whose task this was.
+  - YES, the evidence does not reach that far -> SKIP. It is an observation awaiting
+    evidence from that other environment, not a lesson yet -- e.g. two suites failing
+    on THIS checkout does not establish the build is broken for everyone. A claim's
+    scope must be no wider than the evidence that produced it; recording it anyway
+    would teach the next reader to distrust a signal (a green gate, an exhaustive-
+    looking search) that was fine all along -- which is worse than recording nothing.
+
+Precision matters more than recall. A missed lesson costs a re-discovery someone can
+make again later. A wrongly-recorded one costs every future reader permanently -- there
+is no undo for an automatic record. When genuinely unsure, prefer SKIP."""
+
+_LESSON_OUTPUT_INSTRUCTIONS = """Respond with ONLY a single JSON object -- no markdown fence, no commentary
+before or after it -- with exactly these keys:
+
+  "record": true or false
+  "kind": a short free-text label for what this is (e.g. "search-method limit",
+          "environment-scoped observation", "process rule"), or null when record is false
+  "claim": the transferable statement -- what stays true after this task is forgotten,
+           usable by someone who was never in this session -- or null when record is false
+  "basis": "observation" or "inference", or null when record is false
+  "what_it_does_not_establish": what this does NOT establish, or null when record
+          is false
+  "confidence": "low", "medium", or "high"
+  "reason": one or two sentences on why, naming whether the evidence reaches as far as
+          the claim or is bounded to this environment/task"""
+
+
+def _build_prompt(rule, output_instructions, window):
+    """Shared prompt assembly for both judges -- only `rule` and
+    `output_instructions` differ between the decision and lesson prompts.
+    """
+    lines = [rule, "", "WINDOW:"]
     turns = window.get("turns") or []
     if not turns and not (window.get("tool_calls") or []):
         lines.append("(empty window)")
@@ -254,8 +332,16 @@ def _prompt_for(window):
             else "[tool call: %s]" % call["name"]
         )
     lines.append("")
-    lines.append(_OUTPUT_INSTRUCTIONS)
+    lines.append(output_instructions)
     return "\n".join(lines)
+
+
+def _prompt_for(window):
+    return _build_prompt(_RULE, _OUTPUT_INSTRUCTIONS, window)
+
+
+def _prompt_for_lesson(window):
+    return _build_prompt(_LESSON_RULE, _LESSON_OUTPUT_INSTRUCTIONS, window)
 
 
 # ---------------------------------------------------------------------------
@@ -340,11 +426,12 @@ async def _resolve_providers(parent_coordinator, model_role):
     except Exception:
         providers = []
     if not providers:
-        return providers, "the calling session has no provider configured to inherit"
+        return providers, "the calling session has no provider configured to inherit", False
     if not model_role:
         return (
             providers,
             "no model_role requested; using the calling session's provider unchanged",
+            False,
         )
 
     try:
@@ -355,7 +442,7 @@ async def _resolve_providers(parent_coordinator, model_role):
         return providers, (
             "no model_role_resolver capability is registered on the calling session; "
             "using its provider unchanged"
-        )
+        ), False
 
     try:
         preferences = await resolver.resolve(model_role)
@@ -367,12 +454,14 @@ async def _resolve_providers(parent_coordinator, model_role):
                 model_role,
                 type(error).__name__,
             ),
+            False,
         )
     if not preferences:
         return (
             providers,
             "model_role %r resolved to no candidates; using the calling session's provider unchanged"
             % model_role,
+            False,
         )
 
     preference = preferences[0]
@@ -385,13 +474,13 @@ async def _resolve_providers(parent_coordinator, model_role):
         return providers, (
             "model_role_resolver returned a preference with no provider/model; "
             "using the calling session's provider unchanged"
-        )
+        ), False
     if _GLOB_CHARS.search(pref_model):
         return providers, (
             "model_role %r resolved to a glob pattern (%r) that needs live model-list "
             "resolution this judge does not perform; using the calling session's provider unchanged"
             % (model_role, pref_model)
-        )
+        ), False
 
     for spec in providers:
         if _bare_module(spec.get("module", "")) == pref_provider:
@@ -404,13 +493,13 @@ async def _resolve_providers(parent_coordinator, model_role):
                 model_role,
                 pref_provider,
                 pref_model,
-            )
+            ), True
 
     return providers, (
         "model_role %r resolved to provider %r, which is not among the calling session's "
         "configured providers; using its provider unchanged"
         % (model_role, pref_provider)
-    )
+    ), False
 
 
 # ---------------------------------------------------------------------------
@@ -446,7 +535,7 @@ async def build_judge_session(
     from amplifier_core import AmplifierSession  # lazy: amplifier-core is host-supplied
 
     parent_id = getattr(parent_coordinator, "session_id", None)
-    providers, note = await _resolve_providers(parent_coordinator, model_role)
+    providers, note, role_honored = await _resolve_providers(parent_coordinator, model_role)
     config = {
         "session": {
             "orchestrator": {"module": "loop-streaming", "config": {"max_iterations": 1}},
@@ -476,16 +565,18 @@ async def build_judge_session(
     except BaseException:
         await _cleanup_session(session)
         raise
-    return session, note
+    return session, note, role_honored
 
 
 # ---------------------------------------------------------------------------
-# The public entry point
+# The public entry points
 # ---------------------------------------------------------------------------
 
 
-async def judge_window(parent_coordinator, window, *, extra_tools=None):
-    """Classify ONE window; operational failures return an unavailable verdict.
+async def _judge(parent_coordinator, window, prompt_builder, *, extra_tools=None, log_label="decision judge"):
+    """Shared body for `judge_window()` and `judge_lesson_window()`: classify
+    ONE window using whichever `prompt_builder(window)` the caller supplies;
+    operational failures return an unavailable verdict.
 
     See this module's docstring for the async contract: this performs a real
     provider call and must not be awaited inline on a turn's critical path.
@@ -495,19 +586,26 @@ async def judge_window(parent_coordinator, window, *, extra_tools=None):
     than raising. Cancellation propagates after owned-session cleanup.
     """
     try:
-        session, note = await build_judge_session(
+        session, note, role_honored = await build_judge_session(
             parent_coordinator, extra_tools=extra_tools
         )
     except Exception as error:
-        logger.warning("decision judge: could not build a judge session (%s)", type(error).__name__)
+        logger.warning("%s: could not build a judge session (%s)", log_label, type(error).__name__)
         return no_verdict("could not build a judge session (%s)" % type(error).__name__)
-    logger.debug("decision judge: provider inheritance -- %s", note)
+    # A requested role that could NOT be honored is a COST regression -- this
+    # judge then runs on the calling session's own (often frontier) model, on
+    # every triggered turn. Logged at DEBUG it is invisible, which is how a
+    # silent fallback to an expensive model survives a green DTU run. Warn.
+    if not role_honored:
+        logger.warning("%s: requested model role was NOT honored -- %s", log_label, note)
+    else:
+        logger.debug("%s: provider inheritance -- %s", log_label, note)
 
     try:
         try:
-            raw = await session.execute(_prompt_for(window))
+            raw = await session.execute(prompt_builder(window))
         except Exception as error:
-            logger.warning("decision judge: the provider call failed (%s)", type(error).__name__)
+            logger.warning("%s: the provider call failed (%s)", log_label, type(error).__name__)
             return no_verdict("the judge's provider call failed (%s)" % type(error).__name__)
     finally:
         await _cleanup_session(session)
@@ -516,6 +614,24 @@ async def judge_window(parent_coordinator, window, *, extra_tools=None):
     if verdict is None:
         return no_verdict("the judge's response could not be parsed as a verdict")
     return verdict
+
+
+async def judge_window(parent_coordinator, window, *, extra_tools=None):
+    """Classify ONE window as a DECISION verdict (docs/scenarios/08, 08b)."""
+    return await _judge(
+        parent_coordinator, window, _prompt_for, extra_tools=extra_tools, log_label="decision judge"
+    )
+
+
+async def judge_lesson_window(parent_coordinator, window, *, extra_tools=None):
+    """Classify ONE window as a LESSON verdict (docs/scenarios/06, 06b).
+
+    Same contract as `judge_window()` in every respect but the prompt: the
+    verdict shape, `no_verdict` sentinel, and failure handling are identical.
+    """
+    return await _judge(
+        parent_coordinator, window, _prompt_for_lesson, extra_tools=extra_tools, log_label="lesson judge"
+    )
 
 
 def spawn_judge_window(parent_coordinator, window, *, extra_tools=None):
@@ -529,4 +645,12 @@ def spawn_judge_window(parent_coordinator, window, *, extra_tools=None):
     """
     return asyncio.create_task(
         judge_window(parent_coordinator, window, extra_tools=extra_tools)
+    )
+
+
+def spawn_lesson_judge_window(parent_coordinator, window, *, extra_tools=None):
+    """Fire-and-not-await convenience for `judge_lesson_window()` -- see
+    `spawn_judge_window()`'s docstring; identical contract, lesson prompt."""
+    return asyncio.create_task(
+        judge_lesson_window(parent_coordinator, window, extra_tools=extra_tools)
     )

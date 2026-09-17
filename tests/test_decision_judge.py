@@ -65,7 +65,7 @@ class JudgeNeverRaises(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             decision_judge,
             "build_judge_session",
-            AsyncMock(return_value=(fake, "note")),
+            AsyncMock(return_value=(fake, "note", True)),
         ):
             verdict = await decision_judge.judge_window(object(), EMPTY_WINDOW)
         self.assertFalse(verdict["record"])
@@ -81,7 +81,7 @@ class JudgeNeverRaises(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             decision_judge,
             "build_judge_session",
-            AsyncMock(return_value=(fake, "note")),
+            AsyncMock(return_value=(fake, "note", True)),
         ):
             verdict = await decision_judge.judge_window(object(), EMPTY_WINDOW)
         self.assertFalse(verdict["record"])
@@ -92,7 +92,7 @@ class JudgeNeverRaises(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             decision_judge,
             "build_judge_session",
-            AsyncMock(return_value=(fake, "note")),
+            AsyncMock(return_value=(fake, "note", True)),
         ):
             verdict = await decision_judge.judge_window(object(), EMPTY_WINDOW)
         self.assertFalse(verdict["record"])
@@ -118,7 +118,7 @@ class JudgeNeverRaises(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             decision_judge,
             "build_judge_session",
-            AsyncMock(return_value=(fake, "note")),
+            AsyncMock(return_value=(fake, "note", True)),
         ):
             verdict = await decision_judge.judge_window(object(), EMPTY_WINDOW)
         self.assertTrue(verdict["record"])
@@ -136,7 +136,7 @@ class JudgeNeverRaises(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             decision_judge,
             "build_judge_session",
-            AsyncMock(return_value=(fake, "note")),
+            AsyncMock(return_value=(fake, "note", True)),
         ):
             verdict = await decision_judge.judge_window(object(), EMPTY_WINDOW)
         self.assertFalse(verdict["record"])
@@ -197,7 +197,7 @@ class HonestJudgeFailures(unittest.IsolatedAsyncioTestCase):
     async def test_failure_details_are_not_returned_or_logged(self):
         private_detail = "private-provider-request-and-credential-fixture"
         fake = FakeJudgeSession(execute_error=RuntimeError(private_detail))
-        with patch.object(decision_judge, "build_judge_session", AsyncMock(return_value=(fake, "note"))):
+        with patch.object(decision_judge, "build_judge_session", AsyncMock(return_value=(fake, "note", True))):
             with self.assertLogs(decision_judge.logger, level="WARNING") as logs:
                 verdict = await decision_judge.judge_window(object(), EMPTY_WINDOW)
         self.assertFalse(verdict["available"])
@@ -206,7 +206,7 @@ class HonestJudgeFailures(unittest.IsolatedAsyncioTestCase):
 
     async def test_incomplete_record_cannot_be_a_valid_verdict(self):
         fake = FakeJudgeSession(execute_result='{"record": true}')
-        with patch.object(decision_judge, "build_judge_session", AsyncMock(return_value=(fake, "note"))):
+        with patch.object(decision_judge, "build_judge_session", AsyncMock(return_value=(fake, "note", True))):
             verdict = await decision_judge.judge_window(object(), EMPTY_WINDOW)
         self.assertFalse(verdict["available"])
         self.assertFalse(verdict["record"])
@@ -247,7 +247,7 @@ class HonestJudgeFailures(unittest.IsolatedAsyncioTestCase):
         snapshot = json.dumps(config, sort_keys=True)
         resolver = SimpleNamespace(resolve=AsyncMock(return_value=[{"provider": "cheap", "model": "small"}]))
         parent = SimpleNamespace(config=config, get_capability=lambda name: resolver)
-        providers, _ = await decision_judge._resolve_providers(parent, "fast")
+        providers, _, _honored = await decision_judge._resolve_providers(parent, "fast")
         self.assertEqual([spec["module"] for spec in providers], ["provider-cheap"])
         self.assertEqual(providers[0]["config"]["default_model"], "small")
         self.assertEqual(json.dumps(config, sort_keys=True), snapshot)
@@ -309,7 +309,7 @@ class StandardFoundationSession(unittest.IsolatedAsyncioTestCase):
         parent = SimpleNamespace(session_id="offline-parent", config={"providers": []},
                                  get=lambda name: resolver if name == "module-source-resolver" else None,
                                  approval_system=object())
-        session, _ = await decision_judge.build_judge_session(parent)
+        session, _, _honored = await decision_judge.build_judge_session(parent)
         provider = OfflineProvider()
         try:
             self.assertIs(session.coordinator.get("module-source-resolver"), resolver)
@@ -380,7 +380,7 @@ class ToolMountingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_supplied_stub_tool_is_mounted_and_callable(self):
         stub = StubTool()
-        session, _note = await decision_judge.build_judge_session(
+        session, _note, _honored = await decision_judge.build_judge_session(
             object(), extra_tools=[stub]
         )
         try:
@@ -393,7 +393,7 @@ class ToolMountingTests(unittest.IsolatedAsyncioTestCase):
             await session.cleanup()
 
     async def test_no_tools_are_mounted_by_default(self):
-        session, _note = await decision_judge.build_judge_session(object())
+        session, _note, _honored = await decision_judge.build_judge_session(object())
         try:
             self.assertEqual(session.coordinator.mount_points.get("tools", {}), {})
         finally:
@@ -446,7 +446,7 @@ class ToolMountingTests(unittest.IsolatedAsyncioTestCase):
         parent_hook = TeamworkHook(parent_coordinator, connection, journal, client)
         record_tool = RecordInsightTool(parent_hook)
 
-        session, _note = await decision_judge.build_judge_session(
+        session, _note, _honored = await decision_judge.build_judge_session(
             parent_coordinator, extra_tools=[record_tool]
         )
         try:
