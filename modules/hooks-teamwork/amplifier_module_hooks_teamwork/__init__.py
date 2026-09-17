@@ -106,6 +106,12 @@ MIRROR_MAX_ATTEMPTS = 5
 # next window; anything already behind the watermark is dropped as it goes
 # (see TeamworkHook.detect_decision), so this bound is a ceiling, not a target.
 MAX_DECISION_TURN_BUFFER = 20
+# Shutdown is the only boundary that waits for detection. Keep both the grace
+# period and cancellation cleanup bounded; normal prompt/tool hooks never await it.
+DETECTION_DRAIN_SECONDS = 10
+DETECTION_CANCEL_SECONDS = 6
+DETECTION_JUDGE_SECONDS = 30
+MAX_DECISION_TASKS = 2
 
 
 def verbosity(config):
@@ -310,9 +316,16 @@ class Journal:
 
     def record_decision_fingerprint(self, sid, fingerprint):
         with self.connect() as conn, conn:
-            conn.execute(
+            cursor = conn.execute(
                 "INSERT OR IGNORE INTO decision_fingerprint(session, fingerprint, created_at) VALUES (?,?,?)",
                 (sid, fingerprint, now()))
+            return cursor.rowcount == 1
+
+    def release_decision_fingerprint(self, sid, fingerprint):
+        """Release only after a definite refusal; unknown writes stay reserved."""
+        with self.connect() as conn, conn:
+            conn.execute("DELETE FROM decision_fingerprint WHERE session=? AND fingerprint=?",
+                         (sid, fingerprint))
 
 
 class TeamworkHook:
@@ -328,6 +341,9 @@ class TeamworkHook:
         # Task can be garbage-collected mid-flight, silently dropping a verdict
         # that was already paid for. Tasks remove themselves on completion.
         self._decision_tasks = set()
+        self._detection_closing = False
+        self._detection_publish_closed = False
+        self._session_ended = False
         # The local work queue an inbound message is filed into, or None when this
         # machine runs none. Optional by design: a session without one receives its
         # messages exactly as before and says so, rather than failing.
@@ -393,6 +409,10 @@ class TeamworkHook:
                 updates[key] = credential[key]
         if "base_url" in updates:
             updates["base_url"] = validate_service_url(updates["base_url"])
+        # A project change ends consent for this detector's old window. The
+        # async done callback/host cleanup owns completion of cancellation.
+        for task in tuple(self._decision_tasks):
+            task.cancel()
         if self.state.get("turn"):
             # Close the open turn under the project it started in, so a turn is
             # never split across two projects or silently dropped.
@@ -402,6 +422,7 @@ class TeamworkHook:
         self.sid = str(uuid.uuid5(uuid.NAMESPACE_URL, self.connection["base_url"] + "/" + self.connection["project_id"] + "/" + sha(self.connection["token"]) + "/" + self.native))
         self.state = self.journal.load(self.sid)
         self.entered = False
+        self._session_ended = False
         if self.filing is not None:
             # A different project is a different queue. Re-resolving rather than
             # carrying the old name over is what stops one project's inbound
@@ -1039,7 +1060,16 @@ class TeamworkHook:
         return hook_result()
 
     async def on_end(self, event, data):
+        await self._end_shared_session()
+        # Outside the publication lock: judges use this same lock to record.
+        await self.cleanup()
+        return hook_result()
+
+    async def _end_shared_session(self):
         async with self.lock:
+            if self._session_ended:
+                return
+            self._session_ended = True
             self.ensure_session()
             status = "abandoned" if self.state.get("turn") else "completed"
             if self.state.get("turn"): self.finish("", "interrupted")
@@ -1052,7 +1082,47 @@ class TeamworkHook:
             self.queue([{"op": "session.upsert", "id": self.sid, "expected_version": version, "data": {"status": status, "ended_at": now()}}])
             try: await self.flush()
             except SyncError: logger.warning("Teamwork final session state queued locally")
-        return hook_result()
+
+    def detection_binding(self):
+        """Pin the consent and attribution boundary before background work starts."""
+        return (self.sid, self.state, self.client, self.connection)
+
+    def detection_binding_current(self, binding):
+        return (not self._detection_publish_closed and self.sid == binding[0]
+                and self.state is binding[1] and self.client is binding[2]
+                and self.connection is binding[3])
+
+    def _decision_done(self, task):
+        self._decision_tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            # Never log provider exception text or tracebacks containing private data.
+            logger.warning("Teamwork decision task failed (%s)", type(task.exception()).__name__)
+
+    async def cleanup(self):
+        """Drain owned tasks at shutdown, then cancel and await their cleanup."""
+        # Released Rust hosts run module cleanup BEFORE session:end; other hosts
+        # emit the event first. One idempotent finalizer supports either order.
+        await self._end_shared_session()
+        self._detection_closing = True
+        tasks = set(self._decision_tasks)
+        if not tasks:
+            self._detection_publish_closed = True
+            return
+        try:
+            await asyncio.wait(tasks, timeout=DETECTION_DRAIN_SECONDS)
+        finally:
+            # Prevent a cancellation-resistant provider from publishing later.
+            self._detection_publish_closed = True
+            pending = {task for task in tasks if not task.done()}
+            for task in pending:
+                task.cancel()
+            if pending:
+                _, unfinished = await asyncio.wait(pending, timeout=DETECTION_CANCEL_SECONDS)
+                if unfinished:
+                    logger.warning("Teamwork decision cleanup deadline reached; late publication disabled")
+            for task in tasks:
+                if task.done():
+                    self._decision_done(task)
 
     async def on_tool_pre(self, event, data):
         """The other signal (docs/scenarios/08's open questions): the `pre` of
@@ -1094,11 +1164,15 @@ class TeamworkHook:
         comes back; the two are not the same guarantee and are not enforced
         in the same place.
         """
-        if not self.decision_detection:
+        if not self.decision_detection or self._detection_closing:
+            return None
+        if len(self._decision_tasks) >= MAX_DECISION_TASKS:
             return None
         watermark = self.journal.decision_watermark(self.sid)
         turns = [t for t in self.state.get("decision_turns", []) if t["turn_index"] > watermark]
-        if not turns and not tool_calls:
+        # A tool name/target alone carries no decision evidence. Repeated empty
+        # delegation triggers must not spend budget without advancing a window.
+        if not turns:
             return None
         upto = max([t["turn_index"] for t in turns], default=watermark)
         self.journal.advance_decision_watermark(self.sid, upto)
@@ -1107,12 +1181,12 @@ class TeamworkHook:
         window = decision_judge.build_window_payload(
             [{"user_prompt": t["user_prompt"], "agent_responses": t["agent_responses"]} for t in turns],
             tool_calls)
-        task = asyncio.create_task(self._judge_and_record(window, upto))
+        task = asyncio.create_task(self._judge_and_record(window, upto, self.detection_binding()))
         self._decision_tasks.add(task)
-        task.add_done_callback(self._decision_tasks.discard)
+        task.add_done_callback(self._decision_done)
         return task
 
-    async def _judge_and_record(self, window, considered_upto):
+    async def _judge_and_record(self, window, considered_upto, binding=None):
         """Await the judge and, on a RECORD verdict, write it through this
         session's OWN RecordInsightTool -- never the judge session's, so
         source_session_id stays this session's (see decision_judge.py's
@@ -1121,10 +1195,18 @@ class TeamworkHook:
         itself, because a background task that breaks is still worse than
         one that quietly did nothing.
         """
+        binding = binding or self.detection_binding()
+        if not self.detection_binding_current(binding):
+            return
         try:
-            verdict = await decision_judge.judge_window(self.coordinator, window)
-        except Exception:
-            logger.warning("Teamwork decision judge failed; nothing recorded", exc_info=True)
+            verdict = await asyncio.wait_for(
+                decision_judge.judge_window(self.coordinator, window),
+                timeout=DETECTION_JUDGE_SECONDS)
+        except Exception as error:
+            logger.warning("Teamwork decision judge failed (%s); nothing recorded", type(error).__name__)
+            return
+        if not self.detection_binding_current(binding):
+            logger.info("Teamwork decision discarded after its project binding changed or shutdown")
             return
         if not verdict.get("record"):
             return
@@ -1139,9 +1221,6 @@ class TeamworkHook:
         # only exact re-detections, not paraphrases of the same decision --
         # a deliberate, documented limit, not an oversight.
         fingerprint = sha(" ".join(claim.lower().split()))
-        if self.journal.decision_seen(self.sid, fingerprint):
-            logger.info("Teamwork decision judge: duplicate decision skipped (already recorded)")
-            return
         basis, confidence, limitations = verdict.get("basis"), verdict.get("confidence"), verdict.get("what_it_does_not_establish")
         if basis not in ("observation", "inference") or confidence not in ("low", "medium", "high") \
                 or not isinstance(limitations, str) or not limitations.strip():
@@ -1149,25 +1228,34 @@ class TeamworkHook:
             return
         evidence = [{
             "kind": "external",
-            "uri": "teamwork-decision-window://" + self.sid + "/upto-turn/" + str(considered_upto),
+            "uri": "teamwork-decision-window://" + binding[0] + "/upto-turn/" + str(considered_upto),
             "label": "auto-detected decision window",
         }]
+        # Atomic and durable BEFORE awaiting publication: concurrent judges and
+        # cancellation cannot turn the same claim into multiple record IDs.
+        if not self.journal.record_decision_fingerprint(binding[0], fingerprint):
+            logger.info("Teamwork decision judge: duplicate decision skipped (reserved or recorded)")
+            return
         try:
-            result = await RecordInsightTool(self).execute({
+            result = await RecordInsightTool(self, binding=binding).execute({
                 "claim": claim, "basis": basis, "confidence": confidence,
                 "limitations": limitations, "evidence": evidence,
                 "title": verdict.get("kind") if isinstance(verdict.get("kind"), str) else None,
             })
-        except Exception:
-            logger.warning("Teamwork decision judge: recording the verdict failed", exc_info=True)
+        except asyncio.CancelledError:
+            logger.warning("Teamwork decision write cancelled; reservation retained for reconciliation")
+            raise
+        except Exception as error:
+            logger.warning("Teamwork decision write failed (%s); reservation retained for reconciliation",
+                           type(error).__name__)
             return
         error = result.error or {}
         if not result.success and error.get("outcome") != "unknown":
             # A definite refusal. The record demonstrably does not exist, so leave
             # no fingerprint: a later trigger carrying the same claim is free to
             # try again.
-            logger.warning("Teamwork decision judge: RecordInsightTool refused the verdict: %s",
-                            error.get("message"))
+            self.journal.release_decision_fingerprint(binding[0], fingerprint)
+            logger.warning("Teamwork decision judge: RecordInsightTool refused the verdict")
             return
         if not result.success:
             # acceptance_unknown -- the third state this project refuses to
@@ -1184,7 +1272,6 @@ class TeamworkHook:
             logger.warning("Teamwork decision judge: recording outcome unknown for attempted insight %s; "
                            "not retrying, because a retry would duplicate. Read it back to confirm.",
                            error.get("attempted_record_id"))
-        self.journal.record_decision_fingerprint(self.sid, fingerprint)
 
 
 CONNECTION_FIELDS = ("base_url", "project_id", "token", "harness_id")
@@ -1615,8 +1702,10 @@ class RecordInsightTool:
     side (`core.py:619`). Recording is deliberate: nothing here fires itself.
     """
 
-    def __init__(self, hook):
+    def __init__(self, hook, *, binding=None):
         self.hook = hook
+        # Internal detector context, never an input-schema field a model can set.
+        self.binding = binding
 
     @property
     def name(self):
@@ -1699,6 +1788,21 @@ class RecordInsightTool:
 
     async def execute(self, input):
         from amplifier_core.models import ToolResult
+        binding = self.binding or self.hook.detection_binding()
+
+        def binding_refusal():
+            return ToolResult(success=False, error={"message":
+                "Not recorded: the originating project binding changed or detection shut down."})
+
+        def binding_current():
+            # Deliberate calls retain their original project too, but remain
+            # usable if detection itself is off/closed.
+            return (self.hook.sid == binding[0] and self.hook.state is binding[1]
+                    and self.hook.client is binding[2] and self.hook.connection is binding[3]
+                    and (self.binding is None or not self.hook._detection_publish_closed))
+
+        if not binding_current():
+            return binding_refusal()
         raw_claim = input.get("claim")
         claim = raw_claim.strip() if isinstance(raw_claim, str) else ""
         basis = input.get("basis")
@@ -1726,7 +1830,7 @@ class RecordInsightTool:
             "evidence_refs": evidence_refs,
             # Not caller-supplied: this session's own identity, never overridable
             # by anything in `input`.
-            "source_session_id": self.hook.sid,
+            "source_session_id": binding[0],
             "review_state": "unreviewed",
         }
         if title:
@@ -1743,14 +1847,17 @@ class RecordInsightTool:
 
         try:
             async with self.hook.lock:
+                if not binding_current():
+                    return binding_refusal()
                 # A hook can be enabled after the current prompt began. Confirm
                 # its source session before sending a record attributed to it.
                 self.hook.ensure_session()
                 await self.hook.flush()
-                data["source_session_id"] = self.hook.sid
+                if not binding_current():
+                    return binding_refusal()
                 submitted = True
                 response = await asyncio.to_thread(
-                    self.hook.client.request, "publish",
+                    binding[2].request, "publish",
                     {"operations": [{"op": "insight.upsert", "id": record_id, "expected_version": 0, "data": data}]}, uid())
         except SyncError as error:
             if not submitted:
@@ -1858,4 +1965,5 @@ async def mount(coordinator, config=None):
         await coordinator.mount("tools", tool, name=tool.name)
     coordinator.register_capability("teamwork.session_id", hook.sid)
     coordinator.register_capability("teamwork.rebind", hook.rebind)
-    return None
+    # Core/Foundation register a returned callable as module-owned cleanup.
+    return hook.cleanup if decision_detection else None
