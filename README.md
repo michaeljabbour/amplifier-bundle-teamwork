@@ -225,9 +225,12 @@ specification, not illustrations.
 
 **It spends your model budget.** Detection runs a short, separate in-process Amplifier
 session -- your configured provider, preferring the `fast` routing role -- on turns that
-trigger it. It never blocks or delays your turn, and a failure is logged and dropped
-rather than raised. But it is real spend against your own key, on a schedule you do not
-directly control, and that is the honest cost of the feature.
+trigger it. Normal turns do not await the model call. Each enabled detector admits at
+most two background tasks (up to four when both are on), skips empty windows and bounds a judgment to 30 seconds; later
+triggers can inspect buffered turns when capacity is available. Shutdown allows up to
+10 seconds for pending work, then cancels and allows up to 6 seconds for cooperative
+cleanup. Work that outlasts shutdown cannot start a later publication. This spends
+your model budget and can miss a decision when capacity or time is exhausted.
 
 **When it looks.** Two moments only:
 
@@ -236,27 +239,36 @@ directly control, and that is the honest cost of the feature.
 | a delegation about to be made | the moment a choice surfaces as work handed elsewhere |
 | the session ending | the retrospective -- what actually survived rather than what was momentarily decided |
 
-**What it cannot see, stated plainly:** a session that decides something and then does
-the work *itself*, with no delegation, is invisible to both signals. That is a known
-limit, not a bug to report.
+**Coverage limits:** completed shared turns from work the session does itself are
+examined at clean shutdown, even without delegation. Abrupt process termination,
+unshared/private or delegated-child conversations, omitted content, bounded older
+history and a shutdown deadline can leave decisions unexamined. The delegation
+trigger sees completed shared turns plus the tool name and target; it does not read
+raw tool instructions or private reasoning.
 
 **What reaches the project.** One insight per detected decision: the claim, its basis,
 confidence, what it does *not* establish, and a locator for the window it came from. It
-is attributed to **this** session -- the judge never writes, so a record can never be
-attributed to the judgment session rather than to you.
+is attributed to **this** enrolled session. A project rebind cancels old detector
+tasks; binding identity is rechecked before publication so an old project's window
+cannot be sent to the newly selected project. A request already sent remains under
+its original credential and session identity.
 
-**It will sometimes be wrong.** Measured against the scenarios' own cases on
-`claude-haiku-4-5`: six windows whose reasons are stated, four runs -- one false positive
-across those runs; six windows whose reasons are *not* stated, three runs -- none. The
+**It will sometimes be wrong.** The author reported historical `claude-haiku-4-5`
+trials: six windows with stated reasons across four runs had one false positive;
+six windows with unstated reasons across three runs had none. These trials have no
+committed raw receipts or source hashes and were not independently rerun after the
+runner's unavailable-verdict scoring repair. They do not establish current accuracy. The
 design deliberately prefers missing a decision over publishing a wrong one, because the
 service has no retired state and no forward pointer yet: **a wrong record cannot be
 withdrawn, only added to.**
 
-**Duplicates.** The same decision surfacing at several later delegations is recorded once,
-matched on exact claim text. Paraphrases of the same decision are not caught. And when a
-write's outcome is genuinely unknown -- neither accepted nor refused -- it is treated as
-recorded and never retried, because retrying is what creates the duplicate. The attempted
-record id is logged so you can read it back and reconcile.
+**Duplicates.** A durable, atomic reservation on normalized claim text prevents
+concurrent copies of the same decision. Paraphrases are not caught. A definite refusal
+releases the reservation; success, an unknown write outcome, or cancellation during
+publication retains it. Retention is not proof that the insight exists. The attempted
+record ID is logged when the service outcome is unknown so you can read it back.
+A crash or cancellation between reservation and submission can leave an unpublished
+claim suppressed; the detector prefers that possibility over duplicating knowledge.
 
 To turn it off, remove the key or set it to `false`, then start a new session; a running
 session keeps the configuration it started with.
@@ -304,37 +316,48 @@ structurally from decision detection:
 There is deliberately no delegation-time trigger. A lesson is not tied to handing work
 off (see 06's own open questions), so `session:end` is the only signal that fires it.
 
-**What it cannot see, stated plainly:** anything that happens in a session that never
-reaches `session:end` cleanly is invisible to this detector for that session (an abandoned
-session still runs `on_end`'s retrospective sweep, so an interrupted session is still
-examined -- but nothing mid-session ever triggers early, unlike decision detection's
-delegation signal).
+**Coverage limits:** the host cleanup callback and `session:end` share one idempotent
+retrospective sweep, including an interrupted open turn. Abrupt process termination,
+unshared content, bounded older history and shutdown deadlines can leave lessons
+unexamined. Nothing mid-session triggers a lesson judge, unlike decision detection's
+delegation signal.
 
 **What reaches the project.** One insight per detected lesson: the claim, its basis,
 confidence, what it does *not* establish, and a locator for the window it came from.
 Attributed to **this** session, never the judge session -- same guarantee
 `detect_decisions` gives.
 
-**It will sometimes be wrong** -- though less often than that hedge might suggest.
-Measured against `evals/03-lesson-detection`'s six cases (three RECORD, drawn from real
-incidents in this repository; three SKIP, 06b-shaped) on `claude-haiku-4-5`: five live
-runs, 6/6 correct in every run, zero false positives and zero misses across all thirty
-individual case judgments. See that eval's README for the cases themselves, and for the
+**It will sometimes be wrong.** The historical baseline reported in
+`evals/03-lesson-detection` used six cases (three RECORD, drawn from incidents in this
+repository; three SKIP, 06b-shaped) on `claude-haiku-4-5`: five live runs reported 6/6
+correct each. Those runs predate the lifecycle and publication repairs; the repaired
+code has not repeated that provider evaluation. See the eval's README for the cases and the
 grading limit 06 names explicitly: **a rubric derived from 06 can only score a pair** --
 a run that records and a later run that benefits or does not -- and this eval, like the
 judge itself, answers only the narrower question of whether one window can be classified
 correctly in isolation. A clean score on six curated cases is not a guarantee against a
 harder or more ambiguous real transcript.
 
-**Duplicates.** The same lesson claim text recorded once, matched on exact text --
-identical dedup rule to `detect_decisions`, and the same unknown-outcome handling: a
-write whose outcome is genuinely unknown is treated as recorded and never retried,
-because retrying is what creates the duplicate.
+**Duplicates.** An atomic, durable reservation on normalized lesson claim text prevents
+concurrent copies within the lesson detector. A definite refusal releases it; success,
+an unknown write outcome, or cancellation during publication retains it to avoid a
+duplicate attempt. Retention is not proof that the insight exists.
+
+**When the session records deliberately.** A session's own `teamwork_record_insight`
+call suppresses automatic recording for its window. If a deliberate submission happens
+while a judge is already running, its returning verdict is dropped before publication.
+An unknown outcome also suppresses automatic recording because the deliberate write may
+have landed; a definite refusal leaves detection eligible. Automatic detector writes do
+not count as deliberate calls and cannot mark later turns as already recorded. This
+conservative rule can omit an unrelated finding from the same window; it avoids adding
+a second permanent record after the session has tried to record one itself.
 
 **Independent of `detect_decisions`.** The two flags are unrelated: enabling one never
 turns the other on, and each keeps its own buffer, watermark, and fingerprint state (the
 lesson state reuses the SAME watermark/fingerprint tables as decision detection, keyed
 under a namespaced session id, so enabling both costs no additional schema).
+The fingerprint histories are separate: with both detectors enabled, identical claim
+text can be published once by each detector. Neither check detects paraphrases.
 
 To turn it off, remove the key or set it to `false`, then start a new session; a running
 session keeps the configuration it started with.
