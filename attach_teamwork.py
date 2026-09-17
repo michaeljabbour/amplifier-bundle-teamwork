@@ -1,71 +1,37 @@
-"""Attach a project to a harness credential you ALREADY hold. Mints nothing.
+"""Attach a project directory using an existing portal agent credential.
 
-`setup_teamwork.py` is the enrollment path: it takes a member login code and
-asks the service to MINT a new harness. This script is the other half, and
-until now it did not exist: you already have a credential -- the portal minted
-one for you -- and you need a project directory to use it.
-
-Why that gap mattered. `setup_teamwork.py` was the only path the bundle
-offered, and it always mints. So every re-onboard -- reopening a folder,
-recreating a container, retrying after a failure -- produced ANOTHER backend
-harness. Not because the service duplicated anything, but because the client
-asked it to. A teammate doing first-time UX testing hit the same wall from the
-other side: the portal minted a credential and nothing in the bundle could
-consume it.
-
-TWO THINGS THIS DELIBERATELY DOES NOT DO.
-
-It never calls `POST /api/harnesses`. Re-running it is therefore safe and
-idempotent against the backend: the bearer IS the harness identity, so reusing
-a token already reattaches to the same harness record. The service needs no
-reconnect endpoint and does not have one.
-
-It never writes to `~/.amplifier/`. A harness is spawned IN A FOLDER and its
-credential belongs to that folder. A credential in user-global settings would
-silently give every session on the host one identity, publishing one project's
-work under another project's harness. So configuration lands in the PROJECT
-scope -- `<project>/.amplifier/settings.yaml` and `<project>/.amplifier/keys.env`
--- with the credential in its own 0600 file that the hook reads directly, and
-the settings override carrying only that file's path.
-
-A project `keys.env` deliberately is NOT used: KeyManager reads
-`~/.amplifier/keys.env` and nothing else, so a project-local one is never
-loaded and a `${VAR}` reference to it would never expand -- silently. See
-`settings_block()`.
+No harness is minted. The credential is read privately, checked for this
+project's context and publishing access, and stored in a private connection
+file. Existing settings and connections are never replaced. Repeating an
+identical attach is a no-op. Explicit consent enables sharing in NEW sessions
+started in this directory; the installed Teamwork app behavior is required.
 """
 import argparse
+from contextlib import ExitStack
+import getpass
 import json
 import os
 from pathlib import Path
+import stat
+import subprocess
 import sys
-import urllib.error
 import urllib.request
+import warnings
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "modules/hooks-teamwork"))
 from amplifier_module_hooks_teamwork.service_url import DEFAULT_BASE_URL, validate_service_url
+from amplifier_module_tool_teamwork import ConsentError, _verify_connection
+from setup_teamwork import NoRedirect
 
-COLD_START_SECONDS = 60
-
-
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise urllib.error.HTTPError(req.full_url, code, "Redirect refused", headers, fp)
-
-
-def _open(request):
-    return urllib.request.build_opener(NoRedirect()).open(request, timeout=COLD_START_SECONDS)
+PRIVATE_PATTERNS = ("/teamwork-connection.json", "/outbox-*.sqlite3*", "/queue-names.json")
 
 
 def published_project(base):
-    """The project id the service publishes at /api/config, or None.
-
-    Unauthenticated and read-only. Never fatal: an unreachable or unparseable
-    response just means the caller must say which project they meant.
-    """
+    """Read public discovery without credentials or redirects; None on failure."""
     try:
         request = urllib.request.Request(base + "/api/config", headers={"Accept": "application/json"})
-        with _open(request) as response:
-            published = json.loads(response.read().decode("utf-8"))
+        with urllib.request.build_opener(NoRedirect()).open(request, timeout=60) as response:
+            published = json.load(response)
         value = published.get("project_id") if isinstance(published, dict) else None
         return value.strip() if isinstance(value, str) and value.strip() else None
     except Exception:
@@ -73,151 +39,186 @@ def published_project(base):
 
 
 def verify(base, project, token):
-    """Prove the credential is accepted BEFORE writing it anywhere.
-
-    A read-only `/context` call publishes nothing, so this is safe to run on
-    every attach. The distinction that matters is not success-vs-failure but
-    WHICH failure: 401/403 means the bearer itself was rejected (wrong
-    credential, or revoked), while any other status means the service
-    authenticated it and merely disliked this particular request -- which is
-    all the proof this needs.
-
-    That distinction is not academic. Handed a portal-minted harness bearer, an
-    operator with the source open assumed it was a member login code, got 401
-    from /api/login three times, and only identified it correctly when a
-    /context probe answered 404 rather than 401. Writing an unverified
-    credential into a settings file would push that same confusion into a
-    session, where it surfaces later as silence.
-    """
-    request = urllib.request.Request(
-        base + "/api/v1/projects/" + project + "/context", data=b"{}",
-        headers={"Content-Type": "application/json", "Authorization": "Bearer " + token})
+    """Use the native connector's exact, non-writing two-scope verification."""
     try:
-        with _open(request):
-            return
-    except urllib.error.HTTPError as error:
-        status = error.code
-        error.close()
-        if status in (401, 403):
-            raise SystemExit(
-                "The service refused this credential (HTTP %d). It is not a harness token for this "
-                "project, or it has been revoked. Nothing was written." % status) from None
-    except Exception as error:
-        raise SystemExit(
-            "Could not reach the service to verify the credential (%s). Nothing was written."
-            % type(error).__name__) from None
+        _verify_connection(base, project, token)
+    except ConsentError as error:
+        raise SystemExit(str(error) + " " + (error.hint or "") + " Nothing was written.") from None
 
 
 def settings_block(base, project, connection_file):
-    """The project-scoped override, keyed by module id.
-
-    `overrides.<module-id>.config` is applied after the full mount plan is
-    assembled and is keyed by module IDENTITY, so it reaches the hook wherever
-    it is declared -- including a behavior installed the documented way, with
-    `amplifier bundle add <url> --app`. That is why no hand-written overlay
-    bundle is needed here, and why this does not fight the app-layer install.
-
-    THE SETTINGS FILE CARRIES A PATH, NEVER A SECRET, AND NEVER A ${VAR}.
-
-    The obvious design -- put the token in a project keys.env and reference it
-    as ${TEAMWORK_HARNESS_TOKEN} -- DOES NOT WORK, and fails silently. Measured:
-    KeyManager reads `get_amplifier_home() / "keys.env"` and nothing else
-    (app-cli key_manager.py:11, "Manage API keys in ~/.amplifier/keys.env
-    file"), so a PROJECT-local .amplifier/keys.env is never loaded. The variable
-    stays undefined, expansion leaves the literal string in place, and
-    resolve_connection() receives a token-shaped value that is not a token. The
-    hook then mounts inert: a session shows teamwork_connect and teamwork_bind
-    from the tool module and none of the hook's own tools, with no error
-    anywhere.
-
-    settings.yaml is project-scoped. keys.env is not. They live in the same
-    .amplifier directory and follow different rules.
-
-    So the credential goes in its own 0600 file that the HOOK reads directly,
-    and the override carries only its absolute path. No env expansion in the
-    chain means nothing to silently fail to expand.
-    """
-    # share_visible_turns is the CONSENT gate, and it must be written here.
-    # mount() returns immediately when it is absent (__init__.py:2143), so the
-    # hook registers none of its tools and the session looks like the bundle is
-    # not installed: teamwork_connect and teamwork_bind appear, because those
-    # come from the tool module which has no such gate, and nothing else does.
-    # No error is raised -- a mount exception is absorbed by the host, so the
-    # failure is indistinguishable from the feature simply being off.
-    #
-    # Writing it here is the same act setup_teamwork.py performs at
-    # setup_teamwork.py:53: supplying a credential to a project directory IS
-    # the deliberate opt-in. It is announced on stdout rather than done
-    # quietly, because the consequence -- this session's visible prompts and
-    # responses reaching a shared project -- is the user's to know about.
     config = {"base_url": base, "project_id": project,
               "connection_file": str(connection_file), "share_visible_turns": True}
     return {"overrides": {"hooks-teamwork": {"config": dict(config)},
                           "tool-teamwork": {"config": dict(config)}}}
 
 
+def _regular_or_absent(path):
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(mode):
+        raise SystemExit("A target configuration path is not a regular file. Nothing was written.")
+
+
+def _write_new(path, content, owned, *, dir_fd):
+    # O_EXCL protects both existing files and symlinks. Credentials are private
+    # from creation, including the interval before writing has completed.
+    fd = os.open(path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=dir_fd)
+    identity = os.fstat(fd)
+    owned.append((path, identity.st_dev, identity.st_ino))
+    with os.fdopen(fd, "w", encoding="utf-8") as output:
+        output.write(json.dumps(content, indent=2) + "\n")
+        output.flush()
+        os.fsync(output.fileno())
+
+
+def _read_at(directory_fd, name):
+    fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory_fd)
+    with os.fdopen(fd, "r", encoding="utf-8") as source:
+        info = os.fstat(source.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("Not a regular configuration file")
+        return source.read(), info
+
+
+def _check_pinned_directories(project_dir, project_fd, directory_fd):
+    for current, pinned in ((os.stat(project_dir, follow_symlinks=False), os.fstat(project_fd)),
+                            (os.stat(".amplifier", dir_fd=project_fd, follow_symlinks=False), os.fstat(directory_fd))):
+        if not stat.S_ISDIR(current.st_mode) or (current.st_dev, current.st_ino) != (pinned.st_dev, pinned.st_ino):
+            raise SystemExit("The project configuration directory changed during attachment. Retry after restoring it.")
+
+
+def attach(project_dir, base, project, token):
+    if os.name == "nt":
+        raise SystemExit("This attachment script requires POSIX directory protection. Use the native Teamwork connection form on Windows.")
+    project_dir = project_dir.expanduser().resolve()
+    directory = project_dir / ".amplifier"
+    global_home = Path(os.environ.get("AMPLIFIER_HOME", str(Path.home() / ".amplifier"))).expanduser().resolve()
+    if directory.resolve() == global_home or project_dir == Path.home().resolve():
+        raise SystemExit("Choose a project directory, not the global Amplifier directory. Nothing was written.")
+    if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+        raise SystemExit("The project .amplifier path must be a real directory. Nothing was written.")
+    connection, settings, ignore = (directory / name for name in
+                                    ("teamwork-connection.json", "settings.yaml", ".gitignore"))
+    for target in (connection, settings, ignore):
+        _regular_or_absent(target)
+    block = settings_block(base, project, connection)
+    saved = {"base_url": base, "project_id": project, "token": token}
+    existing = connection.exists() or settings.exists()
+    if existing:
+        try:
+            identical = (not connection.stat().st_mode & 0o077
+                         and json.loads(connection.read_text()) == saved
+                         and json.loads(settings.read_text()) == block)
+        except (OSError, ValueError):
+            identical = False
+        if not identical:
+            raise SystemExit("Existing project settings or connection differ. They were preserved. "
+                             "Use the native Teamwork connection form, or review the existing configuration before attaching again.")
+    try:
+        tracked = subprocess.run(["git", "-C", str(project_dir), "ls-files", "--", *(
+            ".amplifier" + pattern for pattern in PRIVATE_PATTERNS)], capture_output=True, timeout=10)
+        if tracked.stdout:
+            raise SystemExit("A private Teamwork path is tracked by Git. Remove it from tracking before attaching. Nothing was written.")
+    except FileNotFoundError:
+        pass  # The local ignore file also protects a repository initialized later.
+
+    verify(base, project, token)
+    # Pin actual directories after the network wait. Every write and cleanup is
+    # relative to the pinned fd, so a renamed directory or new symlink cannot
+    # redirect a secret into global configuration between checks and writes.
+    with ExitStack() as stack:
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        try:
+            project_fd = os.open(project_dir, flags)
+            stack.callback(os.close, project_fd)
+            try:
+                os.mkdir(".amplifier", 0o700, dir_fd=project_fd)
+            except FileExistsError:
+                pass
+            directory_fd = os.open(".amplifier", flags, dir_fd=project_fd)
+            stack.callback(os.close, directory_fd)
+        except OSError:
+            raise SystemExit("The project configuration directory changed or is unavailable. Nothing was written.") from None
+        if existing:
+            try:
+                contents, info = _read_at(directory_fd, connection.name)
+                current_settings, _ = _read_at(directory_fd, settings.name)
+                ignore_text, _ = _read_at(directory_fd, ignore.name)
+                identical = (not info.st_mode & 0o077 and json.loads(contents) == saved
+                             and json.loads(current_settings) == block)
+                # These final local rules cover the credential and private runtime
+                # journals, including when a repository is initialized later.
+                rules = [line.strip() for line in ignore_text.splitlines()
+                         if line.strip() and not line.lstrip().startswith("#")]
+                protected = rules[-len(PRIVATE_PATTERNS):] == list(PRIVATE_PATTERNS)
+            except (OSError, ValueError):
+                identical = protected = False
+            if not identical or not protected:
+                raise SystemExit("Existing configuration changed or private Teamwork files are not ignored. "
+                                 "Restore the connection, settings and Teamwork ignore rules before retrying. Existing files were preserved.")
+            _check_pinned_directories(project_dir, project_fd, directory_fd)
+            return False
+        # Protect private files before creating any. Existing ignore rules remain.
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW
+        fd = os.open(ignore.name, flags, 0o600, dir_fd=directory_fd)
+        with os.fdopen(fd, "a", encoding="utf-8") as output:
+            output.write("\n" + "\n".join(PRIVATE_PATTERNS) + "\n")
+            output.flush()
+            os.fsync(output.fileno())
+        owned = []
+        try:
+            _write_new(connection, saved, owned, dir_fd=directory_fd)
+            _write_new(settings, block, owned, dir_fd=directory_fd)
+            _check_pinned_directories(project_dir, project_fd, directory_fd)
+        except BaseException:
+            for path, device, inode in reversed(owned):
+                try:
+                    current = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+                    if (current.st_dev, current.st_ino) == (device, inode):
+                        os.unlink(path.name, dir_fd=directory_fd)
+                except FileNotFoundError:
+                    pass
+            raise
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--token", help="The harness credential you already hold. Omit to read it from stdin.")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
-    parser.add_argument("--project", help="Project id; omit to use the one the service publishes at /api/config")
-    parser.add_argument("--dir", default=".", help="Project directory to configure (default: the current one)")
+    parser.add_argument("--project", help="Omit to read the Project ID from public service discovery")
+    parser.add_argument("--dir", default=".", help="Existing project directory to configure")
+    parser.add_argument("--share-visible-turns", action="store_true",
+                        help="Consent to sharing visible prompts and responses from new sessions in this directory")
     args = parser.parse_args()
-
+    if not args.share_visible_turns:
+        raise SystemExit("Attaching enables sharing of visible prompts and responses from new sessions in this directory. "
+                         "Pass --share-visible-turns to consent. Nothing was written.")
     try:
         base = validate_service_url(args.base_url)
     except ValueError as error:
         raise SystemExit(str(error)) from None
-
-    token = (args.token or sys.stdin.readline()).strip()
-    if not token:
-        raise SystemExit("A harness credential is required (--token, or on stdin)")
-
     project = args.project or published_project(base)
     if not project:
-        raise SystemExit(
-            "Could not read the project id from the service; pass --project explicitly")
-
-    verify(base, project, token)
-
-    # Project scope, always. `~/.amplifier` is never touched -- see this
-    # module's docstring for why that is a correctness property and not a
-    # preference.
-    home = (Path(args.dir).expanduser().resolve() / ".amplifier")
-    home.mkdir(parents=True, exist_ok=True, mode=0o700)
-    connection, settings = home / "teamwork-connection.json", home / "settings.yaml"
-
-    # The secret, and only the secret, and only here. Rewritten wholesale on a
-    # re-attach so a rotated credential replaces the old one rather than
-    # accumulating beside it.
-    connection.write_text(json.dumps(
-        {"base_url": base, "project_id": project, "token": token}, indent=2) + "\n",
-        encoding="utf-8")
-    os.chmod(connection, 0o600)
-
-    block = settings_block(base, project, connection)
-    if settings.exists():
-        # Refuse rather than merge. A settings file is the user's, this script
-        # has no YAML parser to merge it faithfully (the bundle carries no
-        # third-party dependency), and a clobbered settings file is a worse
-        # outcome than a paste. So: say exactly what to add, and touch nothing.
-        print("%s already exists -- not modified. Add this to it:\n" % settings)
-        print(json.dumps(block, indent=2))
-    else:
-        # JSON is valid YAML, so this needs no YAML writer to produce a file
-        # the loader reads correctly.
-        settings.write_text(json.dumps(block, indent=2) + "\n", encoding="utf-8")
-        os.chmod(settings, 0o600)
-        print("Wrote", settings)
-
-    print("Wrote", connection, "(0600, credential only)")
-    print("Attached project:", project)
-    print("No harness was minted. Re-running this attaches to the SAME harness.")
-    print("Sharing is ON for sessions started in this directory: their visible")
-    print("prompts and responses will be published to the project above.")
-    print("Install the behavior in this harness if it is not already:")
-    print("  amplifier bundle add \"git+https://github.com/michaeljabbour/amplifier-bundle-teamwork"
-          "@main#subdirectory=behaviors/teamwork.yaml\" --app")
+        raise SystemExit("Could not read the Project ID; pass --project explicitly. Nothing was written.")
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", getpass.GetPassWarning)
+            token = (getpass.getpass("Portal agent credential (hidden): ") if sys.stdin.isatty()
+                     else sys.stdin.readline()).strip()
+    except getpass.GetPassWarning:
+        raise SystemExit("A private terminal prompt is unavailable. Supply the credential through stdin instead. Nothing was written.") from None
+    if not token:
+        raise SystemExit("A portal agent credential is required on the private prompt or stdin.")
+    created = attach(Path(args.dir), base, project, token)
+    print("Attached project:" if created else "Verified existing project attachment:", project)
+    print("No harness was minted. Existing connections and settings were preserved.")
+    print("New sessions in this directory will share visible prompts and responses to this project")
+    print("when the Teamwork app behavior is installed. Install it if needed:")
+    print('  amplifier bundle add "git+https://github.com/michaeljabbour/amplifier-bundle-teamwork'
+          '@main#subdirectory=behaviors/teamwork.yaml" --app')
 
 
 if __name__ == "__main__":

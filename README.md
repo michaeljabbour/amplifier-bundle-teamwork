@@ -473,6 +473,31 @@ amplifier bundle show <name>
 
 Use their output to preserve your actual base bundle. Do not guess a registry alias or substitute a generic bundle name. For portable local setup, supply an **existing absolute filesystem path** to that bundle (for example, `/absolute/path/to/my-bundle.yaml`); an explicit Git URI is also valid only when you intentionally want the remote source resolved.
 
+### Attach with an existing portal agent credential
+
+On macOS or Linux, `attach_teamwork.py` configures an existing project directory
+using a portal agent credential you already hold. It does not mint a new harness.
+Install the Teamwork app behavior as described above, then run:
+
+```sh
+python3 attach_teamwork.py --dir /absolute/path/to/project --share-visible-turns
+```
+
+Enter the **portal agent credential** at the hidden prompt. This is different from
+the personal member code used by `setup_teamwork.py`. Automation can supply the
+credential through private stdin. The script discovers the Project ID unless you
+pass `--project`, verifies both context and publishing access, then writes private
+project configuration. The explicit sharing flag enables visible prompts and
+responses from new sessions started in that directory; active sessions and global
+settings are unchanged.
+
+The credential lives in `.amplifier/teamwork-connection.json` with mode 0600;
+settings contain its path. Local ignore rules cover the credential and private
+runtime journals. Existing settings or a different connection are refused without
+replacement. An identical attachment is verified again without rewriting it. Use
+the native connection form when the directory already has custom settings, or on
+Windows. Keep private Teamwork files out of source control.
+
 ### 3. Enroll and create project-private files
 
 This legacy path is member-code only (no Microsoft sign-in). Sign in at the Teamwork service with your name/email and private member code, and select the project you were added to. Then choose a project-specific private directory outside the checkout. The explicit paths below avoid relying on any installer default:
