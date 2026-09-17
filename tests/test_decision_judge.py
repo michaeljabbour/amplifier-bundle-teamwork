@@ -184,13 +184,190 @@ class WindowPayloadTests(unittest.TestCase):
 
     def test_an_empty_window_is_still_a_valid_bounded_payload(self):
         window = decision_judge.build_window_payload([], [])
-        self.assertEqual(window, {"turns": [], "tool_calls": []})
+        self.assertEqual(window, {"turns": [], "tool_calls": [], "tally": []})
 
     def test_a_turn_with_neither_prompt_nor_response_is_dropped(self):
         window = decision_judge.build_window_payload(
             [{"user_prompt": "", "agent_responses": []}]
         )
         self.assertEqual(window["turns"], [])
+
+    def test_tally_is_bounded_by_count_and_reboundeds_a_caller_supplied_one(self):
+        """build_window_payload never trusts an upstream tally either --
+        matching the "never raises, never trusts an upstream bound" posture
+        it already applies to turns and tool_calls.
+        """
+        tally = [
+            {"record_type": "insight", "record_id": "i%d" % i, "version": 1, "claim": "c%d" % i}
+            for i in range(30)
+        ]
+        window = decision_judge.build_window_payload([], [], tally, max_tally_entries=5)
+        self.assertEqual(len(window["tally"]), 5)
+
+    def test_tally_claim_text_is_clipped_to_the_bound(self):
+        tally = [{"record_type": "insight", "record_id": "i1", "version": 1, "claim": "x" * 500}]
+        window = decision_judge.build_window_payload([], [], tally, max_tally_chars=50)
+        self.assertLessEqual(len(window["tally"][0]["claim"]), 50)
+
+    def test_a_malformed_tally_entry_is_dropped_not_fatal(self):
+        tally = [
+            {"record_type": "insight", "record_id": "i1", "version": 1, "claim": "keep me"},
+            {"record_type": "insight", "record_id": "i2", "claim": "missing a version"},
+            {"record_type": "work", "record_id": "w1", "version": 1, "claim": "wrong record type"},
+            "not even a dict",
+            {"record_type": "idea", "record_id": "d1", "version": "not-an-int", "claim": "bad version type"},
+        ]
+        window = decision_judge.build_window_payload([], [], tally)
+        self.assertEqual([entry["record_id"] for entry in window["tally"]], ["i1"])
+
+    def test_no_tally_supplied_is_an_empty_list_not_a_missing_key(self):
+        window = decision_judge.build_window_payload([], [])
+        self.assertEqual(window["tally"], [])
+
+
+class BuildTallyTests(unittest.TestCase):
+    """build_tally() reads the hook's own synchronized cache -- no network
+    call -- and degrades safely on anything malformed.
+    """
+
+    def _source(self, record_type, record_id, version, content):
+        return {
+            "record": {"id": record_id, "record_type": record_type, "version": version, "content": content},
+            "delivery_id": "manifest",
+        }
+
+    def test_only_insight_and_idea_record_types_are_read(self):
+        cache = {
+            "insight:i1": self._source("insight", "i1", 1, {"claim": "an insight"}),
+            "idea:d1": self._source("idea", "d1", 1, {"text": "an idea"}),
+            "work:w1": self._source("work", "w1", 1, {"title": "not knowledge"}),
+            "person:p1": self._source("person", "p1", 1, {"name": "not knowledge either"}),
+        }
+        tally = decision_judge.build_tally(cache)
+        self.assertEqual({e["record_id"] for e in tally}, {"i1", "d1"})
+
+    def test_most_recent_first_by_updated_at(self):
+        cache = {
+            "insight:old": self._source("insight", "old", 1,
+                                         {"claim": "older", "updated_at": "2026-01-01T00:00:00+00:00"}),
+            "insight:new": self._source("insight", "new", 1,
+                                         {"claim": "newer", "updated_at": "2026-09-01T00:00:00+00:00"}),
+        }
+        tally = decision_judge.build_tally(cache)
+        self.assertEqual([e["record_id"] for e in tally], ["new", "old"])
+
+    def test_falls_back_to_created_at_when_never_updated(self):
+        cache = {
+            "insight:a": self._source("insight", "a", 1,
+                                       {"claim": "a", "created_at": "2026-01-01T00:00:00+00:00"}),
+            "insight:b": self._source("insight", "b", 1,
+                                       {"claim": "b", "created_at": "2026-06-01T00:00:00+00:00"}),
+        }
+        tally = decision_judge.build_tally(cache)
+        self.assertEqual([e["record_id"] for e in tally], ["b", "a"])
+
+    def test_entries_carry_claim_title_only_never_the_whole_record(self):
+        cache = {
+            "insight:i1": self._source("insight", "i1", 3, {
+                "claim": "the transferable statement",
+                "limitations": "must never leak into the tally",
+                "source_session_id": "must never leak into the tally either",
+            }),
+        }
+        tally = decision_judge.build_tally(cache)
+        self.assertEqual(tally, [{"record_type": "insight", "record_id": "i1", "version": 3,
+                                  "claim": "the transferable statement"}])
+
+    def test_bounded_by_max_entries(self):
+        cache = {
+            "insight:i%d" % i: self._source("insight", "i%d" % i, 1, {"claim": "c%d" % i})
+            for i in range(50)
+        }
+        tally = decision_judge.build_tally(cache, max_entries=7)
+        self.assertEqual(len(tally), 7)
+
+    def test_claim_text_is_clipped(self):
+        cache = {"insight:i1": self._source("insight", "i1", 1, {"claim": "x" * 1000})}
+        tally = decision_judge.build_tally(cache, max_chars=20)
+        self.assertLessEqual(len(tally[0]["claim"]), 20)
+
+    def test_empty_cache_degrades_to_an_empty_tally(self):
+        self.assertEqual(decision_judge.build_tally({}), [])
+        self.assertEqual(decision_judge.build_tally(None), [])
+
+    def test_malformed_cache_entries_are_skipped_not_fatal(self):
+        cache = {
+            "insight:good": self._source("insight", "good", 1, {"claim": "the only usable entry"}),
+            "insight:no-content": {"record": {"id": "x", "record_type": "insight", "version": 1}},
+            "insight:no-version": {"record": {"id": "y", "record_type": "insight",
+                                              "content": {"claim": "no version"}}},
+            "insight:no-claim-text": self._source("insight", "z", 1, {"limitations": "no claim field"}),
+            "broken": "not even a dict",
+            "insight:none-record": {"record": None},
+        }
+        tally = decision_judge.build_tally(cache)
+        self.assertEqual([e["record_id"] for e in tally], ["good"])
+
+
+class ParseLinksTests(unittest.TestCase):
+    """_parse_links() is the backstop when a judge's `links` field is
+    malformed -- an entry that does not match RecordInsightTool's own
+    `record` evidence-kind shape is dropped, never fatal to the rest.
+    """
+
+    def test_a_well_formed_link_survives(self):
+        links = decision_judge._parse_links(
+            [{"record_type": "insight", "record_id": "i1", "version": 2}]
+        )
+        self.assertEqual(links, [{"record_type": "insight", "record_id": "i1", "version": 2}])
+
+    def test_non_list_input_degrades_to_no_links(self):
+        for raw in (None, "not a list", {"record_type": "insight"}, 42):
+            with self.subTest(raw=raw):
+                self.assertEqual(decision_judge._parse_links(raw), [])
+
+    def test_a_malformed_entry_is_dropped_not_fatal_to_the_rest(self):
+        links = decision_judge._parse_links([
+            {"record_type": "insight", "record_id": "keep", "version": 1},
+            {"record_type": "person", "record_id": "bad-type", "version": 1},
+            {"record_type": "idea", "record_id": "", "version": 1},
+            {"record_type": "idea", "record_id": "bad-version", "version": "not-an-int"},
+            {"record_type": "work", "record_id": "bad-version-bool", "version": True},
+            "not a dict",
+        ])
+        self.assertEqual(links, [{"record_type": "insight", "record_id": "keep", "version": 1}])
+
+    def test_parse_verdict_carries_valid_links_through_only_on_record_true(self):
+        raw = json.dumps({
+            "record": True, "kind": "k", "claim": "c", "basis": "observation",
+            "what_it_does_not_establish": "w", "confidence": "high", "reason": "r",
+            "links": [{"record_type": "insight", "record_id": "i1", "version": 1}],
+        })
+        verdict = decision_judge._parse_verdict(raw)
+        self.assertEqual(verdict["links"], [{"record_type": "insight", "record_id": "i1", "version": 1}])
+
+    def test_parse_verdict_skip_verdict_always_has_empty_links(self):
+        raw = json.dumps({
+            "record": False, "kind": None, "claim": None, "basis": None,
+            "what_it_does_not_establish": None, "confidence": "high", "reason": "duplicate of i1",
+            "links": [{"record_type": "insight", "record_id": "i1", "version": 1}],
+        })
+        verdict = decision_judge._parse_verdict(raw)
+        self.assertEqual(verdict["links"], [])
+
+    def test_parse_verdict_missing_links_field_entirely_still_parses(self):
+        """links is deliberately NOT in VERDICT_FIELDS -- its absence must
+        never invalidate an otherwise well-formed verdict."""
+        raw = json.dumps({
+            "record": True, "kind": "k", "claim": "c", "basis": "observation",
+            "what_it_does_not_establish": "w", "confidence": "high", "reason": "r",
+        })
+        verdict = decision_judge._parse_verdict(raw)
+        self.assertTrue(verdict["available"])
+        self.assertEqual(verdict["links"], [])
+
+    def test_no_verdict_carries_an_empty_links_list(self):
+        self.assertEqual(decision_judge.no_verdict("x")["links"], [])
 
 
 class HonestJudgeFailures(unittest.IsolatedAsyncioTestCase):

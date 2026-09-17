@@ -58,6 +58,22 @@ carries the parent's `hook.sid`. Swapping in a *new* `RecordInsightTool` built
 against a hook that belongs to this judge session would silently reintroduce
 the misattribution this design exists to avoid -- so `extra_tools` must always
 be already-bound instances handed in by the caller, never constructed here.
+
+THE TALLY. Both judges are also shown a bounded, most-recent-first TALLY of
+knowledge already recorded for this project (`build_tally()` below) -- claim/
+title only, never whole records. This exists because a live DTU run recorded
+the SAME lesson twice in different words ("whatever you mock, you are not
+testing" vs. "a test only covers the defects that could make it fail"): claim-
+text fingerprinting (see `__init__.py`'s `_record_verdict`) only catches an
+exact repeat, never a paraphrase, and a judge shown nothing but its own window
+has no way to notice the project already knows this. The tally is the judge's
+half of that fix -- it can decline a semantic duplicate and, when a claim
+genuinely builds on something already recorded, say so via the optional
+`links` verdict field (see `_parse_links()` below), which `__init__.py`'s
+`_record_verdict` carries through as `{"kind": "record", ...}` evidence
+alongside the window's own `external` reference. The judge is otherwise
+strictly less informed than a model that reads the project directly and cites
+what it extends by hand -- the tally narrows, but does not close, that gap.
 """
 
 from __future__ import annotations
@@ -90,6 +106,13 @@ async def _cleanup_session(session):
 #: referencing the structural-vs-contingent test. Evidence is deliberately
 #: absent: the judge saw a window, not the world, and cannot manufacture an
 #: evidence reference; a caller that decides to record still has to supply one.
+#:
+#: `links` (see "THE TALLY" in this module's docstring) is deliberately NOT in
+#: this tuple: every field here must be PRESENT in the model's JSON or the
+#: whole verdict is unusable (see `_parse_verdict` below), and `links` is the
+#: one field this module is lenient about -- a model that omits it, or gets its
+#: shape wrong, should not lose an otherwise-valid verdict over one optional
+#: field. `_parse_links()` reads it separately and always produces a list.
 VERDICT_FIELDS = (
     "record",
     "kind",
@@ -116,6 +139,7 @@ def no_verdict(reason):
         "what_it_does_not_establish": None,
         "confidence": None,
         "reason": str(reason),
+        "links": [],
     }
 
 
@@ -133,6 +157,31 @@ MAX_TURN_CHARS = 4000
 MAX_TOOL_CALLS = 20
 MAX_TOOL_FIELD_CHARS = 200
 
+# The tally (see this module's docstring, "THE TALLY") is claim/title-only and
+# bounded the same way the window itself is: a count cap and a per-entry char
+# cap, named here rather than reused from the window's own constants because a
+# tally entry is a different shape (one line of already-recorded knowledge, not
+# a turn of conversation) and the two may need to move independently. A tally
+# that grows with the project would turn a cheap per-window classification
+# into one whose cost scales with how much the project has ever recorded --
+# these bounds keep it constant regardless of project size.
+MAX_TALLY_ENTRIES = 20
+MAX_TALLY_CLAIM_CHARS = 200
+
+# The only record types read into the tally: durable knowledge, matching the
+# server's own INCLUDES grouping and the two record kinds RecordInsightTool
+# writes (see docs/scenarios/06's open questions on why nothing wrote one
+# until now). Work/request/message/etc. are project *activity*, not knowledge
+# a judge should be checking a claim against for duplication.
+TALLY_RECORD_TYPES = ("insight", "idea")
+
+# The same fields describe() and TITLE_FIELDS-style projection already favor
+# for "what is this record about" -- kept local rather than imported from
+# __init__.py because decision_judge.py is deliberately dependency-free of the
+# hook module (see this file's own docstring on why it is a library, not a
+# subscriber). Order matters: the first present, non-empty string wins.
+_TALLY_CLAIM_FIELDS = ("claim", "title", "text", "summary", "body")
+
 
 def _clip(text, limit):
     text = " ".join(str(text).split())
@@ -142,7 +191,9 @@ def _clip(text, limit):
 
 
 def build_window_payload(
-    turns, tool_calls=None, *, max_turns=MAX_WINDOW_TURNS, max_turn_chars=MAX_TURN_CHARS
+    turns, tool_calls=None, tally=None, *,
+    max_turns=MAX_WINDOW_TURNS, max_turn_chars=MAX_TURN_CHARS,
+    max_tally_entries=MAX_TALLY_ENTRIES, max_tally_chars=MAX_TALLY_CLAIM_CHARS,
 ):
     """Build a bounded window payload: the last `max_turns` visible turns, plus
     consequential tool calls reduced to NAME AND TARGET ONLY -- never arguments,
@@ -153,6 +204,13 @@ def build_window_payload(
     `turns` is an iterable of `{"user_prompt": str, "agent_responses": [{"text": str}, ...]}`
     -- the same shape the hook's own turn records use. `tool_calls` is an
     iterable of objects or dicts exposing `name` and (optionally) `target`.
+
+    `tally` is an already-built list of entries from `build_tally()` below (or
+    None) -- this function re-bounds it defensively (count and per-entry claim
+    length) rather than trusting the caller, the same "never raises, never
+    trusts an upstream bound" posture the rest of this function already takes
+    for turns and tool_calls. A malformed entry (not a dict, or missing one of
+    record_type/record_id/version/claim) is dropped, not fatal.
 
     Never raises: a turn or call missing an expected key is skipped rather than
     failing the whole window, because a partially-built window is still far
@@ -190,7 +248,89 @@ def build_window_payload(
             entry["target"] = _clip(target, MAX_TOOL_FIELD_CHARS)
         bounded_calls.append(entry)
 
-    return {"turns": bounded_turns, "tool_calls": bounded_calls}
+    bounded_tally = []
+    for entry in list(tally or [])[:max_tally_entries]:
+        if not isinstance(entry, dict):
+            continue
+        record_type, record_id = entry.get("record_type"), entry.get("record_id")
+        version, claim = entry.get("version"), entry.get("claim")
+        if record_type not in TALLY_RECORD_TYPES:
+            continue
+        if not isinstance(record_id, str) or not record_id.strip():
+            continue
+        if not isinstance(version, int) or isinstance(version, bool):
+            continue
+        if not isinstance(claim, str) or not claim.strip():
+            continue
+        bounded_tally.append({
+            "record_type": record_type, "record_id": record_id,
+            "version": version, "claim": _clip(claim, max_tally_chars),
+        })
+
+    return {"turns": bounded_turns, "tool_calls": bounded_calls, "tally": bounded_tally}
+
+
+def build_tally(cache, *, max_entries=MAX_TALLY_ENTRIES, max_chars=MAX_TALLY_CLAIM_CHARS):
+    """Build the tally `build_window_payload()` above bounds and both prompts
+    render: a most-recent-first list of this project's already-recorded
+    knowledge (insight/idea records), claim/title only -- never a whole
+    record. See this module's docstring, "THE TALLY", for why this exists.
+
+    `cache` is the hook's own already-synchronized cache
+    (`self.state["cache"]`, keyed `"<record_type>:<id>"` ->
+    `{"record": {...}, "delivery_id": ...}` -- see `__init__.py`'s
+    `TeamworkHook.retrieve()`). No new network call is made or needed here;
+    this reads what the hook already fetched on this turn's `prompt:submit`.
+
+    "Most recent" is read from each record's own `updated_at` (present inside
+    `content` for every record the service returns -- see
+    `without_audit_trail()`'s AUDIT_FIELDS in `__init__.py`), falling back to
+    `created_at` when a record has never been edited, and to the empty string
+    (sorting last) when neither is a usable string -- a record with no
+    resolvable timestamp is still shown, just not preferentially.
+
+    Never raises: a malformed cache entry -- not a dict, no usable
+    record/content, no string record_id, no integer version, no usable claim
+    text -- is skipped, not fatal to the rest of the tally. An empty or
+    missing cache degrades to an empty tally, which is exactly today's
+    behavior (no "ALREADY RECORDED" section in the prompt) -- callers do not
+    need to special-case "detection has never synchronized yet".
+    """
+    candidates = []
+    for source in (cache or {}).values():
+        if not isinstance(source, dict):
+            continue
+        record = source.get("record")
+        if not isinstance(record, dict):
+            continue
+        record_type = record.get("record_type")
+        if record_type not in TALLY_RECORD_TYPES:
+            continue
+        record_id = record.get("id")
+        version = record.get("version")
+        if not isinstance(record_id, str) or not record_id.strip():
+            continue
+        if not isinstance(version, int) or isinstance(version, bool):
+            continue
+        content = record.get("content") if isinstance(record.get("content"), dict) else {}
+        claim = next(
+            (content[key] for key in _TALLY_CLAIM_FIELDS
+             if isinstance(content.get(key), str) and content[key].strip()),
+            None,
+        )
+        if not claim:
+            continue
+        recency = content.get("updated_at") or content.get("created_at")
+        recency = recency if isinstance(recency, str) else ""
+        candidates.append({
+            "record_type": record_type, "record_id": record_id, "version": version,
+            "claim": _clip(claim, max_chars), "_recency": recency,
+        })
+    candidates.sort(key=lambda entry: entry["_recency"], reverse=True)
+    return [
+        {key: value for key, value in entry.items() if key != "_recency"}
+        for entry in candidates[:max_entries]
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +370,16 @@ strategy, stated with a clear reason, and still must be SKIPPED. The test is:
 
 Precision matters more than recall. A missed RECORD costs a re-decision someone can
 make again later. A wrong RECORD costs every future reader permanently -- there is
-no undo for an automatic record. When genuinely unsure, prefer SKIP."""
+no undo for an automatic record. When genuinely unsure, prefer SKIP.
+
+If, and only if, an ALREADY RECORDED tally is shown to you below (this project's
+own knowledge, most recent first, claim/title only), use it for ONE thing only.
+No tally section means none of this applies -- judge the window on its own merits
+as above. The tally never changes your RECORD/SKIP call: judge that on the window.
+
+When what you record builds on something the tally already states, cite the entry it builds on in "links" using its exact
+record_type/record_id/version as shown -- never invent one, never cite an entry
+not actually shown to you."""
 
 _OUTPUT_INSTRUCTIONS = """Respond with ONLY a single JSON object -- no markdown fence, no commentary
 before or after it -- with exactly these keys:
@@ -245,7 +394,11 @@ before or after it -- with exactly these keys:
           is false
   "confidence": "low", "medium", or "high"
   "reason": one or two sentences on why, naming whether the deciding reason was
-          structural or contingent"""
+          structural or contingent
+  "links": a list of ALREADY RECORDED entries this decision builds on, each exactly
+          {"record_type": ..., "record_id": ..., "version": ...} copied from the
+          tally shown to you -- or an empty list when it builds on nothing shown.
+          Omit or use an empty list when record is false."""
 
 # The lesson rule, distilled from 06 and 06b's "What the good one knows"
 # sections -- quoted, not paraphrased, where 06/06b state the test in their
@@ -291,7 +444,17 @@ its evidence does not reach as far as the claim it would license. The test is:
 
 Precision matters more than recall. A missed lesson costs a re-discovery someone can
 make again later. A wrongly-recorded one costs every future reader permanently -- there
-is no undo for an automatic record. When genuinely unsure, prefer SKIP."""
+is no undo for an automatic record. When genuinely unsure, prefer SKIP.
+
+If, and only if, an ALREADY RECORDED tally is shown to you below (this project's
+own knowledge, most recent first, claim/title only), use it two ways. No tally
+section means none of this applies -- judge the window on its own merits as above.
+
+When what you record builds on something the tally already states, cite the entry it builds on in "links" using its exact
+record_type/record_id/version as shown -- never invent one, never cite an entry
+not actually shown to you. A genuinely NEW lesson, on a different mechanism or
+limitation than anything shown, stays RECORD even when the tally is full of
+near-miss entries on the same general topic -- on-topic is not duplicate."""
 
 _LESSON_OUTPUT_INSTRUCTIONS = """Respond with ONLY a single JSON object -- no markdown fence, no commentary
 before or after it -- with exactly these keys:
@@ -306,14 +469,32 @@ before or after it -- with exactly these keys:
           is false
   "confidence": "low", "medium", or "high"
   "reason": one or two sentences on why, naming whether the evidence reaches as far as
-          the claim or is bounded to this environment/task"""
+          the claim or is bounded to this environment/task -- and, when declining a
+          why
+  "links": a list of ALREADY RECORDED entries this lesson builds on, each exactly
+          {"record_type": ..., "record_id": ..., "version": ...} copied from the
+          tally shown to you -- or an empty list when it builds on nothing shown.
+          Omit or use an empty list when record is false."""
 
 
 def _build_prompt(rule, output_instructions, window):
     """Shared prompt assembly for both judges -- only `rule` and
     `output_instructions` differ between the decision and lesson prompts.
     """
-    lines = [rule, "", "WINDOW:"]
+    lines = [rule, ""]
+    tally = window.get("tally") or []
+    if tally:
+        lines.append(
+            "ALREADY RECORDED (this project's own knowledge, most recent first; "
+            "claim/title only, not full records):"
+        )
+        for entry in tally:
+            lines.append(
+                "  - %s:%s@%s -- %s"
+                % (entry["record_type"], entry["record_id"], entry["version"], entry["claim"])
+            )
+        lines.append("")
+    lines.append("WINDOW:")
     turns = window.get("turns") or []
     if not turns and not (window.get("tool_calls") or []):
         lines.append("(empty window)")
@@ -386,8 +567,48 @@ def _parse_verdict(raw):
     elif any(verdict[field] is not None
              for field in ("kind", "claim", "basis", "what_it_does_not_establish")):
         return None
+    verdict["links"] = _parse_links(data.get("links")) if verdict["record"] else []
     verdict["available"] = True
     return verdict
+
+
+#: The only evidence-kind record types RecordInsightTool's own `record`
+#: evidence kind accepts (see __init__.py's RecordInsightTool._evidence_refs).
+#: Kept identical and separate rather than imported, matching this module's
+#: existing choice to stay import-free of the hook module.
+_LINK_RECORD_TYPES = ("work", "request", "idea", "insight")
+
+
+def _parse_links(raw):
+    """Defensively validate the judge's optional `links` field.
+
+    Each surviving entry matches RecordInsightTool's own `record` evidence-kind
+    shape exactly: `record_type` in work/request/idea/insight, a non-empty
+    string `record_id`, an integer `version`. An entry that does not match is
+    DROPPED, not fatal to the rest of the verdict or the rest of `links` --
+    per this module's docstring, the judge should emit nothing rather than a
+    malformed ref, but this is the backstop for when it doesn't. `raw` that is
+    not a list (absent, null, a string, ...) degrades to no links at all.
+
+    Never raises.
+    """
+    if not isinstance(raw, list):
+        return []
+    links = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        record_type = item.get("record_type")
+        record_id = item.get("record_id")
+        version = item.get("version")
+        if record_type not in _LINK_RECORD_TYPES:
+            continue
+        if not isinstance(record_id, str) or not record_id.strip():
+            continue
+        if not isinstance(version, int) or isinstance(version, bool):
+            continue
+        links.append({"record_type": record_type, "record_id": record_id, "version": version})
+    return links
 
 
 # ---------------------------------------------------------------------------

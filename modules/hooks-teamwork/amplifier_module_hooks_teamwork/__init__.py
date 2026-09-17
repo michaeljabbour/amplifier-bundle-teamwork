@@ -1203,7 +1203,8 @@ class TeamworkHook:
             self.journal.save(self.sid, self.state)
             window = decision_judge.build_window_payload(
                 [{"user_prompt": t["user_prompt"], "agent_responses": t["agent_responses"]} for t in turns],
-                tool_calls)
+                tool_calls,
+                tally=decision_judge.build_tally(self.state.get("cache", {})))
         await self._judge_and_record(window, upto)
 
     def detect_lesson(self):
@@ -1240,7 +1241,8 @@ class TeamworkHook:
         self.state["lesson_turns"] = [t for t in self.state.get("lesson_turns", []) if t["turn_index"] > upto]
         self.journal.save(self.sid, self.state)
         window = decision_judge.build_window_payload(
-            [{"user_prompt": t["user_prompt"], "agent_responses": t["agent_responses"]} for t in turns])
+            [{"user_prompt": t["user_prompt"], "agent_responses": t["agent_responses"]} for t in turns],
+            tally=decision_judge.build_tally(self.state.get("cache", {})))
         task = asyncio.create_task(self._judge_and_record_lesson(window, upto))
         self._lesson_tasks.add(task)
         task.add_done_callback(self._lesson_tasks.discard)
@@ -1293,6 +1295,11 @@ class TeamworkHook:
         (decision_seen/record_decision_fingerprint or their lesson_*
         counterparts), so this method never needs to know which detector
         called it beyond `log_label` and `uri_scheme`.
+
+        Any `links` the judge cited from its tally (decision_judge.py's "THE
+        TALLY") are carried through as additional `record`-kind evidence,
+        re-validated here rather than trusted -- one malformed link is
+        dropped, never allowed to sink the whole write.
         """
         if not verdict.get("record"):
             return
@@ -1320,6 +1327,26 @@ class TeamworkHook:
             "uri": uri_scheme + self.sid + "/upto-turn/" + str(considered_upto),
             "label": "auto-detected " + log_label + " window",
         }]
+        # Carry through whatever the judge cited via the tally (see
+        # decision_judge.py's "THE TALLY" and _parse_links): a claim that
+        # builds on already-recorded knowledge gets a second, `record`-kind
+        # evidence entry alongside the window reference above, so the
+        # knowledge plane stays connected rather than flat. Re-validated here,
+        # independently of decision_judge._parse_links, because a verdict can
+        # reach this method from anywhere a caller constructs one directly
+        # (tests do); a malformed entry is DROPPED, never allowed to abort the
+        # whole write -- one bad link must not cost the record itself.
+        for link in verdict.get("links") or []:
+            if not isinstance(link, dict):
+                continue
+            link_type, link_id, link_version = link.get("record_type"), link.get("record_id"), link.get("version")
+            if link_type not in ("work", "request", "idea", "insight"):
+                continue
+            if not isinstance(link_id, str) or not link_id.strip():
+                continue
+            if not isinstance(link_version, int) or isinstance(link_version, bool):
+                continue
+            evidence.append({"kind": "record", "record_type": link_type, "record_id": link_id, "version": link_version})
         try:
             result = await RecordInsightTool(self).execute({
                 "claim": claim, "basis": basis, "confidence": confidence,

@@ -416,6 +416,122 @@ class ProvenanceStaysOnTheParent(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(refs[0]["uri"].lower().startswith(("http://", "https://")))
 
 
+class TallyReachesTheLessonJudge(unittest.IsolatedAsyncioTestCase):
+    """Same wiring as decision detection's own TallyReachesTheJudge (see
+    tests/test_decision_detection.py) -- the lesson judge is shown the same
+    cache-derived tally, built the same way, with the same never-raises
+    guarantee on a malformed cache entry.
+    """
+
+    def _insight_source(self, record_id, version, claim):
+        return {
+            "record": {"id": record_id, "record_type": "insight", "version": version,
+                       "content": {"claim": claim}},
+            "delivery_id": "manifest",
+        }
+
+    async def test_cache_contents_reach_the_lesson_judge_as_a_tally(self):
+        hook, _client, _journal = build(self)
+        hook.state["cache"] = {
+            "insight:i1": self._insight_source("i1", 5, "A prior lesson already recorded."),
+        }
+        add_turn(hook, "u1", "r1")
+        captured = []
+
+        async def fake_judge(coordinator, window):
+            captured.append(window)
+            return decision_judge.no_verdict("test probe")
+
+        with patch.object(decision_judge, "judge_lesson_window", fake_judge):
+            hook.detect_lesson()
+            await drain(hook)
+        self.assertEqual(captured[0]["tally"], [
+            {"record_type": "insight", "record_id": "i1", "version": 5,
+             "claim": "A prior lesson already recorded."},
+        ])
+
+    async def test_a_malformed_cache_entry_does_not_break_lesson_detection(self):
+        hook, _client, _journal = build(self)
+        hook.state["cache"] = {
+            "insight:good": self._insight_source("good", 1, "The only usable entry."),
+            "insight:broken": {"record": {"id": "broken", "record_type": "insight"}},
+            "not-even-a-source": "garbage",
+        }
+        add_turn(hook, "u1", "r1")
+        captured = []
+
+        async def fake_judge(coordinator, window):
+            captured.append(window)
+            return decision_judge.no_verdict("test probe")
+
+        with patch.object(decision_judge, "judge_lesson_window", fake_judge):
+            hook.detect_lesson()
+            await drain(hook)
+        self.assertEqual(len(captured), 1)
+        self.assertEqual([e["record_id"] for e in captured[0]["tally"]], ["good"])
+
+    async def test_an_empty_cache_is_an_empty_tally_exactly_todays_behavior(self):
+        hook, _client, _journal = build(self)
+        add_turn(hook, "u1", "r1")
+        captured = []
+
+        async def fake_judge(coordinator, window):
+            captured.append(window)
+            return decision_judge.no_verdict("test probe")
+
+        with patch.object(decision_judge, "judge_lesson_window", fake_judge):
+            hook.detect_lesson()
+            await drain(hook)
+        self.assertEqual(captured[0]["tally"], [])
+
+
+class LessonVerdictLinksReachEvidence(unittest.IsolatedAsyncioTestCase):
+    """Same contract as decision detection's VerdictLinksReachEvidence -- a
+    lesson judge's `links` are carried through as additional `record`-kind
+    evidence, and a malformed one is dropped without sinking the write.
+    """
+
+    async def test_valid_links_become_additional_record_kind_evidence(self):
+        hook, client, _journal = build(self)
+        add_turn(hook, "u1", "r1")
+        verdict = dict(RECORD_VERDICT, links=[
+            {"record_type": "idea", "record_id": "d1", "version": 3},
+        ])
+        with patch.object(decision_judge, "judge_lesson_window", AsyncMock(return_value=verdict)):
+            hook.detect_lesson()
+            await drain(hook)
+        refs = insight_ops(client)[0]["data"]["evidence_refs"]
+        self.assertEqual(len(refs), 2)
+        self.assertEqual(refs[0]["kind"], "external")
+        self.assertEqual(refs[1], {"kind": "record", "record_type": "idea",
+                                    "record_id": "d1", "version": 3})
+
+    async def test_a_malformed_link_is_dropped_and_the_record_still_lands(self):
+        hook, client, _journal = build(self)
+        add_turn(hook, "u1", "r1")
+        verdict = dict(RECORD_VERDICT, links=[
+            {"record_type": "idea", "record_id": "keep", "version": 1},
+            {"record_type": "work", "record_id": "bad-version", "version": None},
+        ])
+        with patch.object(decision_judge, "judge_lesson_window", AsyncMock(return_value=verdict)):
+            hook.detect_lesson()
+            await drain(hook)
+        refs = insight_ops(client)[0]["data"]["evidence_refs"]
+        record_refs = [r for r in refs if r["kind"] == "record"]
+        self.assertEqual(record_refs, [{"kind": "record", "record_type": "idea",
+                                         "record_id": "keep", "version": 1}])
+
+    async def test_no_links_field_at_all_is_unaffected_regression(self):
+        hook, client, _journal = build(self)
+        add_turn(hook, "u1", "r1")
+        with patch.object(decision_judge, "judge_lesson_window", AsyncMock(return_value=dict(RECORD_VERDICT))):
+            hook.detect_lesson()
+            await drain(hook)
+        refs = insight_ops(client)[0]["data"]["evidence_refs"]
+        self.assertEqual(len(refs), 1)
+        self.assertEqual(refs[0]["kind"], "external")
+
+
 class TheTwoDetectorsDoNotInterfere(unittest.IsolatedAsyncioTestCase):
     """Enabling one detector must never turn the other on, and each must
     buffer, watermark, and fingerprint independently -- even though both

@@ -366,6 +366,130 @@ class ProvenanceStaysOnTheParent(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(refs[0]["uri"].lower().startswith(("http://", "https://")))
 
 
+class TallyReachesTheJudge(unittest.IsolatedAsyncioTestCase):
+    """The hook builds the tally from its OWN synchronized cache (no new
+    network call) and hands it to the judge as part of the window -- see
+    decision_judge.py's "THE TALLY".
+    """
+
+    def _insight_source(self, record_id, version, claim):
+        return {
+            "record": {"id": record_id, "record_type": "insight", "version": version,
+                       "content": {"claim": claim}},
+            "delivery_id": "manifest",
+        }
+
+    async def test_cache_contents_reach_the_judge_as_a_tally(self):
+        hook, _client, _journal = build(self)
+        hook.state["cache"] = {
+            "insight:i1": self._insight_source("i1", 2, "Already-recorded knowledge."),
+        }
+        add_turn(hook, "u1", "r1")
+        captured = []
+
+        async def fake_judge(coordinator, window):
+            captured.append(window)
+            return decision_judge.no_verdict("test probe")
+
+        with patch.object(decision_judge, "judge_window", fake_judge):
+            hook.detect_decision()
+            await drain(hook)
+        self.assertEqual(captured[0]["tally"], [
+            {"record_type": "insight", "record_id": "i1", "version": 2,
+             "claim": "Already-recorded knowledge."},
+        ])
+
+    async def test_a_malformed_cache_entry_does_not_break_detection(self):
+        """A never-raises guarantee at the wiring layer, not just inside
+        decision_judge.build_tally() itself: one broken cache entry must not
+        prevent the good ones (or the window itself) from reaching the judge.
+        """
+        hook, _client, _journal = build(self)
+        hook.state["cache"] = {
+            "insight:good": self._insight_source("good", 1, "The only usable entry."),
+            "insight:broken": {"record": {"id": "broken", "record_type": "insight"}},  # no version, no content
+            "not-even-a-source": "garbage",
+        }
+        add_turn(hook, "u1", "r1")
+        captured = []
+
+        async def fake_judge(coordinator, window):
+            captured.append(window)
+            return decision_judge.no_verdict("test probe")
+
+        with patch.object(decision_judge, "judge_window", fake_judge):
+            hook.detect_decision()
+            await drain(hook)
+        self.assertEqual(len(captured), 1)
+        self.assertEqual([e["record_id"] for e in captured[0]["tally"]], ["good"])
+
+    async def test_an_empty_cache_is_an_empty_tally_exactly_todays_behavior(self):
+        hook, _client, _journal = build(self)
+        add_turn(hook, "u1", "r1")
+        captured = []
+
+        async def fake_judge(coordinator, window):
+            captured.append(window)
+            return decision_judge.no_verdict("test probe")
+
+        with patch.object(decision_judge, "judge_window", fake_judge):
+            hook.detect_decision()
+            await drain(hook)
+        self.assertEqual(captured[0]["tally"], [])
+
+
+class VerdictLinksReachEvidence(unittest.IsolatedAsyncioTestCase):
+    """A judge's `links` (built from the tally it was shown) are carried
+    through as additional `record`-kind evidence, alongside the window's own
+    `external` reference -- never replacing it.
+    """
+
+    async def test_valid_links_become_additional_record_kind_evidence(self):
+        hook, client, _journal = build(self)
+        add_turn(hook, "u1", "r1")
+        verdict = dict(RECORD_VERDICT, links=[
+            {"record_type": "insight", "record_id": "i1", "version": 2},
+        ])
+        with patch.object(decision_judge, "judge_window", AsyncMock(return_value=verdict)):
+            hook.detect_decision()
+            await drain(hook)
+        refs = insight_ops(client)[0]["data"]["evidence_refs"]
+        self.assertEqual(len(refs), 2)
+        self.assertEqual(refs[0]["kind"], "external")  # the hardcoded window ref stays first
+        self.assertEqual(refs[1], {"kind": "record", "record_type": "insight",
+                                    "record_id": "i1", "version": 2})
+
+    async def test_a_malformed_link_is_dropped_and_the_record_still_lands(self):
+        hook, client, _journal = build(self)
+        add_turn(hook, "u1", "r1")
+        verdict = dict(RECORD_VERDICT, links=[
+            {"record_type": "insight", "record_id": "keep", "version": 1},
+            {"record_type": "person", "record_id": "bad-type", "version": 1},
+            {"record_type": "idea", "record_id": "bad-version", "version": "not-an-int"},
+        ])
+        with patch.object(decision_judge, "judge_window", AsyncMock(return_value=verdict)):
+            hook.detect_decision()
+            await drain(hook)
+        refs = insight_ops(client)[0]["data"]["evidence_refs"]
+        record_refs = [r for r in refs if r["kind"] == "record"]
+        self.assertEqual(record_refs, [{"kind": "record", "record_type": "insight",
+                                         "record_id": "keep", "version": 1}])
+
+    async def test_no_links_field_at_all_is_unaffected_regression(self):
+        """RECORD_VERDICT as used everywhere else in this file has no
+        "links" key at all -- must degrade to exactly one evidence entry,
+        same as before this change.
+        """
+        hook, client, _journal = build(self)
+        add_turn(hook, "u1", "r1")
+        with patch.object(decision_judge, "judge_window", AsyncMock(return_value=dict(RECORD_VERDICT))):
+            hook.detect_decision()
+            await drain(hook)
+        refs = insight_ops(client)[0]["data"]["evidence_refs"]
+        self.assertEqual(len(refs), 1)
+        self.assertEqual(refs[0]["kind"], "external")
+
+
 class ToolPreWindowConstruction(unittest.IsolatedAsyncioTestCase):
     """The delegation call itself is reduced to name+target only -- the
     instruction (where the conclusion is stated, per 08's open questions)
