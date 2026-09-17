@@ -227,7 +227,10 @@ def main():
             status = error.code; error.close(); raise SystemExit(f"Enrollment HTTP {status}; check login and project membership") from None
     path, output = enroll_and_save(post, base, project, args.bundle, args.label, name, token, path, output)
     print("Created opt-in overlay:", output)
-    print("Enrolled project:", args.project)
+    # The RESOLVED project, not the flag: --project is now None whenever it was
+    # omitted, and this is the one line that tells a person which project just
+    # received their consent. Printing None there is worse than printing nothing.
+    print("Enrolled project:", project)
     print("Start a NEW session: amplifier run --bundle " + output.as_uri())
     print("Visible prompts/responses will be shared to this project. No active session or default bundle changed.")
 

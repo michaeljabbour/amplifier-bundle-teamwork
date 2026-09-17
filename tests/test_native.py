@@ -941,3 +941,49 @@ class ProjectIdIsDiscoveredNotAssumed(unittest.TestCase):
             with patch.object(module.urllib.request, "build_opener") as opener:
                 opener.return_value.open.return_value.__enter__.return_value.read.return_value = bad
                 self.assertEqual(module.discover_project("https://svc.example.invalid"), "teamwork")
+
+
+class TheSuccessLineNamesTheProjectThatGotConsent(unittest.TestCase):
+    """Regression for a bug this suite could not have caught: every use site of
+    the project was moved to the resolved variable EXCEPT the success line, so
+    the discovery path printed `Enrolled project: None` directly above "Visible
+    prompts/responses will be shared to this project."
+
+    Nothing asserted the output, so 463 green tests said nothing about the one
+    line whose entire job is telling a person which project just received their
+    consent. The live enrollment run that "proved" discovery had exercised the
+    PREVIOUS commit, not this code.
+    """
+
+    def _run_main(self, argv, tmp):
+        import importlib.util, io, contextlib
+        path = Path(__file__).resolve().parents[1] / "setup_teamwork.py"
+        spec = importlib.util.spec_from_file_location("setup_main_probe", path)
+        module = importlib.util.module_from_spec(spec)
+        exec(compile(path.read_text(), str(path), "exec"), module.__dict__)
+        buffer = io.StringIO()
+        with patch.object(module, "discover_project", return_value="discovered-project"), \
+             patch.object(module, "enroll_and_save",
+                          side_effect=lambda *a, **k: (Path(tmp) / "c.json", Path(tmp) / "o.yaml")), \
+             patch.object(module, "input", create=True, return_value="Someone"), \
+             patch.object(module, "getpass", create=True, return_value="code"), \
+             patch.object(sys, "argv", argv), contextlib.redirect_stdout(buffer):
+            module.main()
+        return buffer.getvalue()
+
+    def test_an_omitted_project_flag_prints_the_discovered_id_not_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self._run_main(
+                ["setup_teamwork.py", "--bundle", "b.yaml",
+                 "--connection-file", str(Path(tmp) / "c.json"),
+                 "--output", str(Path(tmp) / "o.yaml")], tmp)
+        self.assertIn("Enrolled project: discovered-project", out)
+        self.assertNotIn("None", out)
+
+    def test_an_explicit_project_flag_still_wins_and_is_printed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self._run_main(
+                ["setup_teamwork.py", "--bundle", "b.yaml", "--project", "typed-project",
+                 "--connection-file", str(Path(tmp) / "c.json"),
+                 "--output", str(Path(tmp) / "o.yaml")], tmp)
+        self.assertIn("Enrolled project: typed-project", out)
