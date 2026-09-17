@@ -426,11 +426,12 @@ async def _resolve_providers(parent_coordinator, model_role):
     except Exception:
         providers = []
     if not providers:
-        return providers, "the calling session has no provider configured to inherit"
+        return providers, "the calling session has no provider configured to inherit", False
     if not model_role:
         return (
             providers,
             "no model_role requested; using the calling session's provider unchanged",
+            False,
         )
 
     try:
@@ -441,7 +442,7 @@ async def _resolve_providers(parent_coordinator, model_role):
         return providers, (
             "no model_role_resolver capability is registered on the calling session; "
             "using its provider unchanged"
-        )
+        ), False
 
     try:
         preferences = await resolver.resolve(model_role)
@@ -453,12 +454,14 @@ async def _resolve_providers(parent_coordinator, model_role):
                 model_role,
                 type(error).__name__,
             ),
+            False,
         )
     if not preferences:
         return (
             providers,
             "model_role %r resolved to no candidates; using the calling session's provider unchanged"
             % model_role,
+            False,
         )
 
     preference = preferences[0]
@@ -471,13 +474,13 @@ async def _resolve_providers(parent_coordinator, model_role):
         return providers, (
             "model_role_resolver returned a preference with no provider/model; "
             "using the calling session's provider unchanged"
-        )
+        ), False
     if _GLOB_CHARS.search(pref_model):
         return providers, (
             "model_role %r resolved to a glob pattern (%r) that needs live model-list "
             "resolution this judge does not perform; using the calling session's provider unchanged"
             % (model_role, pref_model)
-        )
+        ), False
 
     for spec in providers:
         if _bare_module(spec.get("module", "")) == pref_provider:
@@ -490,13 +493,13 @@ async def _resolve_providers(parent_coordinator, model_role):
                 model_role,
                 pref_provider,
                 pref_model,
-            )
+            ), True
 
     return providers, (
         "model_role %r resolved to provider %r, which is not among the calling session's "
         "configured providers; using its provider unchanged"
         % (model_role, pref_provider)
-    )
+    ), False
 
 
 # ---------------------------------------------------------------------------
@@ -532,7 +535,7 @@ async def build_judge_session(
     from amplifier_core import AmplifierSession  # lazy: amplifier-core is host-supplied
 
     parent_id = getattr(parent_coordinator, "session_id", None)
-    providers, note = await _resolve_providers(parent_coordinator, model_role)
+    providers, note, role_honored = await _resolve_providers(parent_coordinator, model_role)
     config = {
         "session": {
             "orchestrator": {"module": "loop-streaming", "config": {"max_iterations": 1}},
@@ -562,7 +565,7 @@ async def build_judge_session(
     except BaseException:
         await _cleanup_session(session)
         raise
-    return session, note
+    return session, note, role_honored
 
 
 # ---------------------------------------------------------------------------
@@ -583,13 +586,20 @@ async def _judge(parent_coordinator, window, prompt_builder, *, extra_tools=None
     than raising. Cancellation propagates after owned-session cleanup.
     """
     try:
-        session, note = await build_judge_session(
+        session, note, role_honored = await build_judge_session(
             parent_coordinator, extra_tools=extra_tools
         )
     except Exception as error:
         logger.warning("%s: could not build a judge session (%s)", log_label, type(error).__name__)
         return no_verdict("could not build a judge session (%s)" % type(error).__name__)
-    logger.debug("%s: provider inheritance -- %s", log_label, note)
+    # A requested role that could NOT be honored is a COST regression -- this
+    # judge then runs on the calling session's own (often frontier) model, on
+    # every triggered turn. Logged at DEBUG it is invisible, which is how a
+    # silent fallback to an expensive model survives a green DTU run. Warn.
+    if not role_honored:
+        logger.warning("%s: requested model role was NOT honored -- %s", log_label, note)
+    else:
+        logger.debug("%s: provider inheritance -- %s", log_label, note)
 
     try:
         try:
