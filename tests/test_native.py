@@ -222,13 +222,36 @@ class SSOEnrollmentTests(unittest.TestCase):
             def open(self, request, **kwargs):
                 if request.full_url.endswith('/api/config'):
                     return Response({'api_app_id': 'fixture-app-id'})
-                error_body = json.dumps({'error': 'entra_unmapped'}).encode()
+                error_body = json.dumps({'error': {'code': 'not_a_member', 'message': 'untrusted service text'}}).encode()
                 raise urllib.error.HTTPError(request.full_url, 403, 'Forbidden', {}, io.BytesIO(error_body))
         with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', return_value=Opener()):
             with self.assertRaises(ConsentError) as raised:
                 connect({'project': 'selected', 'consent': 'yes'}, BASE, Path(home))
         self.assertEqual(raised.exception.field, 'name')
         self.assertIn('member code', raised.exception.hint.lower())
+        self.assertIn('Ask a workspace maintainer to add it', str(raised.exception))
+        self.assertNotIn('untrusted service text', str(raised.exception))
+
+    def test_other_entra_refusals_do_not_claim_missing_membership(self):
+        for status, code, expected, field in (
+            (401, 'unauthorized', 'could not be verified', 'name'),
+            (403, 'forbidden', 'not allowed to enroll', 'project'),
+        ):
+            with self.subTest(status=status):
+                class Opener:
+                    def open(self, request, **kwargs):
+                        if request.full_url.endswith('/api/config'):
+                            return Response({'api_app_id': 'fixture-app-id'})
+                        body = json.dumps({'error': {'code': code, 'message': 'untrusted service text'}}).encode()
+                        raise urllib.error.HTTPError(request.full_url, status, 'Refused', {}, io.BytesIO(body))
+                with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', return_value=Opener()):
+                    with self.assertRaises(ConsentError) as raised:
+                        connect({'project': 'selected', 'consent': 'yes'}, BASE, Path(home))
+                    self.assertEqual(list(Path(home).rglob('connection.json')), [])
+                self.assertIn(expected, str(raised.exception))
+                self.assertEqual(raised.exception.field, field)
+                self.assertNotIn('not a member', str(raised.exception))
+                self.assertNotIn('untrusted service text', str(raised.exception))
 
     def test_sso_conflict_revokes_the_new_credential_and_reuses_the_saved_one(self):
         with tempfile.TemporaryDirectory() as home:

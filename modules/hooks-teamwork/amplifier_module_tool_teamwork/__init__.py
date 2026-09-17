@@ -240,11 +240,22 @@ def _mint_sso(form, base, home, project, repository):
                 ("Type one of these project ids: " + ", ".join(candidates))
                 if candidates else "Type the exact project ID you joined.",
             ) from None
-        if error.status in (401, 403):
+        detail = error.payload.get("error")
+        if error.status == 403 and isinstance(detail, dict) and detail.get("code") == "not_a_member":
             raise ConsentError(
-                "Microsoft sign-in did not match a Teamwork member.", "name",
-                "Ask a maintainer to set your Teamwork email, or enroll with your name and private "
-                "member code below.",
+                "This Microsoft account is not a member of this workspace. Ask a workspace maintainer to add it.", "name",
+                "A maintainer can add your Microsoft email to the workspace sign-in roster. "
+                "You can also enroll with your name and private member code below.",
+            ) from None
+        if error.status == 401:
+            raise ConsentError(
+                "Microsoft sign-in could not be verified.", "name",
+                "Sign in again with az login, or enroll with your name and private member code below.",
+            ) from None
+        if error.status == 403:
+            raise ConsentError(
+                "Microsoft sign-in was not allowed to enroll an agent in this project.", "project",
+                "Check the project ID and ask a project owner to confirm your enrollment access.",
             ) from None
         raise
 
