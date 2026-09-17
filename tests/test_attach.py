@@ -86,6 +86,25 @@ class ItWritesOnlyProjectScope(unittest.TestCase):
         self.assertNotIn("${", settings)
         self.assertFalse((Path(tmp) / ".amplifier/keys.env").exists())
 
+    def test_the_consent_flag_is_written_or_the_hook_mounts_inert(self):
+        """Without share_visible_turns the hook registers NOTHING, silently.
+
+        mount() returns at __init__.py:2143 when the flag is absent, and a
+        mount exception is absorbed by the host, so the failure is
+        indistinguishable from the feature being switched off. Measured in a
+        container: a session in a correctly-attached directory listed
+        teamwork_connect and teamwork_bind -- the TOOL module's tools, which
+        have no such gate -- and none of the hook's own. Nothing in stderr.
+
+        Every other check had passed: credential verified, global settings
+        byte-identical, files 0600, project discovered from /api/config. This
+        is the assertion that would have caught it.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            self._attach(Path(tmp))
+            written = json.loads((Path(tmp) / ".amplifier/settings.yaml").read_text())
+        self.assertIs(written["overrides"]["hooks-teamwork"]["config"]["share_visible_turns"], True)
+
     def test_both_files_are_written_0600(self):
         with tempfile.TemporaryDirectory() as tmp:
             self._attach(Path(tmp))

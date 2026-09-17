@@ -137,8 +137,21 @@ def settings_block(base, project, connection_file):
     and the override carries only its absolute path. No env expansion in the
     chain means nothing to silently fail to expand.
     """
+    # share_visible_turns is the CONSENT gate, and it must be written here.
+    # mount() returns immediately when it is absent (__init__.py:2143), so the
+    # hook registers none of its tools and the session looks like the bundle is
+    # not installed: teamwork_connect and teamwork_bind appear, because those
+    # come from the tool module which has no such gate, and nothing else does.
+    # No error is raised -- a mount exception is absorbed by the host, so the
+    # failure is indistinguishable from the feature simply being off.
+    #
+    # Writing it here is the same act setup_teamwork.py performs at
+    # setup_teamwork.py:53: supplying a credential to a project directory IS
+    # the deliberate opt-in. It is announced on stdout rather than done
+    # quietly, because the consequence -- this session's visible prompts and
+    # responses reaching a shared project -- is the user's to know about.
     config = {"base_url": base, "project_id": project,
-              "connection_file": str(connection_file)}
+              "connection_file": str(connection_file), "share_visible_turns": True}
     return {"overrides": {"hooks-teamwork": {"config": dict(config)},
                           "tool-teamwork": {"config": dict(config)}}}
 
@@ -200,6 +213,8 @@ def main():
     print("Wrote", connection, "(0600, credential only)")
     print("Attached project:", project)
     print("No harness was minted. Re-running this attaches to the SAME harness.")
+    print("Sharing is ON for sessions started in this directory: their visible")
+    print("prompts and responses will be published to the project above.")
     print("Install the behavior in this harness if it is not already:")
     print("  amplifier bundle add \"git+https://github.com/michaeljabbour/amplifier-bundle-teamwork"
           "@main#subdirectory=behaviors/teamwork.yaml\" --app")
