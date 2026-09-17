@@ -25,8 +25,13 @@ credential belongs to that folder. A credential in user-global settings would
 silently give every session on the host one identity, publishing one project's
 work under another project's harness. So configuration lands in the PROJECT
 scope -- `<project>/.amplifier/settings.yaml` and `<project>/.amplifier/keys.env`
--- and the secret itself is referenced through `${TEAMWORK_HARNESS_TOKEN}`
-rather than inlined into a settings file.
+-- with the credential in its own 0600 file that the hook reads directly, and
+the settings override carrying only that file's path.
+
+A project `keys.env` deliberately is NOT used: KeyManager reads
+`~/.amplifier/keys.env` and nothing else, so a project-local one is never
+loaded and a `${VAR}` reference to it would never expand -- silently. See
+`settings_block()`.
 """
 import argparse
 import json
@@ -40,7 +45,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "modules/hooks-teamwork
 from amplifier_module_hooks_teamwork.service_url import DEFAULT_BASE_URL, validate_service_url
 
 COLD_START_SECONDS = 60
-TOKEN_VAR = "TEAMWORK_HARNESS_TOKEN"
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -104,7 +108,7 @@ def verify(base, project, token):
             % type(error).__name__) from None
 
 
-def settings_block(base, project):
+def settings_block(base, project, connection_file):
     """The project-scoped override, keyed by module id.
 
     `overrides.<module-id>.config` is applied after the full mount plan is
@@ -113,15 +117,30 @@ def settings_block(base, project):
     `amplifier bundle add <url> --app`. That is why no hand-written overlay
     bundle is needed here, and why this does not fight the app-layer install.
 
-    The token is a `${VAR}` reference, never a literal: env expansion runs last
-    over the whole assembled config, so the secret stays in keys.env and out of
-    every settings file, diff, and log.
+    THE SETTINGS FILE CARRIES A PATH, NEVER A SECRET, AND NEVER A ${VAR}.
+
+    The obvious design -- put the token in a project keys.env and reference it
+    as ${TEAMWORK_HARNESS_TOKEN} -- DOES NOT WORK, and fails silently. Measured:
+    KeyManager reads `get_amplifier_home() / "keys.env"` and nothing else
+    (app-cli key_manager.py:11, "Manage API keys in ~/.amplifier/keys.env
+    file"), so a PROJECT-local .amplifier/keys.env is never loaded. The variable
+    stays undefined, expansion leaves the literal string in place, and
+    resolve_connection() receives a token-shaped value that is not a token. The
+    hook then mounts inert: a session shows teamwork_connect and teamwork_bind
+    from the tool module and none of the hook's own tools, with no error
+    anywhere.
+
+    settings.yaml is project-scoped. keys.env is not. They live in the same
+    .amplifier directory and follow different rules.
+
+    So the credential goes in its own 0600 file that the HOOK reads directly,
+    and the override carries only its absolute path. No env expansion in the
+    chain means nothing to silently fail to expand.
     """
-    return {"overrides": {
-        "hooks-teamwork": {"config": {
-            "base_url": base, "project_id": project, "token": "${%s}" % TOKEN_VAR}},
-        "tool-teamwork": {"config": {
-            "base_url": base, "project_id": project, "token": "${%s}" % TOKEN_VAR}}}}
+    config = {"base_url": base, "project_id": project,
+              "connection_file": str(connection_file)}
+    return {"overrides": {"hooks-teamwork": {"config": dict(config)},
+                          "tool-teamwork": {"config": dict(config)}}}
 
 
 def main():
@@ -153,15 +172,17 @@ def main():
     # preference.
     home = (Path(args.dir).expanduser().resolve() / ".amplifier")
     home.mkdir(parents=True, exist_ok=True, mode=0o700)
-    keys, settings = home / "keys.env", home / "settings.yaml"
+    connection, settings = home / "teamwork-connection.json", home / "settings.yaml"
 
-    # The secret, and only the secret, and only here.
-    existing = keys.read_text(encoding="utf-8") if keys.exists() else ""
-    kept = [line for line in existing.splitlines() if not line.startswith(TOKEN_VAR + "=")]
-    keys.write_text("\n".join(kept + ["%s=%s" % (TOKEN_VAR, token)]) + "\n", encoding="utf-8")
-    os.chmod(keys, 0o600)
+    # The secret, and only the secret, and only here. Rewritten wholesale on a
+    # re-attach so a rotated credential replaces the old one rather than
+    # accumulating beside it.
+    connection.write_text(json.dumps(
+        {"base_url": base, "project_id": project, "token": token}, indent=2) + "\n",
+        encoding="utf-8")
+    os.chmod(connection, 0o600)
 
-    block = settings_block(base, project)
+    block = settings_block(base, project, connection)
     if settings.exists():
         # Refuse rather than merge. A settings file is the user's, this script
         # has no YAML parser to merge it faithfully (the bundle carries no
@@ -176,7 +197,7 @@ def main():
         os.chmod(settings, 0o600)
         print("Wrote", settings)
 
-    print("Wrote", keys, "(0600, token only)")
+    print("Wrote", connection, "(0600, credential only)")
     print("Attached project:", project)
     print("No harness was minted. Re-running this attaches to the SAME harness.")
     print("Install the behavior in this harness if it is not already:")

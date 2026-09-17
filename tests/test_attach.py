@@ -60,19 +60,36 @@ class ItWritesOnlyProjectScope(unittest.TestCase):
             self.assertEqual(sorted(written["overrides"]), ["hooks-teamwork", "tool-teamwork"])
             self.assertEqual(written["overrides"]["hooks-teamwork"]["config"]["project_id"], "teamwork")
 
-    def test_the_secret_is_referenced_not_inlined(self):
+    def test_the_settings_file_carries_a_path_and_never_the_secret(self):
         with tempfile.TemporaryDirectory() as tmp:
             self._attach(Path(tmp), token="super-secret-value")
             settings = (Path(tmp) / ".amplifier/settings.yaml").read_text()
-            keys = (Path(tmp) / ".amplifier/keys.env").read_text()
+            credential = json.loads((Path(tmp) / ".amplifier/teamwork-connection.json").read_text())
         self.assertNotIn("super-secret-value", settings)
-        self.assertIn("${TEAMWORK_HARNESS_TOKEN}", settings)
-        self.assertIn("TEAMWORK_HARNESS_TOKEN=super-secret-value", keys)
+        self.assertIn("teamwork-connection.json", settings)
+        self.assertEqual(credential["token"], "super-secret-value")
+
+    def test_no_env_var_reference_survives_in_the_settings_file(self):
+        """The ${VAR} design is a trap here and this pins it shut.
+
+        KeyManager reads `get_amplifier_home() / "keys.env"` and nothing else
+        (app-cli key_manager.py:11), so a PROJECT-local .amplifier/keys.env is
+        never loaded. A ${TEAMWORK_HARNESS_TOKEN} reference would never expand,
+        resolve_connection() would receive the literal string, and the hook
+        would mount INERT -- a session showing the tool module's tools and none
+        of the hook's own, with no error anywhere. Measured, in a container,
+        before this was changed to a connection file.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            self._attach(Path(tmp))
+            settings = (Path(tmp) / ".amplifier/settings.yaml").read_text()
+        self.assertNotIn("${", settings)
+        self.assertFalse((Path(tmp) / ".amplifier/keys.env").exists())
 
     def test_both_files_are_written_0600(self):
         with tempfile.TemporaryDirectory() as tmp:
             self._attach(Path(tmp))
-            for name in ("settings.yaml", "keys.env"):
+            for name in ("settings.yaml", "teamwork-connection.json"):
                 mode = (Path(tmp) / ".amplifier" / name).stat().st_mode & 0o777
                 self.assertEqual(mode, 0o600, name)
 
@@ -84,13 +101,12 @@ class ItWritesOnlyProjectScope(unittest.TestCase):
             self._attach(Path(tmp))
             self.assertEqual(settings.read_text(), "mine: true\n")
 
-    def test_re_attaching_replaces_the_token_line_rather_than_appending_a_second(self):
+    def test_re_attaching_replaces_the_credential_rather_than_accumulating(self):
         with tempfile.TemporaryDirectory() as tmp:
             self._attach(Path(tmp), token="first")
             self._attach(Path(tmp), token="second")
-            keys = (Path(tmp) / ".amplifier/keys.env").read_text()
-        self.assertEqual(keys.count("TEAMWORK_HARNESS_TOKEN="), 1)
-        self.assertIn("TEAMWORK_HARNESS_TOKEN=second", keys)
+            credential = json.loads((Path(tmp) / ".amplifier/teamwork-connection.json").read_text())
+        self.assertEqual(credential["token"], "second")
 
 
 class ARejectedCredentialWritesNothing(unittest.TestCase):
