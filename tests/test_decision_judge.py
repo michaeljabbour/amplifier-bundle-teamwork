@@ -659,6 +659,66 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class JudgeReferenceProvenance(unittest.IsolatedAsyncioTestCase):
+    async def judge(self, entrypoint, window, links, mutate=None):
+        raw = json.dumps({
+            "record": True, "kind": "structural constraint", "claim": "A fixture claim.",
+            "basis": "observation", "confidence": "high",
+            "what_it_does_not_establish": "Only a synthetic fixture.",
+            "reason": "The fixture supplies a structural reason.", "links": links,
+        })
+        fake = FakeJudgeSession(execute_result=raw)
+        original_execute = fake.execute
+
+        async def execute(prompt):
+            if mutate:
+                mutate()
+            return await original_execute(prompt)
+
+        fake.execute = execute
+        with patch.object(decision_judge, "build_judge_session",
+                          AsyncMock(return_value=(fake, "fixture", True))):
+            result = await entrypoint(object(), window)
+        self.assertTrue(result["available"])
+        self.assertTrue(result["record"])
+        self.assertTrue(fake.cleaned_up)
+        return result
+
+    async def test_both_judges_drop_unseen_ids_types_and_versions_without_losing_claim(self):
+        shown = {"record_type": "insight", "record_id": "shown", "version": 2}
+        window = decision_judge.build_window_payload([], tally=[dict(shown, claim="Shown claim")])
+        links = [dict(shown, record_id="unseen"), dict(shown, version=1),
+                 dict(shown, version=True), dict(shown, version=-1),
+                 dict(shown, record_type="work"), shown]
+        for entrypoint in (decision_judge.judge_window, decision_judge.judge_lesson_window):
+            with self.subTest(entrypoint=entrypoint.__name__):
+                result = await self.judge(entrypoint, window, links)
+                self.assertEqual(result["links"], [shown])
+
+    async def test_no_tally_means_no_record_links(self):
+        result = await self.judge(decision_judge.judge_window, EMPTY_WINDOW,
+                                  [{"record_type": "insight", "record_id": "invented", "version": 1}])
+        self.assertEqual(result["links"], [])
+
+    async def test_duplicate_and_excess_links_cannot_exceed_the_tally_bound(self):
+        refs = [{"record_type": "insight", "record_id": "i%d" % i, "version": 1}
+                for i in range(decision_judge.MAX_TALLY_ENTRIES + 5)]
+        window = {"turns": [], "tool_calls": [],
+                  "tally": [dict(ref, claim="Claim") for ref in refs]}
+        result = await self.judge(decision_judge.judge_window, window, refs + refs)
+        self.assertEqual(result["links"], refs[:decision_judge.MAX_TALLY_ENTRIES])
+
+    async def test_reference_membership_uses_the_tally_shown_before_provider_await(self):
+        shown = {"record_type": "insight", "record_id": "shown", "version": 1}
+        later = dict(shown, record_id="later")
+        window = decision_judge.build_window_payload([], tally=[dict(shown, claim="Original")])
+        result = await self.judge(
+            decision_judge.judge_window, window, [shown, later],
+            mutate=lambda: window["tally"].__setitem__(slice(None), [dict(later, claim="Later")]),
+        )
+        self.assertEqual(result["links"], [shown])
+
+
 class ConfiguredDetectionModelTakesOverWhenTheRoleCannotBeHonored(unittest.IsolatedAsyncioTestCase):
     """The `fast` role is a preference, and in practice it is usually NOT
     honored -- measured twice: a resolver that resolves it to a glob whose
@@ -702,11 +762,36 @@ class ConfiguredDetectionModelTakesOverWhenTheRoleCannotBeHonored(unittest.Isola
         self.assertEqual(providers[0]["config"]["default_model"], "claude-opus-5")
 
     async def test_a_configured_provider_not_among_the_parents_is_refused_not_invented(self):
-        providers, note, honored = await decision_judge._resolve_providers(
-            self._parent(resolver=None), "fast", "openai/gpt-nope")
-        self.assertFalse(honored)
-        self.assertEqual(providers[0]["config"]["default_model"], "claude-opus-5")
-        self.assertIn("not", note)
+        with self.assertRaisesRegex(ValueError, "configured providers"):
+            await decision_judge._resolve_providers(
+                self._parent(resolver=None), "fast", "openai/gpt-nope")
+
+    async def test_unusable_explicit_model_never_constructs_a_child_or_calls_a_provider(self):
+        for setting in ("openai/unmounted", "anthropic/", "/missing-provider", "a/b/c",
+                        "anthropic/model*", "anthropic/model name", True):
+            for entrypoint in (decision_judge.judge_window, decision_judge.judge_lesson_window):
+                with self.subTest(setting=setting, entrypoint=entrypoint.__name__), \
+                        patch("amplifier_core.AmplifierSession") as constructor:
+                    verdict = await entrypoint(self._parent(), EMPTY_WINDOW, explicit_model=setting)
+                    self.assertFalse(verdict["available"])
+                    self.assertFalse(verdict["record"])
+                    constructor.assert_not_called()
+
+    async def test_bare_model_with_multiple_providers_requires_an_explicit_provider(self):
+        parent = self._parent()
+        parent.config["providers"].append({"module": "provider-other", "config": {"priority": 0}})
+        with patch("amplifier_core.AmplifierSession") as constructor:
+            verdict = await decision_judge.judge_window(parent, EMPTY_WINDOW, explicit_model="small")
+        self.assertFalse(verdict["available"])
+        constructor.assert_not_called()
+
+    async def test_configured_fallback_does_not_mutate_the_parent_provider_config(self):
+        parent = self._parent()
+        before = json.loads(json.dumps(parent.config))
+        providers, _, honored = await decision_judge._resolve_providers(parent, "fast", "anthropic/small")
+        self.assertTrue(honored)
+        self.assertEqual(providers[0]["config"]["default_model"], "small")
+        self.assertEqual(parent.config, before)
 
     def test_the_setting_refuses_an_ambiguous_value_rather_than_coercing_it(self):
         self.assertIsNone(detection_model_setting({}))

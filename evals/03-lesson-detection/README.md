@@ -15,14 +15,22 @@ Read `docs/scenarios/06-record-the-lesson-not-the-incident.md` and its twin
 this eval. Their "What the good one knows" sections are the rule
 `amplifier_module_hooks_teamwork/decision_judge.py`'s `_LESSON_RULE` encodes.
 
-## CURRENT SCOPE: the tally is for LINKING only
+## Current scope: linking only
 
-The tally was built to do two jobs. **It ships doing one**, and this section is the
-measurement that decided that -- read it before adding the second one back.
+The numeric results below are the author's historical reports from September 16–17,
+2026. Raw run receipts and exact prompt/source hashes were not supplied with this PR,
+and this review did not independently rerun those provider trials. The reference
+validation, explicit-model fallback, and prompt-prose repairs made during review have
+local regression checks; those checks do not establish current model accuracy.
+Keep the historical scores separate from acceptance of the repaired source.
+
+The tally was built to do two jobs. The current code supports linking only. The
+author reported the following experiments as the reason for removing duplicate
+suppression; any proposal to restore it needs fresh evidence.
 
 | tally job | verdict |
 |---|---|
-| **link** what a new record extends | **shipped** -- cites `record_type/record_id/version` from entries actually shown |
+| **link** what a new record extends | **implemented** -- code retains exact `record_type/record_id/version` references from the shown tally |
 | **decline** a semantic duplicate | **REMOVED** -- it did not work, and it damaged cases it could not apply to |
 
 **Why declining was removed, in numbers.** With the duplicate-declining paragraph in the
@@ -48,20 +56,21 @@ With that paragraph removed, linking retained, three consecutive runs:
 
 Two things that measurement establishes, and one it does not:
 
-- **Over-suppression did not happen.** `G` -- a genuinely new lesson shown against a tally
+- **Over-suppression was not observed in the reported cases.** `G` -- a genuinely new lesson shown against a tally
   *full of near-misses on the same topic* -- stayed RECORD every time. That was the
   headline risk of showing the judge prior records, and it did not materialise.
-- **Rule-text length is itself a variable.** `E` and `F` carry no tally at all, and both
+- **The changed rule text may affect other cases.** `E` and `F` carry no tally at all, and both
   degraded from adding a paragraph gated behind *"if a tally is shown."* On a small model
-  a prompt change is not local, and "it only fires when X" is not a containment argument.
+  these runs suggest prompt effects outside the cases receiving a tally. They do not
+  isolate text length as the cause or establish a general error rate.
 - **It does not establish that semantic dedup is impossible** -- only that it cannot be
   carried by a boolean the model overrides. `H` remains here, red, as the gate for a
   future mechanical `duplicate_of` field. A change claiming to fix duplicates must turn
   `H` green without turning `E`, `F` or `G` red.
 
-The belt is untouched and still proven: a session that records deliberately suppresses
-the automatic record for that window (verified end-to-end in a DTU, `notes` 3 -> 4 rather
-than 3 -> 5).
+The author also reported a DTU run where a deliberate record suppressed an automatic
+record (`notes` 3 -> 4 rather than 3 -> 5). That historical observation does not replace
+regressions for concurrent detectors, uncertain writes, or session rebinding.
 
 ## The grading limit this eval does NOT paper over
 
@@ -107,7 +116,7 @@ alongside the judge TALLY (`decision_judge.py`'s "THE TALLY") -- see the next se
 | G | RECORD | **the adversarial over-suppression probe** -- a genuinely NEW structural lesson (import-time monkeypatch leaks across test boundaries) shown alongside a tally FULL of near-miss entries on the same general topic (mocking/coverage). On-topic must not be read as already-covered. | constructed, testing-methodology-shaped, deliberately adjacent to (but distinct from) the tally entries |
 | H | SKIP | **the adversarial duplicate probe** -- the SAME lesson as an existing tally entry ("Whatever you mock, you are not testing."), restated in different words with a different concrete story attached. Must be declined as a semantic duplicate. | this is the literal real incident that motivated the tally feature: a detector and a model both recorded this lesson independently, in different words, because claim-text fingerprinting alone cannot catch a paraphrase |
 
-## THE TALLY -- results actually observed, including a real limitation
+## Historical author reports: tally experiments and limits
 
 Adding a bounded "ALREADY RECORDED" tally to the judge prompt (`decision_judge.py`'s
 `build_tally()`/`build_window_payload(..., tally=...)`) answers two separate questions,
@@ -128,7 +137,7 @@ explicitly identifies the tally entry as the same claim ("It duplicates
 insight:i-mock-original@1", "extends insight:i-mock-1@1 by...") and then still sets
 `"record": true` anyway. The model's own stated reasoning and its own boolean verdict
 disagree with each other. Rewording the rule to be more explicit about a SKIP-wins
-tie-break (see `_LESSON_RULE`'s and `_RULE`'s current text) did not fix this, and is
+tie-break in an earlier prompt revision did not fix this in the reported runs, and is
 **not** being iterated on further past this point, per this eval's own instructions:
 report a real finding, don't tune until the number goes green.
 
@@ -137,12 +146,12 @@ all (`_window()`, not `_window_with_tally()`) -- went from 0 false positives acr
 five original runs (see the older results table below) to a false positive in 4 of 5
 runs after the tally rule paragraph was added to `_LESSON_RULE`, EVEN THOUGH that
 paragraph is gated ("If, and only if, an ALREADY RECORDED tally is shown to you below
-...") and no tally section renders for E. The most likely explanation is that a longer,
-more elaborate rule text shifts this small model's calibration on unrelated cases, not
-that the tally content itself leaked in. Also observed once: case F (also tally-free)
+...") and no tally section renders for E. The author hypothesized that the changed
+rule text affected unrelated cases. These small trials do not distinguish text length
+from wording or ordinary model variation. The report also describes case F (tally-free), which
 came back `UNAVAILABLE` (unparseable JSON) in 2 of the 3 runs against the longer rule
-wording -- a further sign that rule-text length, not tally content, is putting pressure
-on this particular small judge model's output reliability.
+wording. This is an observed reliability issue in the report, not an isolated causal
+measurement of rule-text length.
 
 **Recommendation carried forward, not resolved here:** `claude-haiku-4-5` is not reliably
 enforcing its own duplicate-detection judgment through the single `"record"` boolean.
@@ -152,7 +161,7 @@ forces `record=false` in code whenever non-null, rather than trusting the model 
 without depending on prompt wording. That is out of scope for this task and is reported
 here as the next real step, not implemented speculatively.
 
-### Live runs against the current (reworded) rule text, `claude-haiku-4-5`, 2026-09-17
+### Reported earlier tie-break prompt runs, `claude-haiku-4-5`, 2026-09-17
 
 | Run | Correct | False positives (SKIP judged RECORD) | Misses (RECORD judged SKIP) | Unavailable |
 |-----|---------|----------------------------------------|-------------------------------|-------------|
@@ -162,7 +171,7 @@ here as the next real step, not implemented speculatively.
 A/B/C/D/G were correct in both runs. See the paragraphs above for what E/F/H's
 failures actually mean -- they are not being smoothed over into this table.
 
-### Live runs against the FIRST rule wording (unconditional tally paragraph), same model, 2026-09-17
+### Reported first prompt runs (unconditional tally paragraph), same model, 2026-09-17
 
 | Run | Correct | False positives | Misses | Unavailable |
 |-----|---------|------------------|--------|-------------|
@@ -178,10 +187,10 @@ consistent the H finding is.
 ## Fidelity rule -- non-negotiable
 
 Each case goes to its own isolated `judge_lesson_window()` call. A judge that could see
-all six at once could contrast them, which makes the task easier than reality and
+all cases at once could contrast them, which makes the task easier than reality and
 produces a falsely optimistic result. `run.py` calls `judge_lesson_window()` once per
 case, and each call builds a brand-new child session with no history and no memory of
-the other five.
+the other cases.
 
 The one thing reused across cases is a single top-level session built purely so each
 isolated call has a real provider configuration to inherit -- it carries no per-case
@@ -206,12 +215,12 @@ JSON report under `results/` (gitignored -- run output is never committed) both 
 with the **false-positive count** (SKIP cases judged RECORD) as a separate, named number,
 rather than folding everything into one accuracy figure that could hide it.
 
-## Results actually observed (pre-tally baseline, six cases)
+## Historical author report: pre-tally baseline, six cases
 
 Live runs on 2026-09-16, `claude-haiku-4-5`, five separate invocations of `run.py` (each
 invocation runs all six cases through six independent, isolated judge calls). This
-predates the tally feature and cases G/H -- see "THE TALLY -- results actually
-observed" above for the current eight-case results, including the real H limitation
+predates the tally feature and cases G/H -- see the historical tally experiments
+above for the reported eight-case results, including the H limitation
 this baseline could not have surfaced (it has no duplicate-detection case).
 
 | Run | Correct | False positives (costly) | Misses (cheap) | Unavailable |

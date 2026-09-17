@@ -229,29 +229,29 @@ trigger it. It never blocks or delays your turn, and a failure is logged and dro
 rather than raised. But it is real spend against your own key, on a schedule you do not
 directly control, and that is the honest cost of the feature.
 
-**Name the model, or expect to pay frontier rates.** The `fast` role is a *preference*,
-and in practice it often cannot be honored -- measured twice: a resolver that resolves
-`fast` to a glob (`claude-haiku-*`) whose live model-list lookup fails, and a session
-with no `model_role_resolver` registered at all. **In both cases the judge falls back to
-the model your own session runs on**, which is typically the expensive one, on every
-turn that triggers detection.
+**Choose the fallback model explicitly.** The `fast` role is a preference. If the
+role resolves to a concrete model on a configured provider, that choice wins. A
+missing resolver, an unresolved glob, or an unavailable provider can prevent it from
+being honored.
 
 ```yaml
       detect_decisions: true
-      detection_model: anthropic/claude-haiku-4-5   # or a bare model name
+      detection_model: anthropic/claude-haiku-4-5
 ```
 
-`detection_model` is used **only** when the role could not be honored, so it never
-overrides a routing matrix that is working. Leave it unset and you get today's behaviour
--- the fallback still happens, and now says so at WARNING:
+`detection_model` applies to both detectors and is used only when the role cannot be
+honored. Use `provider/model`; a bare model name is accepted only when exactly one
+provider is configured. Invalid syntax, an unavailable named provider, or an ambiguous
+bare name makes detection unavailable before a child session or provider call is
+created. It does not authorize a different inherited model as a substitute. A valid
+name still depends on the provider accepting that model; this setting is not a model
+availability check or a spending limit.
 
-```
-decision judge: requested model role was NOT honored -- model_role 'fast' resolved to
-no candidates; using the calling session's provider unchanged
-```
-
-A present-but-not-a-string value is refused at mount rather than coerced. A typo here
-does not fail visibly; it just quietly bills a frontier model on every judged turn.
+When `detection_model` is absent, the judge retains the calling session's provider
+configuration if the role cannot be honored and logs that fallback at WARNING. That
+can use the same expensive model as the main session. The author reported this in two
+setups: a role resolving to an unexpanded model glob and a missing role resolver.
+These reports do not establish how often fallback occurs on other hosts.
 
 **When it looks.** Two moments only:
 

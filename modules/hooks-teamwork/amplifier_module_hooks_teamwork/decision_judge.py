@@ -59,21 +59,19 @@ against a hook that belongs to this judge session would silently reintroduce
 the misattribution this design exists to avoid -- so `extra_tools` must always
 be already-bound instances handed in by the caller, never constructed here.
 
-THE TALLY. Both judges are also shown a bounded, most-recent-first TALLY of
-knowledge already recorded for this project (`build_tally()` below) -- claim/
-title only, never whole records. This exists because a live DTU run recorded
-the SAME lesson twice in different words ("whatever you mock, you are not
-testing" vs. "a test only covers the defects that could make it fail"): claim-
-text fingerprinting (see `__init__.py`'s `_record_verdict`) only catches an
-exact repeat, never a paraphrase, and a judge shown nothing but its own window
-has no way to notice the project already knows this. The tally is the judge's
-half of that fix -- it can decline a semantic duplicate and, when a claim
-genuinely builds on something already recorded, say so via the optional
-`links` verdict field (see `_parse_links()` below), which `__init__.py`'s
-`_record_verdict` carries through as `{"kind": "record", ...}` evidence
-alongside the window's own `external` reference. The judge is otherwise
-strictly less informed than a model that reads the project directly and cites
-what it extends by hand -- the tally narrows, but does not close, that gap.
+THE TALLY. Both judges receive a bounded, most-recent-first list of knowledge
+already recorded for this project (`build_tally()` below): claim/title only,
+never whole records. Its current purpose is linking a new claim to knowledge
+it extends, through the optional `links` verdict field. The judge wrapper
+retains only unique, exact record_type/record_id/version entries captured from
+that tally when the prompt was built. The hook carries those references beside
+the window's own external locator when it records a verdict.
+
+The author originally tested semantic duplicate suppression as a second use,
+but removed that prompt rule after reported failures. The tally does not now
+provide semantic deduplication. Exact claim fingerprints remain a separate
+hook mechanism. Historical model results and their limits are documented in
+evals/03-lesson-detection/README.md; they are not a rerun of this repaired code.
 """
 
 from __future__ import annotations
@@ -447,7 +445,7 @@ make again later. A wrongly-recorded one costs every future reader permanently -
 is no undo for an automatic record. When genuinely unsure, prefer SKIP.
 
 If, and only if, an ALREADY RECORDED tally is shown to you below (this project's
-own knowledge, most recent first, claim/title only), use it two ways. No tally
+own knowledge, most recent first, claim/title only), use it for linking only. No tally
 section means none of this applies -- judge the window on its own merits as above.
 
 When what you record builds on something the tally already states, cite the entry it builds on in "links" using its exact
@@ -469,8 +467,7 @@ before or after it -- with exactly these keys:
           is false
   "confidence": "low", "medium", or "high"
   "reason": one or two sentences on why, naming whether the evidence reaches as far as
-          the claim or is bounded to this environment/task -- and, when declining a
-          why
+          the claim or is bounded to this environment/task
   "links": a list of ALREADY RECORDED entries this lesson builds on, each exactly
           {"record_type": ..., "record_id": ..., "version": ...} copied from the
           tally shown to you -- or an empty list when it builds on nothing shown.
@@ -611,6 +608,41 @@ def _parse_links(raw):
     return links
 
 
+def tally_reference_keys(tally):
+    """Snapshot the bounded evidence identities actually offered to a judge.
+
+    Shape validation alone cannot establish provenance: a syntactically valid
+    model-generated ID may be invented or name a record the judge never saw.
+    Only knowledge entries with a usable claim and positive version qualify.
+    """
+    if not isinstance(tally, list):
+        return frozenset()
+    allowed = set()
+    for entry in tally[:MAX_TALLY_ENTRIES]:
+        if not isinstance(entry, dict):
+            continue
+        claim = entry.get("claim")
+        if not isinstance(claim, str) or not claim.strip():
+            continue
+        for ref in _parse_links([entry]):
+            if ref["record_type"] in TALLY_RECORD_TYPES and ref["version"] >= 1:
+                allowed.add((ref["record_type"], ref["record_id"], ref["version"]))
+    return frozenset(allowed)
+
+
+def validated_tally_links(raw, allowed):
+    """Keep unique exact snapshot members; invalid optional links cost no claim."""
+    result, seen = [], set()
+    for ref in _parse_links(raw):
+        key = (ref["record_type"], ref["record_id"], ref["version"])
+        if key in allowed and key not in seen:
+            result.append(ref)
+            seen.add(key)
+            if len(result) >= MAX_TALLY_ENTRIES:
+                break
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Provider inheritance
 # ---------------------------------------------------------------------------
@@ -627,6 +659,25 @@ def _bare_module(module_id):
     )
 
 
+def parse_detection_model(value):
+    """Parse a concrete fallback name without accepting globs or empty parts.
+
+    Return None when no fallback was requested. A bare name is usable only
+    with one inherited provider; provider selection is checked separately.
+    Error text deliberately excludes the configured value.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("detection_model must be a non-empty concrete model or provider/model name")
+    parts = value.strip().split("/")
+    if len(parts) not in (1, 2) or any(
+        not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]*", part) for part in parts
+    ):
+        raise ValueError("detection_model must be a non-empty concrete model or provider/model name")
+    return (parts[0], parts[1]) if len(parts) == 2 else (None, parts[0])
+
+
 async def _resolve_providers(parent_coordinator, model_role, explicit_model=None):
     """Resolve the judge's providers: try the role, then an operator-named model.
 
@@ -640,14 +691,16 @@ async def _resolve_providers(parent_coordinator, model_role, explicit_model=None
     `explicit_model` is the operator's answer to that: a concrete
     `"provider/model"` or bare `"model"` from config, used ONLY when the role
     could not be honored. It turns a silent cost regression into a named choice.
-    Never raises.
+    An invalid or unavailable explicit fallback raises before a child session
+    is constructed. Only an absent fallback permits inherited-model behavior.
     """
+    requested = parse_detection_model(explicit_model)
     providers, note, honored = await _resolve_by_role(parent_coordinator, model_role)
-    if honored or not explicit_model:
+    if honored or requested is None:
         return providers, note, honored
-    want_provider, _, want_model = str(explicit_model).rpartition("/")
-    if not want_model:
-        return providers, note, honored
+    want_provider, want_model = requested
+    if want_provider is None and len(providers) != 1:
+        raise ValueError("detection_model must name a provider when there is not exactly one configured provider")
     for spec in providers:
         if want_provider and _bare_module(spec.get("module", "")) != want_provider:
             continue
@@ -659,10 +712,7 @@ async def _resolve_providers(parent_coordinator, model_role, explicit_model=None
             "model_role %r could not be honored (%s); using the configured "
             "detection_model %r instead" % (model_role, note, explicit_model)
         ), True
-    return providers, (
-        "%s -- and the configured detection_model %r names a provider that is not "
-        "among the calling session's providers" % (note, explicit_model)
-    ), False
+    raise ValueError("detection_model provider is not among the calling session's configured providers")
 
 
 async def _resolve_by_role(parent_coordinator, model_role):
@@ -862,7 +912,11 @@ async def _judge(parent_coordinator, window, prompt_builder, *, extra_tools=None
 
     try:
         try:
-            raw = await session.execute(prompt_builder(window))
+            # Capture identities at prompt construction, before the provider
+            # await. A later cache/window mutation must not authorize new refs.
+            allowed_links = tally_reference_keys(window.get("tally"))
+            prompt = prompt_builder(window)
+            raw = await session.execute(prompt)
         except Exception as error:
             logger.warning("%s: the provider call failed (%s)", log_label, type(error).__name__)
             return no_verdict("the judge's provider call failed (%s)" % type(error).__name__)
@@ -872,6 +926,7 @@ async def _judge(parent_coordinator, window, prompt_builder, *, extra_tools=None
     verdict = _parse_verdict(raw)
     if verdict is None:
         return no_verdict("the judge's response could not be parsed as a verdict")
+    verdict["links"] = validated_tally_links(verdict["links"], allowed_links)
     return verdict
 
 
