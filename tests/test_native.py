@@ -901,3 +901,43 @@ class AutoBindTests(unittest.IsolatedAsyncioTestCase):
 
 
 if __name__ == '__main__': unittest.main()
+
+
+class ProjectIdIsDiscoveredNotAssumed(unittest.TestCase):
+    """The service publishes its own project id unauthenticated at /api/config.
+    Asking a person to retype it is asking them to guess something the other end
+    could have said -- it was the first question real onboarding produced.
+    """
+
+    def _module(self, source_transform=lambda s: s):
+        import importlib.util
+        path = Path(__file__).resolve().parents[1] / "setup_teamwork.py"
+        spec = importlib.util.spec_from_file_location("setup_probe", path)
+        module = importlib.util.module_from_spec(spec)
+        exec(compile(source_transform(path.read_text()), str(path), "exec"), module.__dict__)
+        return module
+
+    def test_a_published_project_id_is_used(self):
+        module = self._module()
+        published = json.dumps({"project_id": "some-other-project"}).encode()
+        with patch.object(module.urllib.request, "build_opener") as opener:
+            opener.return_value.open.return_value.__enter__.return_value.read.return_value = published
+            self.assertEqual(module.discover_project("https://svc.example.invalid"), "some-other-project")
+
+    def test_an_unreachable_service_falls_back_and_never_raises(self):
+        # A convenience read must not be able to stop an enrollment that would
+        # otherwise succeed -- 401/403 (an auth layer in front of the service's
+        # own config) included, which is the same "unavailable" the SSO path
+        # already tolerates.
+        module = self._module()
+        with patch.object(module.urllib.request, "build_opener", side_effect=OSError("down")):
+            self.assertEqual(module.discover_project("https://svc.example.invalid"), "teamwork")
+
+    def test_a_blank_or_non_string_project_id_is_not_trusted(self):
+        module = self._module()
+        for bad in (json.dumps({"project_id": "   "}).encode(),
+                    json.dumps({"project_id": 7}).encode(),
+                    b"not json at all"):
+            with patch.object(module.urllib.request, "build_opener") as opener:
+                opener.return_value.open.return_value.__enter__.return_value.read.return_value = bad
+                self.assertEqual(module.discover_project("https://svc.example.invalid"), "teamwork")
