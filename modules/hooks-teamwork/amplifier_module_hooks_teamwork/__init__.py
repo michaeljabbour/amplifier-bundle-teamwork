@@ -283,6 +283,10 @@ class Journal:
             # tables here rather than opening a second store.
             conn.execute("CREATE TABLE IF NOT EXISTS decision_watermark (session TEXT PRIMARY KEY, turn_index INTEGER NOT NULL)")
             conn.execute("CREATE TABLE IF NOT EXISTS decision_fingerprint (session TEXT NOT NULL, fingerprint TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (session, fingerprint))")
+            # Private diagnostic metadata only; never claim text or provider output.
+            conn.execute("CREATE TABLE IF NOT EXISTS detection_outcome ("
+                         "session TEXT NOT NULL, kind TEXT NOT NULL, outcome TEXT NOT NULL, "
+                         "tally_size INTEGER, link_count INTEGER, created_at TEXT NOT NULL)")
         os.chmod(path, 0o600)
 
     def connect(self): return closing(sqlite3.connect(self.path, timeout=10))
@@ -327,6 +331,16 @@ class Journal:
                 (sid, fingerprint)).fetchone()
         return row is not None
 
+    def record_detection_outcome(self, sid, kind, outcome, tally_size=None, link_count=None):
+        """Best-effort metadata: observation must never break detection."""
+        try:
+            with self.connect() as conn, conn:
+                conn.execute(
+                    "INSERT INTO detection_outcome(session,kind,outcome,tally_size,link_count,created_at) "
+                    "VALUES (?,?,?,?,?,?)", (sid, kind, outcome, tally_size, link_count, now()))
+        except Exception:
+            pass
+
     def record_decision_fingerprint(self, sid, fingerprint):
         with self.connect() as conn, conn:
             cursor = conn.execute(
@@ -370,7 +384,7 @@ class Journal:
 class TeamworkHook:
     def __init__(self, coordinator, connection, journal, client=None, level=VERBOSITY_DEFAULT, complaint=None,
                  node_label=None, responsibility=None, skills=None, filing=None, decision_detection=False,
-                 lesson_detection=False):
+                 lesson_detection=False, detection_model=None):
         self.coordinator, self.connection, self.journal = coordinator, connection, journal
         self.level = level
         # Opt-in, default off (see mount()'s detect_decisions gate). Off means
@@ -383,6 +397,7 @@ class TeamworkHook:
         # never turns the other on and disabling one never disturbs the
         # other's state.
         self.lesson_detection = lesson_detection
+        self.detection_model = detection_model
         # Strong references to in-flight judge tasks -- an unreferenced asyncio
         # Task can be garbage-collected mid-flight, silently dropping a verdict
         # that was already paid for. Tasks remove themselves on completion.
@@ -1284,13 +1299,14 @@ class TeamworkHook:
         self.journal.save(binding[0], self.state)
         if deliberate:
             logger.info("Teamwork %s detection skipped: window recorded deliberately", detector)
+            self.journal.record_detection_outcome(binding[0], detector, "skipped_deliberate")
             return None
         # A pending manual submission holds this same lock. Capture after it has
         # resolved, so a definite refusal can roll its reservation back cleanly.
         binding = (*binding[:4], self.state.get("deliberate_record_generation", 0))
         window = decision_judge.build_window_payload(
             [{"user_prompt": turn["user_prompt"], "agent_responses": turn["agent_responses"]} for turn in turns],
-            tool_calls)
+            tool_calls, tally=decision_judge.build_tally(self.state.get("cache", {})))
         return window, upto, binding
 
     async def _judge_and_record(self, window, considered_upto, binding=None):
@@ -1298,49 +1314,66 @@ class TeamworkHook:
         binding = binding or self.detection_binding()
         if not self.detection_binding_current(binding):
             return
+        allowed_links = decision_judge.tally_reference_keys(window.get("tally"))
+        tally_size = len(window.get("tally") or [])
         try:
             verdict = await asyncio.wait_for(
-                decision_judge.judge_window(self.coordinator, window),
+                decision_judge.judge_window(self.coordinator, window, explicit_model=self.detection_model),
                 timeout=DETECTION_JUDGE_SECONDS)
+        except asyncio.CancelledError:
+            self.journal.record_detection_outcome(binding[0], "decision", "judge_cancelled", tally_size)
+            raise
         except Exception as error:
             logger.warning("Teamwork decision judge failed (%s); nothing recorded", type(error).__name__)
+            self.journal.record_detection_outcome(binding[0], "decision", "judge_failed", tally_size)
             return
         await self._record_verdict(
             verdict, considered_upto, binding=binding,
             uri_scheme="teamwork-decision-window://",
             reserve=lambda fp: self.journal.record_decision_fingerprint(binding[0], fp),
             release=lambda fp: self.journal.release_decision_fingerprint(binding[0], fp),
-            log_label="decision")
+            log_label="decision", allowed_links=allowed_links, tally_size=tally_size)
 
     async def _judge_and_record_lesson(self, window, considered_upto, binding=None):
         """Run the lesson judge with the same lifecycle guards as decisions."""
         binding = binding or self.detection_binding()
         if not self.detection_binding_current(binding):
             return
+        allowed_links = decision_judge.tally_reference_keys(window.get("tally"))
+        tally_size = len(window.get("tally") or [])
         try:
             verdict = await asyncio.wait_for(
-                decision_judge.judge_lesson_window(self.coordinator, window),
+                decision_judge.judge_lesson_window(self.coordinator, window, explicit_model=self.detection_model),
                 timeout=DETECTION_JUDGE_SECONDS)
+        except asyncio.CancelledError:
+            self.journal.record_detection_outcome(binding[0], "lesson", "judge_cancelled", tally_size)
+            raise
         except Exception as error:
             logger.warning("Teamwork lesson judge failed (%s); nothing recorded", type(error).__name__)
+            self.journal.record_detection_outcome(binding[0], "lesson", "judge_failed", tally_size)
             return
         await self._record_verdict(
             verdict, considered_upto, binding=binding,
             uri_scheme="teamwork-lesson-window://",
             reserve=lambda fp: self.journal.record_lesson_fingerprint(binding[0], fp),
             release=lambda fp: self.journal.release_lesson_fingerprint(binding[0], fp),
-            log_label="lesson")
+            log_label="lesson", allowed_links=allowed_links, tally_size=tally_size)
 
-    async def _record_verdict(self, verdict, considered_upto, *, binding, uri_scheme, reserve, release, log_label):
+    async def _record_verdict(self, verdict, considered_upto, *, binding, uri_scheme, reserve, release,
+                              log_label, allowed_links=frozenset(), tally_size=None):
         """Reserve one claim durably, then publish with pinned session ownership."""
         if not self.detection_binding_current(binding):
             logger.info("Teamwork %s verdict discarded after rebinding or shutdown", log_label)
+            self.journal.record_detection_outcome(binding[0], log_label, "binding_changed", tally_size)
             return
         if not verdict.get("record"):
+            self.journal.record_detection_outcome(binding[0], log_label,
+                "unavailable" if verdict.get("available") is False else "skip_verdict", tally_size)
             return
         claim = (verdict.get("claim") or "").strip()
         if not claim:
             logger.warning("Teamwork %s judge returned no claim; nothing recorded", log_label)
+            self.journal.record_detection_outcome(binding[0], log_label, "no_claim", tally_size)
             return
         claim = self.clean(claim)[:INSIGHT_CLAIM]
         fingerprint = sha(" ".join(claim.lower().split()))
@@ -1348,15 +1381,21 @@ class TeamworkHook:
         if basis not in ("observation", "inference") or confidence not in ("low", "medium", "high") \
                 or not isinstance(limitations, str) or not limitations.strip():
             logger.warning("Teamwork %s judge returned an unusable verdict; nothing recorded", log_label)
+            self.journal.record_detection_outcome(binding[0], log_label, "unusable_shape", tally_size)
             return
         evidence = [{
             "kind": "external", "uri": uri_scheme + binding[0] + "/upto-turn/" + str(considered_upto),
             "label": "auto-detected " + log_label + " window",
         }]
+        # Recheck even a replaced judge implementation against the immutable
+        # identities captured before its await, never the current mutable cache.
+        links = decision_judge.validated_tally_links(verdict.get("links"), allowed_links)
+        evidence.extend({"kind": "record", **link} for link in links)
         # The reservation is atomic before any await. Unknown outcomes and
         # cancellation retain it; only definite refusals release it.
         if not reserve(fingerprint):
             logger.info("Teamwork %s duplicate skipped (reserved or recorded)", log_label)
+            self.journal.record_detection_outcome(binding[0], log_label, "duplicate_fingerprint", tally_size, len(links))
             return
         try:
             result = await RecordInsightTool(self, binding=binding, automatic=True).execute({
@@ -1366,18 +1405,23 @@ class TeamworkHook:
             })
         except asyncio.CancelledError:
             logger.warning("Teamwork %s write cancelled; reservation retained", log_label)
+            self.journal.record_detection_outcome(binding[0], log_label, "write_cancelled", tally_size, len(links))
             raise
         except Exception as error:
             logger.warning("Teamwork %s write failed (%s); reservation retained", log_label, type(error).__name__)
+            self.journal.record_detection_outcome(binding[0], log_label, "write_raised", tally_size, len(links))
             return
         error = result.error or {}
         if not result.success and error.get("outcome") != "unknown":
             release(fingerprint)
             logger.warning("Teamwork %s automatic record refused", log_label)
+            self.journal.record_detection_outcome(binding[0], log_label, "refused", tally_size, len(links))
             return
         if not result.success:
             logger.warning("Teamwork %s recording outcome unknown for attempted insight %s; not retrying",
                            log_label, error.get("attempted_record_id"))
+        self.journal.record_detection_outcome(binding[0], log_label,
+            "recorded" if result.success else "acceptance_unknown", tally_size, len(links))
 
 
 CONNECTION_FIELDS = ("base_url", "project_id", "token", "harness_id")
@@ -2062,6 +2106,17 @@ def decision_detection_enabled(config):
     return True
 
 
+def detection_model_setting(config):
+    """Validate a concrete fallback at mount; provider availability is checked later."""
+    value = config.get("detection_model")
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("Teamwork detection_model must be a non-empty string like 'anthropic/claude-haiku-4-5'")
+    decision_judge.parse_detection_model(value)
+    return value.strip()
+
+
 def lesson_detection_enabled(config):
     """Resolve the detect_lessons opt-in -- identical rule to
     decision_detection_enabled above, same reasoning, its own independent
@@ -2086,6 +2141,7 @@ async def mount(coordinator, config=None):
         raise ValueError("Teamwork hook requires explicit share_visible_turns: true opt-in")
     decision_detection = decision_detection_enabled(config)
     lesson_detection = lesson_detection_enabled(config)
+    detection_model = detection_model_setting(config)
     try:
         connection, home = resolve_connection(config)
     except ValueError as error:
@@ -2123,7 +2179,8 @@ async def mount(coordinator, config=None):
                         responsibility=config.get("responsibility"),
                         skills=config.get("skills"), filing=filing,
                         decision_detection=decision_detection,
-                        lesson_detection=lesson_detection)
+                        lesson_detection=lesson_detection,
+                        detection_model=detection_model)
     for name, handler in (("session:start", hook.on_start), ("prompt:submit", hook.on_submit), ("prompt:complete", hook.on_complete), ("session:end", hook.on_end), ("tool:pre", hook.on_tool_pre)):
         coordinator.hooks.register(name, handler, priority=50, name="teamwork-" + name.replace(":", "-"))
     send = SendTool(hook)

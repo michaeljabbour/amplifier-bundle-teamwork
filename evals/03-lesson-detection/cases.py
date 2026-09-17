@@ -1,4 +1,4 @@
-"""Six windows, grounded in real material from this project, with expected labels.
+"""Eight windows, grounded in real material from this project, with expected labels.
 
 Three RECORD cases are drawn from real incidents in this repository: scenario
 06's own running example (the compiled-extension/grep miss), the Origin-header
@@ -17,6 +17,20 @@ grounded in this project's own real, documented conventions (ANTHROPIC_API_KEY
 requirement from AGENTS.md's own gotchas table) -- the same "throwaway spike,
 grounded in real project shape" provenance evals/02-decision-detection/cases.py
 itself documents for its six cases.
+
+Cases G and H are the adversarial pair added alongside the judge TALLY (see
+decision_judge.py's "THE TALLY"): both windows carry a non-empty ALREADY
+RECORDED tally, and they are grounded in the SAME real DTU-run incident that
+motivated the tally in the first place -- a detector and a model both recorded
+"whatever you mock, you are not testing" / "a test only covers the defects
+that could make it fail" as separate insights, in different words, because
+claim-text fingerprinting cannot catch a paraphrase. Case G is the risk this
+change introduces: a genuinely NEW lesson, shown alongside a tally full of
+near misses on the same general topic (mocking/coverage), must still RECORD --
+a judge that treats "on-topic" as "already covered" silently over-suppresses,
+and silence looks identical to correctness. Case H is the case the tally
+exists to catch: the SAME lesson as an existing tally entry, restated in
+different words, must SKIP.
 
 Each case is a single-turn window: at most one user line and one assistant
 monologue, shaped to `decision_judge.build_window_payload`'s input contract
@@ -40,6 +54,39 @@ def _window(user_prompt, assistant_text):
         {"user_prompt": user_prompt, "agent_responses": [{"text": assistant_text}]}
     ]
     return decision_judge.build_window_payload(turns)
+
+
+def _window_with_tally(user_prompt, assistant_text, tally):
+    turns = [
+        {"user_prompt": user_prompt, "agent_responses": [{"text": assistant_text}]}
+    ]
+    return decision_judge.build_window_payload(turns, tally=tally)
+
+
+# The near-miss tally shared by case G: three real-shaped, testing/mocking-
+# adjacent entries, none of which is the lesson G's window actually states.
+# Entry 2 is the exact real phrasing this eval's own docstring quotes as one
+# half of the incident that motivated the tally feature.
+_NEAR_MISS_TALLY = [
+    {"record_type": "insight", "record_id": "i-mock-1", "version": 1,
+     "claim": ("Whatever you mock, you are not testing that path -- a mocked dependency "
+               "proves the code calls the mock correctly, not that the real integration works.")},
+    {"record_type": "insight", "record_id": "i-coverage-1", "version": 1,
+     "claim": ("A test only covers the defects that could make it fail -- a passing test over "
+               "an untested branch proves nothing about that branch.")},
+    {"record_type": "idea", "record_id": "d-integration-1", "version": 2,
+     "claim": ("Prefer an integration test over a heavily-mocked unit test whenever the "
+               "boundary itself, not the logic around it, is what's actually risky.")},
+]
+
+# The true-duplicate tally shared by case H: one entry stating, in the exact
+# words this eval's docstring quotes, the same lesson H's window restates.
+_DUPLICATE_TALLY = [
+    {"record_type": "insight", "record_id": "i-mock-original", "version": 1,
+     "claim": "Whatever you mock, you are not testing."},
+    {"record_type": "idea", "record_id": "d-unrelated", "version": 1,
+     "claim": "Prefer --noproxy '*' for any local staging call from inside a DTU."},
+]
 
 
 CASES = [
@@ -190,6 +237,70 @@ CASES = [
             "So the whole staging environment for this service looks to be "
             "down right now. Flagging it as an outage before anyone else "
             "burns time on it.",
+        ),
+    },
+    {
+        "id": "G",
+        "expected": "RECORD",
+        "note": (
+            "THE ADVERSARIAL CASE for the tally feature: a genuinely NEW, "
+            "structural lesson (a module-level monkeypatch of datetime.now() "
+            "leaks across test boundaries within one process) shown alongside "
+            "an ALREADY RECORDED tally full of near misses on the same general "
+            "topic -- mocking and coverage -- none of which is this claim. "
+            "On-topic must not be read as already-covered; over-suppression "
+            "here would look identical to correctness and is the real risk "
+            "this eval exists to catch."
+        ),
+        "window": _window_with_tally(
+            "",
+            "Chased a flaky failure that only showed up when the full suite ran, "
+            "never in isolation: one test module patches datetime.now() at import "
+            "time to freeze a fixed date, and never undoes it. Because the patch "
+            "target is the datetime module itself, not an instance passed into that "
+            "one test, it stays frozen for every OTHER test that imports datetime "
+            "afterward in the same worker process -- including tests in completely "
+            "unrelated files that never touch this fixture.\n\n"
+            "The fix for this suite is to patch inside a fixture with proper "
+            "teardown instead of at import time. But the failure mode generalises "
+            "past this one file: a module-level patch of a stdlib or third-party "
+            "symbol is not scoped to the test that requested it -- it is scoped to "
+            "the PROCESS, and leaks into every test that runs afterward in the same "
+            "worker, regardless of which file requested the patch. That is a "
+            "structural fact about how import-time patching works, not something "
+            "specific to this fixture or this test run -- worth recording on its "
+            "own, separate from the specific fix in this file.",
+            tally=_NEAR_MISS_TALLY,
+        ),
+    },
+    {
+        "id": "H",
+        "expected": "SKIP",
+        "note": (
+            "THE REQUIRED PAIR to case G: the SAME lesson as an existing tally "
+            "entry ('Whatever you mock, you are not testing.'), restated in "
+            "completely different words -- must be declined as a semantic "
+            "duplicate. This is the exact real incident that motivated the "
+            "tally feature: a detector and a model both recorded this lesson "
+            "independently, in different words, because claim-text "
+            "fingerprinting alone cannot catch a paraphrase."
+        ),
+        "window": _window_with_tally(
+            "",
+            "Debugged a false-negative that took an embarrassingly long time: the "
+            "test suite for the publish path was fully green, but the actual "
+            "publish call to the service had been broken for two days. Looked "
+            "closer and the test mocks the HTTP client completely -- so all it "
+            "actually verifies is that the code under test calls the mock object "
+            "with the right arguments, never that a real request against the real "
+            "service succeeds.\n\n"
+            "So a green suite here was never evidence the integration worked, and "
+            "that's not specific to this one test -- any test that replaces a real "
+            "dependency with a mock only proves the code calls the mock correctly, "
+            "not that the real thing on the other side behaves the way the mock "
+            "assumes. Worth recording so nobody reads a green mocked suite as proof "
+            "the integration itself is healthy.",
+            tally=_DUPLICATE_TALLY,
         ),
     },
 ]

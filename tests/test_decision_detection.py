@@ -110,6 +110,15 @@ def build(test, decision_detection=True):
     return hook, client, journal
 
 
+def outcomes(hook):
+    """Read the journal-only detection_outcome rows. Deliberately read through
+    sqlite rather than a log: nothing about this reaches a user."""
+    with hook.journal.connect() as conn:
+        return [{"kind": k, "outcome": o, "tally_size": t, "link_count": l}
+                for k, o, t, l in conn.execute(
+                    "SELECT kind, outcome, tally_size, link_count FROM detection_outcome ORDER BY rowid")]
+
+
 def insight_ops(client):
     return [op for endpoint, body, _ in client.requests if endpoint == "publish"
             for op in body["operations"] if op["op"] == "insight.upsert"]
@@ -255,7 +264,7 @@ class WatermarkBoundsReExamination(unittest.IsolatedAsyncioTestCase):
         add_turn(hook, "u2", "r2")
         captured = []
 
-        async def fake_judge(coordinator, window):
+        async def fake_judge(coordinator, window, **kwargs):
             captured.append(window)
             return decision_judge.no_verdict("test probe")
 
@@ -294,7 +303,7 @@ class JudgeFailureIsolation(unittest.IsolatedAsyncioTestCase):
         hook, client, _journal = build(self)
         add_turn(hook, "u1", "r1")
 
-        async def boom(coordinator, window):
+        async def boom(coordinator, window, **kwargs):
             raise RuntimeError("the provider is unreachable")
 
         with patch.object(decision_judge, "judge_window", boom):
@@ -366,6 +375,132 @@ class ProvenanceStaysOnTheParent(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(refs[0]["uri"].lower().startswith(("http://", "https://")))
 
 
+class TallyReachesTheJudge(unittest.IsolatedAsyncioTestCase):
+    """The hook builds the tally from its OWN synchronized cache (no new
+    network call) and hands it to the judge as part of the window -- see
+    decision_judge.py's "THE TALLY".
+    """
+
+    def _insight_source(self, record_id, version, claim):
+        return {
+            "record": {"id": record_id, "record_type": "insight", "version": version,
+                       "content": {"claim": claim}},
+            "delivery_id": "manifest",
+        }
+
+    async def test_cache_contents_reach_the_judge_as_a_tally(self):
+        hook, _client, _journal = build(self)
+        hook.state["cache"] = {
+            "insight:i1": self._insight_source("i1", 2, "Already-recorded knowledge."),
+        }
+        add_turn(hook, "u1", "r1")
+        captured = []
+
+        async def fake_judge(coordinator, window, **kwargs):
+            captured.append(window)
+            return decision_judge.no_verdict("test probe")
+
+        with patch.object(decision_judge, "judge_window", fake_judge):
+            hook.detect_decision()
+            await drain(hook)
+        self.assertEqual(captured[0]["tally"], [
+            {"record_type": "insight", "record_id": "i1", "version": 2,
+             "claim": "Already-recorded knowledge."},
+        ])
+
+    async def test_a_malformed_cache_entry_does_not_break_detection(self):
+        """A never-raises guarantee at the wiring layer, not just inside
+        decision_judge.build_tally() itself: one broken cache entry must not
+        prevent the good ones (or the window itself) from reaching the judge.
+        """
+        hook, _client, _journal = build(self)
+        hook.state["cache"] = {
+            "insight:good": self._insight_source("good", 1, "The only usable entry."),
+            "insight:broken": {"record": {"id": "broken", "record_type": "insight"}},  # no version, no content
+            "not-even-a-source": "garbage",
+        }
+        add_turn(hook, "u1", "r1")
+        captured = []
+
+        async def fake_judge(coordinator, window, **kwargs):
+            captured.append(window)
+            return decision_judge.no_verdict("test probe")
+
+        with patch.object(decision_judge, "judge_window", fake_judge):
+            hook.detect_decision()
+            await drain(hook)
+        self.assertEqual(len(captured), 1)
+        self.assertEqual([e["record_id"] for e in captured[0]["tally"]], ["good"])
+
+    async def test_an_empty_cache_is_an_empty_tally_exactly_todays_behavior(self):
+        hook, _client, _journal = build(self)
+        add_turn(hook, "u1", "r1")
+        captured = []
+
+        async def fake_judge(coordinator, window, **kwargs):
+            captured.append(window)
+            return decision_judge.no_verdict("test probe")
+
+        with patch.object(decision_judge, "judge_window", fake_judge):
+            hook.detect_decision()
+            await drain(hook)
+        self.assertEqual(captured[0]["tally"], [])
+
+
+class VerdictLinksReachEvidence(unittest.IsolatedAsyncioTestCase):
+    """A judge's `links` (built from the tally it was shown) are carried
+    through as additional `record`-kind evidence, alongside the window's own
+    `external` reference -- never replacing it.
+    """
+
+    async def test_valid_links_become_additional_record_kind_evidence(self):
+        hook, client, _journal = build(self)
+        hook.state["cache"] = {"insight:i1": {"record": {"record_type": "insight", "id": "i1", "version": 2, "content": {"claim": "Prior claim"}}}}
+        add_turn(hook, "u1", "r1")
+        verdict = dict(RECORD_VERDICT, links=[
+            {"record_type": "insight", "record_id": "i1", "version": 2},
+        ])
+        with patch.object(decision_judge, "judge_window", AsyncMock(return_value=verdict)):
+            hook.detect_decision()
+            await drain(hook)
+        refs = insight_ops(client)[0]["data"]["evidence_refs"]
+        self.assertEqual(len(refs), 2)
+        self.assertEqual(refs[0]["kind"], "external")  # the hardcoded window ref stays first
+        self.assertEqual(refs[1], {"kind": "record", "record_type": "insight",
+                                    "record_id": "i1", "version": 2})
+
+    async def test_a_malformed_link_is_dropped_and_the_record_still_lands(self):
+        hook, client, _journal = build(self)
+        hook.state["cache"] = {"insight:keep": {"record": {"record_type": "insight", "id": "keep", "version": 1, "content": {"claim": "Prior claim"}}}}
+        add_turn(hook, "u1", "r1")
+        verdict = dict(RECORD_VERDICT, links=[
+            {"record_type": "insight", "record_id": "keep", "version": 1},
+            {"record_type": "person", "record_id": "bad-type", "version": 1},
+            {"record_type": "idea", "record_id": "bad-version", "version": "not-an-int"},
+        ])
+        with patch.object(decision_judge, "judge_window", AsyncMock(return_value=verdict)):
+            hook.detect_decision()
+            await drain(hook)
+        refs = insight_ops(client)[0]["data"]["evidence_refs"]
+        record_refs = [r for r in refs if r["kind"] == "record"]
+        self.assertEqual(record_refs, [{"kind": "record", "record_type": "insight",
+                                         "record_id": "keep", "version": 1}])
+
+    async def test_no_links_field_at_all_is_unaffected_regression(self):
+        """RECORD_VERDICT as used everywhere else in this file has no
+        "links" key at all -- must degrade to exactly one evidence entry,
+        same as before this change.
+        """
+        hook, client, _journal = build(self)
+        add_turn(hook, "u1", "r1")
+        with patch.object(decision_judge, "judge_window", AsyncMock(return_value=dict(RECORD_VERDICT))):
+            hook.detect_decision()
+            await drain(hook)
+        refs = insight_ops(client)[0]["data"]["evidence_refs"]
+        self.assertEqual(len(refs), 1)
+        self.assertEqual(refs[0]["kind"], "external")
+
+
 class ToolPreWindowConstruction(unittest.IsolatedAsyncioTestCase):
     """The delegation call itself is reduced to name+target only -- the
     instruction (where the conclusion is stated, per 08's open questions)
@@ -377,7 +512,7 @@ class ToolPreWindowConstruction(unittest.IsolatedAsyncioTestCase):
         add_turn(hook, "u1", "r1")
         captured = []
 
-        async def fake_judge(coordinator, window):
+        async def fake_judge(coordinator, window, **kwargs):
             captured.append(window)
             return decision_judge.no_verdict("test probe")
 
@@ -412,7 +547,7 @@ class ToolPreWindowConstruction(unittest.IsolatedAsyncioTestCase):
         add_turn(hook, "u1", "r1")
         captured = []
 
-        async def fake_judge(coordinator, window):
+        async def fake_judge(coordinator, window, **kwargs):
             captured.append(window)
             return decision_judge.no_verdict("test probe")
 
@@ -424,3 +559,54 @@ class ToolPreWindowConstruction(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DetectionOutcomeIsObservableInTheJournalOnly(unittest.IsolatedAsyncioTestCase):
+    """Every detector path used to end in the SAME observable state -- a
+    watermark moved and no record -- whether it was suppressed, judged SKIP,
+    refused, or written with an unknown outcome. That ambiguity cost four
+    failed verification runs against a live DTU. These assert the paths are
+    now distinguishable, and that nothing about it reaches a user.
+    """
+
+    async def test_a_skip_verdict_and_a_deliberate_suppression_are_distinguishable(self):
+        hook, client, _journal = build(self)
+        hook.state["decision_turns"] = [{"turn_index": 1, "user_prompt": "u", "agent_responses": [{"text": "a"}]}]
+        with patch.object(decision_judge, "judge_window",
+                          AsyncMock(return_value={"record": False, "available": True})):
+            task = hook.detect_decision()
+            if task:
+                await task
+        rows = outcomes(hook)
+        self.assertEqual([r["outcome"] for r in rows], ["skip_verdict"])
+
+        hook2, _client2, _j2 = build(self)
+        hook2.state["decision_turns"] = [{"turn_index": 1, "user_prompt": "u", "agent_responses": [{"text": "a"}]}]
+        hook2.state["deliberate_record_turn"] = 1
+        with patch.object(decision_judge, "judge_window", AsyncMock()) as judge:
+            task = hook2.detect_decision()
+            if task:
+                await task
+        judge.assert_not_called()
+        self.assertEqual([r["outcome"] for r in outcomes(hook2)], ["skipped_deliberate"])
+
+    async def test_the_tally_size_the_judge_actually_saw_is_recorded(self):
+        hook, client, _journal = build(self)
+        hook.state["decision_turns"] = [{"turn_index": 1, "user_prompt": "u", "agent_responses": [{"text": "a"}]}]
+        hook.state["cache"] = {
+            "insight:aaa": {"record": {"record_type": "insight", "id": "aaa", "version": 1,
+                                       "content": {"claim": "already known"}}, "delivery_id": "d"},
+        }
+        with patch.object(decision_judge, "judge_window",
+                          AsyncMock(return_value={"record": False, "available": True})):
+            task = hook.detect_decision()
+            if task:
+                await task
+        rows = outcomes(hook)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["tally_size"], 1)
+
+    def test_recording_an_outcome_can_never_break_detection(self):
+        hook, _client, _j = build(self)
+        hook.journal.path = "/nonexistent/dir/does-not-exist.sqlite3"
+        hook.journal.record_detection_outcome("s", "decision", "recorded", 0, 0)

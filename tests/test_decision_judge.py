@@ -30,6 +30,7 @@ from amplifier_module_hooks_teamwork import (
     RecordInsightTool,
     TeamworkHook,
     decision_judge,
+    detection_model_setting,
 )
 from amplifier_module_hooks_teamwork import mount as teamwork_mount
 
@@ -184,13 +185,190 @@ class WindowPayloadTests(unittest.TestCase):
 
     def test_an_empty_window_is_still_a_valid_bounded_payload(self):
         window = decision_judge.build_window_payload([], [])
-        self.assertEqual(window, {"turns": [], "tool_calls": []})
+        self.assertEqual(window, {"turns": [], "tool_calls": [], "tally": []})
 
     def test_a_turn_with_neither_prompt_nor_response_is_dropped(self):
         window = decision_judge.build_window_payload(
             [{"user_prompt": "", "agent_responses": []}]
         )
         self.assertEqual(window["turns"], [])
+
+    def test_tally_is_bounded_by_count_and_reboundeds_a_caller_supplied_one(self):
+        """build_window_payload never trusts an upstream tally either --
+        matching the "never raises, never trusts an upstream bound" posture
+        it already applies to turns and tool_calls.
+        """
+        tally = [
+            {"record_type": "insight", "record_id": "i%d" % i, "version": 1, "claim": "c%d" % i}
+            for i in range(30)
+        ]
+        window = decision_judge.build_window_payload([], [], tally, max_tally_entries=5)
+        self.assertEqual(len(window["tally"]), 5)
+
+    def test_tally_claim_text_is_clipped_to_the_bound(self):
+        tally = [{"record_type": "insight", "record_id": "i1", "version": 1, "claim": "x" * 500}]
+        window = decision_judge.build_window_payload([], [], tally, max_tally_chars=50)
+        self.assertLessEqual(len(window["tally"][0]["claim"]), 50)
+
+    def test_a_malformed_tally_entry_is_dropped_not_fatal(self):
+        tally = [
+            {"record_type": "insight", "record_id": "i1", "version": 1, "claim": "keep me"},
+            {"record_type": "insight", "record_id": "i2", "claim": "missing a version"},
+            {"record_type": "work", "record_id": "w1", "version": 1, "claim": "wrong record type"},
+            "not even a dict",
+            {"record_type": "idea", "record_id": "d1", "version": "not-an-int", "claim": "bad version type"},
+        ]
+        window = decision_judge.build_window_payload([], [], tally)
+        self.assertEqual([entry["record_id"] for entry in window["tally"]], ["i1"])
+
+    def test_no_tally_supplied_is_an_empty_list_not_a_missing_key(self):
+        window = decision_judge.build_window_payload([], [])
+        self.assertEqual(window["tally"], [])
+
+
+class BuildTallyTests(unittest.TestCase):
+    """build_tally() reads the hook's own synchronized cache -- no network
+    call -- and degrades safely on anything malformed.
+    """
+
+    def _source(self, record_type, record_id, version, content):
+        return {
+            "record": {"id": record_id, "record_type": record_type, "version": version, "content": content},
+            "delivery_id": "manifest",
+        }
+
+    def test_only_insight_and_idea_record_types_are_read(self):
+        cache = {
+            "insight:i1": self._source("insight", "i1", 1, {"claim": "an insight"}),
+            "idea:d1": self._source("idea", "d1", 1, {"text": "an idea"}),
+            "work:w1": self._source("work", "w1", 1, {"title": "not knowledge"}),
+            "person:p1": self._source("person", "p1", 1, {"name": "not knowledge either"}),
+        }
+        tally = decision_judge.build_tally(cache)
+        self.assertEqual({e["record_id"] for e in tally}, {"i1", "d1"})
+
+    def test_most_recent_first_by_updated_at(self):
+        cache = {
+            "insight:old": self._source("insight", "old", 1,
+                                         {"claim": "older", "updated_at": "2026-01-01T00:00:00+00:00"}),
+            "insight:new": self._source("insight", "new", 1,
+                                         {"claim": "newer", "updated_at": "2026-09-01T00:00:00+00:00"}),
+        }
+        tally = decision_judge.build_tally(cache)
+        self.assertEqual([e["record_id"] for e in tally], ["new", "old"])
+
+    def test_falls_back_to_created_at_when_never_updated(self):
+        cache = {
+            "insight:a": self._source("insight", "a", 1,
+                                       {"claim": "a", "created_at": "2026-01-01T00:00:00+00:00"}),
+            "insight:b": self._source("insight", "b", 1,
+                                       {"claim": "b", "created_at": "2026-06-01T00:00:00+00:00"}),
+        }
+        tally = decision_judge.build_tally(cache)
+        self.assertEqual([e["record_id"] for e in tally], ["b", "a"])
+
+    def test_entries_carry_claim_title_only_never_the_whole_record(self):
+        cache = {
+            "insight:i1": self._source("insight", "i1", 3, {
+                "claim": "the transferable statement",
+                "limitations": "must never leak into the tally",
+                "source_session_id": "must never leak into the tally either",
+            }),
+        }
+        tally = decision_judge.build_tally(cache)
+        self.assertEqual(tally, [{"record_type": "insight", "record_id": "i1", "version": 3,
+                                  "claim": "the transferable statement"}])
+
+    def test_bounded_by_max_entries(self):
+        cache = {
+            "insight:i%d" % i: self._source("insight", "i%d" % i, 1, {"claim": "c%d" % i})
+            for i in range(50)
+        }
+        tally = decision_judge.build_tally(cache, max_entries=7)
+        self.assertEqual(len(tally), 7)
+
+    def test_claim_text_is_clipped(self):
+        cache = {"insight:i1": self._source("insight", "i1", 1, {"claim": "x" * 1000})}
+        tally = decision_judge.build_tally(cache, max_chars=20)
+        self.assertLessEqual(len(tally[0]["claim"]), 20)
+
+    def test_empty_cache_degrades_to_an_empty_tally(self):
+        self.assertEqual(decision_judge.build_tally({}), [])
+        self.assertEqual(decision_judge.build_tally(None), [])
+
+    def test_malformed_cache_entries_are_skipped_not_fatal(self):
+        cache = {
+            "insight:good": self._source("insight", "good", 1, {"claim": "the only usable entry"}),
+            "insight:no-content": {"record": {"id": "x", "record_type": "insight", "version": 1}},
+            "insight:no-version": {"record": {"id": "y", "record_type": "insight",
+                                              "content": {"claim": "no version"}}},
+            "insight:no-claim-text": self._source("insight", "z", 1, {"limitations": "no claim field"}),
+            "broken": "not even a dict",
+            "insight:none-record": {"record": None},
+        }
+        tally = decision_judge.build_tally(cache)
+        self.assertEqual([e["record_id"] for e in tally], ["good"])
+
+
+class ParseLinksTests(unittest.TestCase):
+    """_parse_links() is the backstop when a judge's `links` field is
+    malformed -- an entry that does not match RecordInsightTool's own
+    `record` evidence-kind shape is dropped, never fatal to the rest.
+    """
+
+    def test_a_well_formed_link_survives(self):
+        links = decision_judge._parse_links(
+            [{"record_type": "insight", "record_id": "i1", "version": 2}]
+        )
+        self.assertEqual(links, [{"record_type": "insight", "record_id": "i1", "version": 2}])
+
+    def test_non_list_input_degrades_to_no_links(self):
+        for raw in (None, "not a list", {"record_type": "insight"}, 42):
+            with self.subTest(raw=raw):
+                self.assertEqual(decision_judge._parse_links(raw), [])
+
+    def test_a_malformed_entry_is_dropped_not_fatal_to_the_rest(self):
+        links = decision_judge._parse_links([
+            {"record_type": "insight", "record_id": "keep", "version": 1},
+            {"record_type": "person", "record_id": "bad-type", "version": 1},
+            {"record_type": "idea", "record_id": "", "version": 1},
+            {"record_type": "idea", "record_id": "bad-version", "version": "not-an-int"},
+            {"record_type": "work", "record_id": "bad-version-bool", "version": True},
+            "not a dict",
+        ])
+        self.assertEqual(links, [{"record_type": "insight", "record_id": "keep", "version": 1}])
+
+    def test_parse_verdict_carries_valid_links_through_only_on_record_true(self):
+        raw = json.dumps({
+            "record": True, "kind": "k", "claim": "c", "basis": "observation",
+            "what_it_does_not_establish": "w", "confidence": "high", "reason": "r",
+            "links": [{"record_type": "insight", "record_id": "i1", "version": 1}],
+        })
+        verdict = decision_judge._parse_verdict(raw)
+        self.assertEqual(verdict["links"], [{"record_type": "insight", "record_id": "i1", "version": 1}])
+
+    def test_parse_verdict_skip_verdict_always_has_empty_links(self):
+        raw = json.dumps({
+            "record": False, "kind": None, "claim": None, "basis": None,
+            "what_it_does_not_establish": None, "confidence": "high", "reason": "duplicate of i1",
+            "links": [{"record_type": "insight", "record_id": "i1", "version": 1}],
+        })
+        verdict = decision_judge._parse_verdict(raw)
+        self.assertEqual(verdict["links"], [])
+
+    def test_parse_verdict_missing_links_field_entirely_still_parses(self):
+        """links is deliberately NOT in VERDICT_FIELDS -- its absence must
+        never invalidate an otherwise well-formed verdict."""
+        raw = json.dumps({
+            "record": True, "kind": "k", "claim": "c", "basis": "observation",
+            "what_it_does_not_establish": "w", "confidence": "high", "reason": "r",
+        })
+        verdict = decision_judge._parse_verdict(raw)
+        self.assertTrue(verdict["available"])
+        self.assertEqual(verdict["links"], [])
+
+    def test_no_verdict_carries_an_empty_links_list(self):
+        self.assertEqual(decision_judge.no_verdict("x")["links"], [])
 
 
 class HonestJudgeFailures(unittest.IsolatedAsyncioTestCase):
@@ -479,3 +657,146 @@ class ToolMountingTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class JudgeReferenceProvenance(unittest.IsolatedAsyncioTestCase):
+    async def judge(self, entrypoint, window, links, mutate=None):
+        raw = json.dumps({
+            "record": True, "kind": "structural constraint", "claim": "A fixture claim.",
+            "basis": "observation", "confidence": "high",
+            "what_it_does_not_establish": "Only a synthetic fixture.",
+            "reason": "The fixture supplies a structural reason.", "links": links,
+        })
+        fake = FakeJudgeSession(execute_result=raw)
+        original_execute = fake.execute
+
+        async def execute(prompt):
+            if mutate:
+                mutate()
+            return await original_execute(prompt)
+
+        fake.execute = execute
+        with patch.object(decision_judge, "build_judge_session",
+                          AsyncMock(return_value=(fake, "fixture", True))):
+            result = await entrypoint(object(), window)
+        self.assertTrue(result["available"])
+        self.assertTrue(result["record"])
+        self.assertTrue(fake.cleaned_up)
+        return result
+
+    async def test_both_judges_drop_unseen_ids_types_and_versions_without_losing_claim(self):
+        shown = {"record_type": "insight", "record_id": "shown", "version": 2}
+        window = decision_judge.build_window_payload([], tally=[dict(shown, claim="Shown claim")])
+        links = [dict(shown, record_id="unseen"), dict(shown, version=1),
+                 dict(shown, version=True), dict(shown, version=-1),
+                 dict(shown, record_type="work"), shown]
+        for entrypoint in (decision_judge.judge_window, decision_judge.judge_lesson_window):
+            with self.subTest(entrypoint=entrypoint.__name__):
+                result = await self.judge(entrypoint, window, links)
+                self.assertEqual(result["links"], [shown])
+
+    async def test_no_tally_means_no_record_links(self):
+        result = await self.judge(decision_judge.judge_window, EMPTY_WINDOW,
+                                  [{"record_type": "insight", "record_id": "invented", "version": 1}])
+        self.assertEqual(result["links"], [])
+
+    async def test_duplicate_and_excess_links_cannot_exceed_the_tally_bound(self):
+        refs = [{"record_type": "insight", "record_id": "i%d" % i, "version": 1}
+                for i in range(decision_judge.MAX_TALLY_ENTRIES + 5)]
+        window = {"turns": [], "tool_calls": [],
+                  "tally": [dict(ref, claim="Claim") for ref in refs]}
+        result = await self.judge(decision_judge.judge_window, window, refs + refs)
+        self.assertEqual(result["links"], refs[:decision_judge.MAX_TALLY_ENTRIES])
+
+    async def test_reference_membership_uses_the_tally_shown_before_provider_await(self):
+        shown = {"record_type": "insight", "record_id": "shown", "version": 1}
+        later = dict(shown, record_id="later")
+        window = decision_judge.build_window_payload([], tally=[dict(shown, claim="Original")])
+        result = await self.judge(
+            decision_judge.judge_window, window, [shown, later],
+            mutate=lambda: window["tally"].__setitem__(slice(None), [dict(later, claim="Later")]),
+        )
+        self.assertEqual(result["links"], [shown])
+
+
+class ConfiguredDetectionModelTakesOverWhenTheRoleCannotBeHonored(unittest.IsolatedAsyncioTestCase):
+    """The `fast` role is a preference, and in practice it is usually NOT
+    honored -- measured twice: a resolver that resolves it to a glob whose
+    live model-list lookup fails, and a session with no resolver registered.
+    Both then run the judge on the CALLING session's frontier model, on every
+    judged turn. `detection_model` is the operator's answer, and it applies
+    only where the role already failed.
+    """
+
+    def _parent(self, resolver=None):
+        config = {"providers": [
+            {"module": "provider-anthropic", "config": {"priority": 1, "default_model": "claude-opus-5"}},
+        ]}
+        return SimpleNamespace(config=config, get_capability=lambda name: resolver)
+
+    async def test_no_resolver_at_all_falls_back_to_the_configured_model(self):
+        providers, note, honored = await decision_judge._resolve_providers(
+            self._parent(resolver=None), "fast", "anthropic/claude-haiku-4-5")
+        self.assertTrue(honored)
+        self.assertEqual(providers[0]["config"]["default_model"], "claude-haiku-4-5")
+        self.assertIn("detection_model", note)
+
+    async def test_a_glob_the_judge_cannot_expand_falls_back_to_the_configured_model(self):
+        resolver = SimpleNamespace(resolve=AsyncMock(return_value=[{"provider": "anthropic", "model": "claude-haiku-*"}]))
+        providers, _note, honored = await decision_judge._resolve_providers(
+            self._parent(resolver), "fast", "claude-haiku-4-5")
+        self.assertTrue(honored)
+        self.assertEqual(providers[0]["config"]["default_model"], "claude-haiku-4-5")
+
+    async def test_a_role_that_DOES_resolve_wins_over_the_configured_model(self):
+        resolver = SimpleNamespace(resolve=AsyncMock(return_value=[{"provider": "anthropic", "model": "resolved-small"}]))
+        providers, _note, honored = await decision_judge._resolve_providers(
+            self._parent(resolver), "fast", "anthropic/ignored-me")
+        self.assertTrue(honored)
+        self.assertEqual(providers[0]["config"]["default_model"], "resolved-small")
+
+    async def test_without_a_configured_model_todays_behaviour_is_unchanged(self):
+        providers, _note, honored = await decision_judge._resolve_providers(
+            self._parent(resolver=None), "fast", None)
+        self.assertFalse(honored)
+        self.assertEqual(providers[0]["config"]["default_model"], "claude-opus-5")
+
+    async def test_a_configured_provider_not_among_the_parents_is_refused_not_invented(self):
+        with self.assertRaisesRegex(ValueError, "configured providers"):
+            await decision_judge._resolve_providers(
+                self._parent(resolver=None), "fast", "openai/gpt-nope")
+
+    async def test_unusable_explicit_model_never_constructs_a_child_or_calls_a_provider(self):
+        for setting in ("openai/unmounted", "anthropic/", "/missing-provider", "a/b/c",
+                        "anthropic/model*", "anthropic/model name", True):
+            for entrypoint in (decision_judge.judge_window, decision_judge.judge_lesson_window):
+                with self.subTest(setting=setting, entrypoint=entrypoint.__name__), \
+                        patch("amplifier_core.AmplifierSession") as constructor:
+                    verdict = await entrypoint(self._parent(), EMPTY_WINDOW, explicit_model=setting)
+                    self.assertFalse(verdict["available"])
+                    self.assertFalse(verdict["record"])
+                    constructor.assert_not_called()
+
+    async def test_bare_model_with_multiple_providers_requires_an_explicit_provider(self):
+        parent = self._parent()
+        parent.config["providers"].append({"module": "provider-other", "config": {"priority": 0}})
+        with patch("amplifier_core.AmplifierSession") as constructor:
+            verdict = await decision_judge.judge_window(parent, EMPTY_WINDOW, explicit_model="small")
+        self.assertFalse(verdict["available"])
+        constructor.assert_not_called()
+
+    async def test_configured_fallback_does_not_mutate_the_parent_provider_config(self):
+        parent = self._parent()
+        before = json.loads(json.dumps(parent.config))
+        providers, _, honored = await decision_judge._resolve_providers(parent, "fast", "anthropic/small")
+        self.assertTrue(honored)
+        self.assertEqual(providers[0]["config"]["default_model"], "small")
+        self.assertEqual(parent.config, before)
+
+    def test_the_setting_refuses_an_ambiguous_value_rather_than_coercing_it(self):
+        self.assertIsNone(detection_model_setting({}))
+        self.assertEqual(detection_model_setting({"detection_model": "  anthropic/x  "}), "anthropic/x")
+        with self.assertRaisesRegex(ValueError, "non-empty string"):
+            detection_model_setting({"detection_model": True})
+        with self.assertRaisesRegex(ValueError, "non-empty string"):
+            detection_model_setting({"detection_model": "   "})

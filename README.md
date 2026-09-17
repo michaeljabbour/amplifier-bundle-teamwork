@@ -232,6 +232,30 @@ triggers can inspect buffered turns when capacity is available. Shutdown allows 
 cleanup. Work that outlasts shutdown cannot start a later publication. This spends
 your model budget and can miss a decision when capacity or time is exhausted.
 
+**Choose the fallback model explicitly.** The `fast` role is a preference. If the
+role resolves to a concrete model on a configured provider, that choice wins. A
+missing resolver, an unresolved glob, or an unavailable provider can prevent it from
+being honored.
+
+```yaml
+      detect_decisions: true
+      detection_model: anthropic/claude-haiku-4-5
+```
+
+`detection_model` applies to both detectors and is used only when the role cannot be
+honored. Use `provider/model`; a bare model name is accepted only when exactly one
+provider is configured. Invalid syntax, an unavailable named provider, or an ambiguous
+bare name makes detection unavailable before a child session or provider call is
+created. It does not authorize a different inherited model as a substitute. A valid
+name still depends on the provider accepting that model; this setting is not a model
+availability check or a spending limit.
+
+When `detection_model` is absent, the judge retains the calling session's provider
+configuration if the role cannot be honored and logs that fallback at WARNING. That
+can use the same expensive model as the main session. The author reported this in two
+setups: a role resolving to an unexpanded model glob and a missing role resolver.
+These reports do not establish how often fallback occurs on other hosts.
+
 **When it looks.** Two moments only:
 
 | signal | what it catches |
