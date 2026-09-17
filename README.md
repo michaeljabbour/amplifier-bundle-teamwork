@@ -196,6 +196,83 @@ remove it yourself once you have confirmed you no longer need it.
 With no project configured the hook mounts **inert** -- it registers nothing and sends
 nothing -- until a session binds one.
 
+### Automatic decision detection (`detect_decisions`) -- off unless you ask
+
+**This is the one setting that makes the bundle call a model on its own and publish
+without you.** Read this section before enabling it; everything else in this bundle only
+moves text you already saw.
+
+```yaml
+# ~/.amplifier/settings.yaml
+overrides:
+  hooks-teamwork:
+    config:
+      share_visible_turns: true
+      detect_decisions: true      # default: false
+```
+
+Absent or `false` means **genuinely nothing**: no model call, no state written, no cost.
+Any other value is rejected at mount with the same explicit-opt-in error as
+`share_visible_turns`, rather than being guessed at.
+
+**What it does when on.** Some decisions are never asked about -- a session reaches a
+fork, picks correctly, acts, and the reasoning disappears when the session ends. With
+this on, the hook watches for those and publishes them to the project as attributed
+knowledge. The two scenarios that define what qualifies are
+[`08`](docs/scenarios/08-the-decision-the-session-made-itself.md) and its twin
+[`08b`](docs/scenarios/08b-the-path-taken-that-binds-nothing.md); they are the
+specification, not illustrations.
+
+**It spends your model budget.** Detection runs a short, separate in-process Amplifier
+session -- your configured provider, preferring the `fast` routing role -- on turns that
+trigger it. Normal turns do not await the model call. Detection admits at most two
+background tasks, skips empty windows and bounds a judgment to 30 seconds; later
+triggers can inspect buffered turns when capacity is available. Shutdown allows up to
+10 seconds for pending work, then cancels and allows up to 6 seconds for cooperative
+cleanup. Work that outlasts shutdown cannot start a later publication. This spends
+your model budget and can miss a decision when capacity or time is exhausted.
+
+**When it looks.** Two moments only:
+
+| signal | what it catches |
+|---|---|
+| a delegation about to be made | the moment a choice surfaces as work handed elsewhere |
+| the session ending | the retrospective -- what actually survived rather than what was momentarily decided |
+
+**Coverage limits:** completed shared turns from work the session does itself are
+examined at clean shutdown, even without delegation. Abrupt process termination,
+unshared/private or delegated-child conversations, omitted content, bounded older
+history and a shutdown deadline can leave decisions unexamined. The delegation
+trigger sees completed shared turns plus the tool name and target; it does not read
+raw tool instructions or private reasoning.
+
+**What reaches the project.** One insight per detected decision: the claim, its basis,
+confidence, what it does *not* establish, and a locator for the window it came from. It
+is attributed to **this** enrolled session. A project rebind cancels old detector
+tasks; binding identity is rechecked before publication so an old project's window
+cannot be sent to the newly selected project. A request already sent remains under
+its original credential and session identity.
+
+**It will sometimes be wrong.** The author reported historical `claude-haiku-4-5`
+trials: six windows with stated reasons across four runs had one false positive;
+six windows with unstated reasons across three runs had none. These trials have no
+committed raw receipts or source hashes and were not independently rerun after the
+runner's unavailable-verdict scoring repair. They do not establish current accuracy. The
+design deliberately prefers missing a decision over publishing a wrong one, because the
+service has no retired state and no forward pointer yet: **a wrong record cannot be
+withdrawn, only added to.**
+
+**Duplicates.** A durable, atomic reservation on normalized claim text prevents
+concurrent copies of the same decision. Paraphrases are not caught. A definite refusal
+releases the reservation; success, an unknown write outcome, or cancellation during
+publication retains it. Retention is not proof that the insight exists. The attempted
+record ID is logged when the service outcome is unknown so you can read it back.
+A crash or cancellation between reservation and submission can leave an unpublished
+claim suppressed; the detector prefers that possibility over duplicating knowledge.
+
+To turn it off, remove the key or set it to `false`, then start a new session; a running
+session keeps the configuration it started with.
+
 ### How much the hook says about what arrived
 
 When project records the user has not been told about are accepted into a turn, the hook
