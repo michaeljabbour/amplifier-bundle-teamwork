@@ -51,6 +51,8 @@ button.ghost{background:transparent;color:var(--muted);border-color:var(--line)}
 .foot{margin:22px 0 0;padding-top:16px;border-top:1px solid var(--line);
 font-size:12.5px;color:var(--muted)}
 .foot code{font-size:12px;word-break:break-all}
+details{margin:20px 0;border-top:1px solid var(--line);padding-top:14px}
+summary{cursor:pointer;color:var(--muted);font-size:13.5px;font-weight:600;margin-bottom:12px}
 """
 
 
@@ -130,16 +132,18 @@ def form_page(nonce, csrf, style_nonce, service, minutes, values=None, error=Non
                else "Exactly as it appears in Teamwork, for example design/review.",
                extra=('' if project_optional else ' required')
                + ' maxlength="200" autocomplete="off" autocapitalize="off" spellcheck="false" autofocus')
-        + text("credential", "Credential from the portal", "optional",
-               "Paste a credential minted from Account menu \u2192 Harnesses & agents. "
-               "Takes precedence over the fields below.",
-               kind="password", extra=' autocomplete="off"')
         + text("name", "Name or email", code_label,
-               "Leave blank if this project is already enrolled on this machine.",
+               "Use your Teamwork name or email with your personal access code. Leave both blank to reuse a saved connection.",
                extra=' autocomplete="username"')
-        + text("code", "Private member code", code_label,
-               "Sent straight to the service and never written to disk.",
+        + text("code", "Personal access code", code_label,
+               "The private member code supplied for your account. Sent straight to the service and never saved.",
                kind="password", extra=' autocomplete="off"')
+        + '<details' + (' open' if field == "credential" else '') + '><summary>Advanced: portal agent credential</summary>'
+        + text("credential", "Agent credential from the portal", "optional",
+               "Use an agent credential minted in Account menu \u2192 Harnesses & agents, not your personal access code. "
+               "If supplied, it is used instead of the name and personal access code above.",
+               kind="password", extra=' autocomplete="off"')
+        + '</details>'
         + '<div class="consent"' + (' data-invalid="true"' if field == "consent" else "")
         + '><input id="consent" name="consent" type="checkbox" value="yes" required>'
         '<label for="consent">Share subsequent visible prompts and final responses in this session with this '

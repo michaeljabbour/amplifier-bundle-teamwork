@@ -1,5 +1,4 @@
 """Focused native tool/enrollment tests; no provider or external service calls."""
-import asyncio
 import io
 import json
 import re
@@ -91,12 +90,24 @@ class Response:
     def __exit__(self, *args): pass
 
 
+def validation_probe(request):
+    if request.full_url.endswith('/context'):
+        status, code, message = 404, 'session_not_found', 'Session not found'
+    elif request.full_url.endswith('/publish'):
+        status, code, message = 422, 'invalid_request', 'Supply 1–20 operations'
+    else:
+        return
+    payload = json.dumps({'error': {'code': code, 'message': message}}).encode()
+    raise urllib.error.HTTPError(request.full_url, status, 'Fixture validation', {}, io.BytesIO(payload))
+
+
 class EnrollmentTests(unittest.TestCase):
     def test_project_scoped_private_enrollment_and_reuse(self):
         requests = []
         class Opener:
             def open(self, request, **kwargs):
                 requests.append(request)
+                validation_probe(request)
                 if request.full_url.endswith('/api/login'):
                     return Response({}, {'Set-Cookie': 'fixture=cookie; HttpOnly'})
                 return Response({'token': 'harness-fixture', 'id': 'harness-id'})
@@ -110,13 +121,13 @@ class EnrollmentTests(unittest.TestCase):
             self.assertEqual(json.loads(requests[1].data)['scopes'], ['context:read', 'session:write', 'shared:write'])
             self.assertTrue(all(r.get_header('X-teamwork-project') == 'selected' for r in requests))
             self.assertEqual(connect({'project': 'selected', 'consent': 'yes'}, BASE, Path(home), origin=ORIGIN), (path, project))
-            self.assertEqual(len(requests), 2)
+            self.assertEqual(len(requests), 4)
             for bad in ({'project': 'selected'}, {'consent': 'yes'}):
                 with self.assertRaises(ValueError): connect(bad, BASE, Path(home), origin=ORIGIN)
 
     def test_failed_enrollment_removes_reserved_file(self):
         with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', side_effect=OSError('fixture')):
-            with self.assertRaises(OSError): connect(FORM, BASE, Path(home), origin=ORIGIN)
+            with self.assertRaises(ConsentError): connect(FORM, BASE, Path(home), origin=ORIGIN)
             self.assertEqual(list(Path(home).rglob('connection.json')), [])
 
     def test_failed_write_revokes_issued_credential(self):
@@ -198,7 +209,7 @@ class SSOEnrollmentTests(unittest.TestCase):
             def open(self, request, **kwargs):
                 if request.full_url.endswith('/api/config'):
                     return Response({'api_app_id': 'fixture-app-id'})
-                error_body = json.dumps({'projects': ['proj-a', 'proj-b'], 'reason': 'ambiguous_repository'}).encode()
+                error_body = json.dumps({'error': {'code': 'choose_project', 'choices': [{'id': 'proj-a'}, {'id': 'proj-b'}]}}).encode()
                 raise urllib.error.HTTPError(request.full_url, 409, 'Conflict', {}, io.BytesIO(error_body))
         with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', return_value=Opener()):
             with self.assertRaises(ConsentError) as raised:
@@ -245,6 +256,7 @@ class SSOEnrollmentTests(unittest.TestCase):
             revoked = []
             class Opener:
                 def open(self, request, **kwargs):
+                    validation_probe(request)
                     if request.full_url.endswith('/api/config'):
                         return Response({'api_app_id': 'fixture-app-id'})
                     if request.full_url.endswith('/api/harnesses/revoke'):
@@ -297,7 +309,7 @@ class PortalCredentialTests(unittest.TestCase):
         class Opener:
             def open(self, request, **kwargs):
                 requests.append(request)
-                return Response({'stored': True})
+                validation_probe(request)
         with tempfile.TemporaryDirectory() as home, \
              patch('urllib.request.build_opener', return_value=Opener()), \
              patch('amplifier_module_tool_teamwork.entra.available', side_effect=AssertionError('entra touched')), \
@@ -312,10 +324,12 @@ class PortalCredentialTests(unittest.TestCase):
             self.assertIsNone(saved['harness_id'])
             self.assertEqual(saved['repository_url'], 'https://github.com/owner/repo')
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
-        self.assertEqual(len(requests), 1)
-        self.assertTrue(requests[0].full_url.endswith('/api/v1/projects/portal-project/publish'))
+        self.assertEqual(len(requests), 2)
+        self.assertTrue(requests[0].full_url.endswith('/api/v1/projects/portal-project/context'))
+        self.assertTrue(requests[1].full_url.endswith('/api/v1/projects/portal-project/publish'))
         self.assertEqual(requests[0].get_header('Authorization'), 'Bearer portal-token')
-        self.assertEqual(json.loads(requests[0].data), {'operations': []})
+        self.assertEqual(json.loads(requests[0].data), {})
+        self.assertEqual(json.loads(requests[1].data), {'operations': []})
         self.assertFalse(any(r.full_url.endswith('/api/login') for r in requests))
 
     def test_rejected_credential_is_a_retryable_form_error_and_writes_nothing(self):
@@ -333,7 +347,7 @@ class PortalCredentialTests(unittest.TestCase):
         class Opener:
             def open(self, request, **kwargs):
                 requests.append(request)
-                return Response({'stored': True})
+                validation_probe(request)
         with tempfile.TemporaryDirectory() as home, \
              patch('urllib.request.build_opener', return_value=Opener()), \
              patch('amplifier_module_tool_teamwork.entra.available', side_effect=AssertionError('entra touched')):
@@ -364,25 +378,19 @@ class PortalCredentialTests(unittest.TestCase):
             self.assertIn('delete', raised.exception.hint.lower())
             self.assertEqual(json.loads(saved_path.read_text())['token'], 'existing-token')
 
-    def test_valid_credential_returns_422_from_the_real_endpoint_and_is_verified(self):
-        """Empirically confirmed against the live web origin: a valid token
-        scoped to the requested project returns 422 invalid_request ("Supply
-        1-20 operations") for a zero-operation batch -- not 2xx. An invalid
-        token returns 401 regardless of project; a valid token against the
-        WRONG project returns 404. This is the exact shape the service
-        returned; it must be treated as verified, not merely tolerated."""
+    def test_valid_credential_returns_both_exact_validation_envelopes(self):
+        """Deliberate missing-session and empty-publish failures prove both scopes."""
         requests = []
         class Opener:
             def open(self, request, **kwargs):
                 requests.append(request)
-                body = b'{"error": {"code": "invalid_request", "message": "Supply 1\xe2\x80\x9320 operations"}}'
-                raise urllib.error.HTTPError(request.full_url, 422, 'Unprocessable Entity', {}, io.BytesIO(body))
+                validation_probe(request)
         with tempfile.TemporaryDirectory() as home, patch('urllib.request.build_opener', return_value=Opener()):
             path, project = connect(
                 {'project': 'portal-project', 'credential': 'portal-token', 'consent': 'yes'}, BASE, Path(home))
             self.assertEqual(project, 'portal-project')
             self.assertEqual(json.loads(path.read_text())['token'], 'portal-token')
-        self.assertEqual(len(requests), 1)
+        self.assertEqual(len(requests), 2)
 
     def test_credential_verification_5xx_is_not_treated_as_verified_and_writes_nothing(self):
         class Opener:
@@ -502,7 +510,7 @@ class BrowserTests(unittest.TestCase):
             status, body = self.post(url, good, {'Origin': origin})
             self.assertEqual(status, 200)
             self.assertNotIn(FORM['code'], body)
-        def enroll(form, base, home, repository=None, origin=None):
+        def enroll(form, base, home, repository=None, origin=None, attempt=None):
             seen.append(form); return Path('/private/fixture.json'), 'selected'
         with patch('amplifier_module_tool_teamwork.connect', side_effect=enroll):
             result = self.drive(act)
@@ -520,7 +528,7 @@ class BrowserTests(unittest.TestCase):
             with urllib.request.urlopen(url) as response: page = response.read().decode()
             self.assertEqual(self.post(url, dict(FORM, csrf=self.token(page)),
                                        {'Origin': origin, 'Sec-Fetch-Site': 'same-origin'})[0], 200)
-        def enroll(form, base, home, repository=None, origin=None):
+        def enroll(form, base, home, repository=None, origin=None, attempt=None):
             seen.append(origin); return Path('/private/fixture.json'), 'selected'
         with patch('amplifier_module_tool_teamwork.connect', side_effect=enroll):
             self.drive(act, origin='https://web.example.invalid')
@@ -533,7 +541,7 @@ class BrowserTests(unittest.TestCase):
             with urllib.request.urlopen(url) as response: page = response.read().decode()
             self.assertEqual(self.post(url, dict(FORM, csrf=self.token(page)),
                                        {'Origin': origin, 'Sec-Fetch-Site': 'same-origin'})[0], 200)
-        def enroll(form, base, home, repository=None, origin=None):
+        def enroll(form, base, home, repository=None, origin=None, attempt=None):
             seen.append(origin); return Path('/private/fixture.json'), 'selected'
         with patch('amplifier_module_tool_teamwork.connect', side_effect=enroll):
             self.drive(act)
@@ -547,7 +555,7 @@ class BrowserTests(unittest.TestCase):
             status, _ = self.post(url, dict(FORM, csrf=self.token(page)),
                                   {'Origin': 'null', 'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'navigate'})
             self.assertEqual(status, 200)
-        def enroll(form, base, home, repository=None, origin=None):
+        def enroll(form, base, home, repository=None, origin=None, attempt=None):
             seen.append(form); return Path('/private/fixture.json'), 'selected'
         with patch('amplifier_module_tool_teamwork.connect', side_effect=enroll):
             self.drive(act)
@@ -567,7 +575,7 @@ class BrowserTests(unittest.TestCase):
             self.assertIn('type="password"', body)
             status, body = self.post(url, dict(FORM, csrf=self.token(body)), {'Origin': origin})
             self.assertEqual(status, 200)
-        def enroll(form, base, home, repository=None, origin=None):
+        def enroll(form, base, home, repository=None, origin=None, attempt=None):
             attempts.append(form['project'])
             if form['project'] == 'rejected':
                 raise ConsentError('Fixture reason', 'project', 'Fixture hint')
@@ -585,7 +593,7 @@ class BrowserTests(unittest.TestCase):
             for secret in ('service-detail-leak', 'session=cookievalue', FORM['code']):
                 self.assertNotIn(secret, body)
             self.assertIn('type="password"', body)
-        def enroll(form, base, home, repository=None, origin=None):
+        def enroll(form, base, home, repository=None, origin=None, attempt=None):
             raise RuntimeError('service-detail-leak session=cookievalue')
         with patch('amplifier_module_tool_teamwork.connect', side_effect=enroll):
             result = self.drive(act, timeout=1)
