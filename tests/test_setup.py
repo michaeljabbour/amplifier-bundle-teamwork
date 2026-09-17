@@ -1,4 +1,5 @@
 import json
+import io
 import os
 from pathlib import Path
 import sys
@@ -107,6 +108,24 @@ class ColdServiceTests(unittest.TestCase):
 
 
 class SetupTests(unittest.TestCase):
+    def test_discovered_project_is_used_and_reported(self):
+        import setup_teamwork
+        with tempfile.TemporaryDirectory() as folder:
+            output=io.StringIO()
+            connection=Path(folder)/'connection.json'
+            overlay=Path(folder)/'overlay.yaml'
+            with patch.object(sys,'argv',['setup_teamwork.py','--bundle','fixture',
+                    '--connection-file',str(connection),'--output',str(overlay)]), \
+                    patch.object(setup_teamwork,'discover_project',return_value='discovered-project'), \
+                    patch('builtins.input',return_value='Fixture'), \
+                    patch('setup_teamwork.getpass.getpass',return_value='fixture-code'), \
+                    patch.object(setup_teamwork,'enroll_and_save',return_value=(connection,overlay)) as enroll, \
+                    patch('sys.stdout',output):
+                setup_teamwork.main()
+            self.assertEqual(enroll.call_args.args[2],'discovered-project')
+            self.assertIn('Enrolled project: discovered-project',output.getvalue())
+            self.assertNotIn('Enrolled project: None',output.getvalue())
+
     def test_existing_bundle_is_file_uri_and_overlay_keeps_secret_out(self):
         with tempfile.TemporaryDirectory(prefix='bundle with spaces ') as directory:
             base = Path(directory) / 'bundle.md'
@@ -164,7 +183,9 @@ class SetupTests(unittest.TestCase):
                 ],
             ), patch("builtins.input", return_value="Fixture member"), patch(
                 "setup_teamwork.getpass.getpass", return_value="fixture-member-code"
-            ), patch.object(setup_teamwork, "enroll_and_save", side_effect=enroll):
+            ), patch.object(setup_teamwork, "enroll_and_save", side_effect=enroll), patch.object(
+                setup_teamwork, "discover_project", side_effect=AssertionError("Explicit project must skip discovery")
+            ):
                 setup_teamwork.main()
 
             self.assertEqual(captured["connection"], expected_connection.resolve())

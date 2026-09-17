@@ -227,7 +227,7 @@ def main():
             status = error.code; error.close(); raise SystemExit(f"Enrollment HTTP {status}; check login and project membership") from None
     path, output = enroll_and_save(post, base, project, args.bundle, args.label, name, token, path, output)
     print("Created opt-in overlay:", output)
-    print("Enrolled project:", args.project)
+    print("Enrolled project:", project)
     print("Start a NEW session: amplifier run --bundle " + output.as_uri())
     print("Visible prompts/responses will be shared to this project. No active session or default bundle changed.")
 
