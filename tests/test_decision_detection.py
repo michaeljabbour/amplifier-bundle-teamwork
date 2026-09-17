@@ -110,6 +110,15 @@ def build(test, decision_detection=True):
     return hook, client, journal
 
 
+def outcomes(hook):
+    """Read the journal-only detection_outcome rows. Deliberately read through
+    sqlite rather than a log: nothing about this reaches a user."""
+    with hook.journal.connect() as conn:
+        return [{"kind": k, "outcome": o, "tally_size": t, "link_count": l}
+                for k, o, t, l in conn.execute(
+                    "SELECT kind, outcome, tally_size, link_count FROM detection_outcome ORDER BY rowid")]
+
+
 def insight_ops(client):
     return [op for endpoint, body, _ in client.requests if endpoint == "publish"
             for op in body["operations"] if op["op"] == "insight.upsert"]
@@ -548,3 +557,54 @@ class ToolPreWindowConstruction(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DetectionOutcomeIsObservableInTheJournalOnly(unittest.IsolatedAsyncioTestCase):
+    """Every detector path used to end in the SAME observable state -- a
+    watermark moved and no record -- whether it was suppressed, judged SKIP,
+    refused, or written with an unknown outcome. That ambiguity cost four
+    failed verification runs against a live DTU. These assert the paths are
+    now distinguishable, and that nothing about it reaches a user.
+    """
+
+    async def test_a_skip_verdict_and_a_deliberate_suppression_are_distinguishable(self):
+        hook, client, _journal = build(self)
+        hook.state["decision_turns"] = [{"turn_index": 1, "user_prompt": "u", "agent_responses": [{"text": "a"}]}]
+        with patch.object(decision_judge, "judge_window",
+                          AsyncMock(return_value={"record": False, "available": True})):
+            task = hook.detect_decision()
+            if task:
+                await task
+        rows = outcomes(hook)
+        self.assertEqual([r["outcome"] for r in rows], ["skip_verdict"])
+
+        hook2, _client2, _j2 = build(self)
+        hook2.state["decision_turns"] = [{"turn_index": 1, "user_prompt": "u", "agent_responses": [{"text": "a"}]}]
+        hook2.state["deliberate_record_turn"] = 1
+        with patch.object(decision_judge, "judge_window", AsyncMock()) as judge:
+            task = hook2.detect_decision()
+            if task:
+                await task
+        judge.assert_not_called()
+        self.assertEqual([r["outcome"] for r in outcomes(hook2)], ["skipped_deliberate"])
+
+    async def test_the_tally_size_the_judge_actually_saw_is_recorded(self):
+        hook, client, _journal = build(self)
+        hook.state["decision_turns"] = [{"turn_index": 1, "user_prompt": "u", "agent_responses": [{"text": "a"}]}]
+        hook.state["cache"] = {
+            "insight:aaa": {"record": {"record_type": "insight", "id": "aaa", "version": 1,
+                                       "content": {"claim": "already known"}}, "delivery_id": "d"},
+        }
+        with patch.object(decision_judge, "judge_window",
+                          AsyncMock(return_value={"record": False, "available": True})):
+            task = hook.detect_decision()
+            if task:
+                await task
+        rows = outcomes(hook)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["tally_size"], 1)
+
+    def test_recording_an_outcome_can_never_break_detection(self):
+        hook, _client, _j = build(self)
+        hook.journal.path = "/nonexistent/dir/does-not-exist.sqlite3"
+        hook.journal.record_detection_outcome("s", "decision", "recorded", 0, 0)

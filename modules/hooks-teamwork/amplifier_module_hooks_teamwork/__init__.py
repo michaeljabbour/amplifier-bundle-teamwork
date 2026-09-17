@@ -277,6 +277,16 @@ class Journal:
             # tables here rather than opening a second store.
             conn.execute("CREATE TABLE IF NOT EXISTS decision_watermark (session TEXT PRIMARY KEY, turn_index INTEGER NOT NULL)")
             conn.execute("CREATE TABLE IF NOT EXISTS decision_fingerprint (session TEXT NOT NULL, fingerprint TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (session, fingerprint))")
+            # Why a table and not a log line: every detector path used to end in
+            # the SAME observable state -- a watermark moved and no record --
+            # whether it was suppressed, judged SKIP, refused, or written with an
+            # unknown outcome. That ambiguity cost four failed verification runs.
+            # This disambiguates them WITHOUT adding anything a user ever sees:
+            # the journal is a private 0600 file, read only when someone is
+            # debugging. Deliberately not a log line, for exactly that reason.
+            conn.execute("CREATE TABLE IF NOT EXISTS detection_outcome ("
+                         "session TEXT NOT NULL, kind TEXT NOT NULL, outcome TEXT NOT NULL, "
+                         "tally_size INTEGER, link_count INTEGER, created_at TEXT NOT NULL)")
         os.chmod(path, 0o600)
 
     def connect(self): return closing(sqlite3.connect(self.path, timeout=10))
@@ -320,6 +330,21 @@ class Journal:
                 "SELECT 1 FROM decision_fingerprint WHERE session=? AND fingerprint=?",
                 (sid, fingerprint)).fetchone()
         return row is not None
+
+    def record_detection_outcome(self, sid, kind, outcome, tally_size=None, link_count=None):
+        """Append what a detector actually did. Journal-only and never raises:
+        observability must not be able to break the thing it observes, and a
+        failure to record an outcome is strictly less bad than a failed
+        detection. Nothing here is logged or surfaced -- see the table's
+        comment in __init__ for why that is deliberate.
+        """
+        try:
+            with self.connect() as conn, conn:
+                conn.execute(
+                    "INSERT INTO detection_outcome(session, kind, outcome, tally_size, link_count, created_at) "
+                    "VALUES (?,?,?,?,?,?)", (sid, kind, outcome, tally_size, link_count, now()))
+        except Exception:
+            pass
 
     def record_decision_fingerprint(self, sid, fingerprint):
         with self.connect() as conn, conn:
@@ -1202,6 +1227,7 @@ class TeamworkHook:
                 # permanent (no retired state, no forward pointer --
                 # teamwork-s7d) and text fingerprinting cannot catch a paraphrase.
                 logger.info("Teamwork decision detection skipped: this window was already recorded deliberately")
+                self.journal.record_detection_outcome(self.sid, "decision", "skipped_deliberate")
                 self.journal.advance_decision_watermark(self.sid, upto)
                 self.state["decision_turns"] = [t for t in self.state.get("decision_turns", []) if t["turn_index"] > upto]
                 self.journal.save(self.sid, self.state)
@@ -1241,6 +1267,7 @@ class TeamworkHook:
         if self.state.get("deliberate_record_turn", 0) > watermark:
             # Same rule as detect_decision -- see its comment.
             logger.info("Teamwork lesson detection skipped: this window was already recorded deliberately")
+            self.journal.record_detection_outcome(self.sid, "lesson", "skipped_deliberate")
             self.journal.advance_lesson_watermark(self.sid, upto)
             self.state["lesson_turns"] = [t for t in self.state.get("lesson_turns", []) if t["turn_index"] > upto]
             self.journal.save(self.sid, self.state)
@@ -1272,6 +1299,7 @@ class TeamworkHook:
             seen=lambda fp: self.journal.decision_seen(self.sid, fp),
             mark_seen=lambda fp: self.journal.record_decision_fingerprint(self.sid, fp),
             log_label="decision",
+            tally_size=len(window.get("tally") or []) if isinstance(window, dict) else None,
         )
 
     async def _judge_and_record_lesson(self, window, considered_upto):
@@ -1290,9 +1318,10 @@ class TeamworkHook:
             seen=lambda fp: self.journal.lesson_seen(self.sid, fp),
             mark_seen=lambda fp: self.journal.record_lesson_fingerprint(self.sid, fp),
             log_label="lesson",
+            tally_size=len(window.get("tally") or []) if isinstance(window, dict) else None,
         )
 
-    async def _record_verdict(self, verdict, considered_upto, *, uri_scheme, seen, mark_seen, log_label):
+    async def _record_verdict(self, verdict, considered_upto, *, uri_scheme, seen, mark_seen, log_label, tally_size=None):
         """Shared by both detectors: write a RECORD verdict through this
         session's OWN RecordInsightTool -- never the judge session's, so
         source_session_id stays this session's (see decision_judge.py's
@@ -1312,10 +1341,14 @@ class TeamworkHook:
         dropped, never allowed to sink the whole write.
         """
         if not verdict.get("record"):
+            self.journal.record_detection_outcome(
+                self.sid, log_label,
+                "unavailable" if verdict.get("available") is False else "skip_verdict", tally_size)
             return
         claim = (verdict.get("claim") or "").strip()
         if not claim:
             logger.warning("Teamwork %s judge said record=true with no claim; nothing recorded", log_label)
+            self.journal.record_detection_outcome(self.sid, log_label, "no_claim", tally_size)
             return
         # Precision over recall (docs/scenarios/08b for decisions, 06/06b for
         # lessons): a claim is fingerprinted by its own normalised text, not
@@ -1326,11 +1359,13 @@ class TeamworkHook:
         fingerprint = sha(" ".join(claim.lower().split()))
         if seen(fingerprint):
             logger.info("Teamwork %s judge: duplicate skipped (already recorded)", log_label)
+            self.journal.record_detection_outcome(self.sid, log_label, "duplicate_fingerprint", tally_size)
             return
         basis, confidence, limitations = verdict.get("basis"), verdict.get("confidence"), verdict.get("what_it_does_not_establish")
         if basis not in ("observation", "inference") or confidence not in ("low", "medium", "high") \
                 or not isinstance(limitations, str) or not limitations.strip():
             logger.warning("Teamwork %s judge returned an unusable verdict shape; nothing recorded", log_label)
+            self.journal.record_detection_outcome(self.sid, log_label, "unusable_shape", tally_size)
             return
         evidence = [{
             "kind": "external",
@@ -1357,6 +1392,7 @@ class TeamworkHook:
             if not isinstance(link_version, int) or isinstance(link_version, bool):
                 continue
             evidence.append({"kind": "record", "record_type": link_type, "record_id": link_id, "version": link_version})
+        links = sum(1 for e in evidence if e.get("kind") == "record")
         try:
             result = await RecordInsightTool(self).execute({
                 "claim": claim, "basis": basis, "confidence": confidence,
@@ -1365,6 +1401,7 @@ class TeamworkHook:
             })
         except Exception:
             logger.warning("Teamwork %s judge: recording the verdict failed", log_label, exc_info=True)
+            self.journal.record_detection_outcome(self.sid, log_label, "write_raised", tally_size, links)
             return
         error = result.error or {}
         if not result.success and error.get("outcome") != "unknown":
@@ -1373,6 +1410,7 @@ class TeamworkHook:
             # try again.
             logger.warning("Teamwork %s judge: RecordInsightTool refused the verdict: %s",
                             log_label, error.get("message"))
+            self.journal.record_detection_outcome(self.sid, log_label, "refused", tally_size, links)
             return
         if not result.success:
             # acceptance_unknown -- the third state this project refuses to
@@ -1389,6 +1427,9 @@ class TeamworkHook:
             logger.warning("Teamwork %s judge: recording outcome unknown for attempted insight %s; "
                            "not retrying, because a retry would duplicate. Read it back to confirm.",
                            log_label, error.get("attempted_record_id"))
+        self.journal.record_detection_outcome(
+            self.sid, log_label, "recorded" if result.success else "acceptance_unknown",
+            tally_size, links)
         mark_seen(fingerprint)
 
 
