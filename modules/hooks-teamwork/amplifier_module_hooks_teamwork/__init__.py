@@ -1136,8 +1136,11 @@ class TeamworkHook:
                 target = tool_input.get("agent")
                 call = {"name": tool_name, "target": target} if isinstance(target, str) and target.strip() \
                     else {"name": tool_name}
-                async with self.lock:
-                    self.detect_decision(tool_calls=[call])
+                # NOT under the lock and NOT touching SQLite: see
+                # detect_decision's docstring. The hot path must stay a few
+                # dict lookups; every journal read and write happens inside
+                # the spawned task.
+                self.detect_decision(tool_calls=[call])
         return hook_result()
 
     def detect_decision(self, tool_calls=None):
@@ -1161,21 +1164,47 @@ class TeamworkHook:
         """
         if not self.decision_detection:
             return None
-        watermark = self.journal.decision_watermark(self.sid)
-        turns = [t for t in self.state.get("decision_turns", []) if t["turn_index"] > watermark]
-        if not turns and not tool_calls:
+        # HOT PATH ENDS HERE. The idle check below is in-memory only -- no
+        # lock, no SQLite -- so a session that triggers nothing pays a dict
+        # lookup. Everything after this line runs inside the spawned task.
+        if not self.state.get("decision_turns") and not tool_calls:
             return None
-        upto = max([t["turn_index"] for t in turns], default=watermark)
-        self.journal.advance_decision_watermark(self.sid, upto)
-        self.state["decision_turns"] = [t for t in self.state.get("decision_turns", []) if t["turn_index"] > upto]
-        self.journal.save(self.sid, self.state)
-        window = decision_judge.build_window_payload(
-            [{"user_prompt": t["user_prompt"], "agent_responses": t["agent_responses"]} for t in turns],
-            tool_calls)
-        task = asyncio.create_task(self._judge_and_record(window, upto))
+        task = asyncio.create_task(self._detect_decision_body(tool_calls))
         self._decision_tasks.add(task)
         task.add_done_callback(self._decision_tasks.discard)
         return task
+
+    async def _detect_decision_body(self, tool_calls):
+        """The whole of detection, off the turn's critical path.
+
+        The lock is taken HERE rather than by the caller: serialisation is
+        what the lock is for, and holding it on the hot path bought nothing
+        except a stalled turn. Two triggers racing are still serialised --
+        just not at the cost of the work that triggered them.
+        """
+        async with self.lock:
+            watermark = self.journal.decision_watermark(self.sid)
+            turns = [t for t in self.state.get("decision_turns", []) if t["turn_index"] > watermark]
+            if not turns and not tool_calls:
+                return
+            upto = max([t["turn_index"] for t in turns], default=watermark)
+            if self.state.get("deliberate_record_turn", 0) > watermark:
+                # The session already recorded inside this window, on purpose.
+                # A second record of the same thing in different words is
+                # permanent (no retired state, no forward pointer --
+                # teamwork-s7d) and text fingerprinting cannot catch a paraphrase.
+                logger.info("Teamwork decision detection skipped: this window was already recorded deliberately")
+                self.journal.advance_decision_watermark(self.sid, upto)
+                self.state["decision_turns"] = [t for t in self.state.get("decision_turns", []) if t["turn_index"] > upto]
+                self.journal.save(self.sid, self.state)
+                return
+            self.journal.advance_decision_watermark(self.sid, upto)
+            self.state["decision_turns"] = [t for t in self.state.get("decision_turns", []) if t["turn_index"] > upto]
+            self.journal.save(self.sid, self.state)
+            window = decision_judge.build_window_payload(
+                [{"user_prompt": t["user_prompt"], "agent_responses": t["agent_responses"]} for t in turns],
+                tool_calls)
+        await self._judge_and_record(window, upto)
 
     def detect_lesson(self):
         """Fire-and-forget: examine this session's turns for a lesson worth
@@ -1200,6 +1229,13 @@ class TeamworkHook:
         if not turns:
             return None
         upto = max(t["turn_index"] for t in turns)
+        if self.state.get("deliberate_record_turn", 0) > watermark:
+            # Same rule as detect_decision -- see its comment.
+            logger.info("Teamwork lesson detection skipped: this window was already recorded deliberately")
+            self.journal.advance_lesson_watermark(self.sid, upto)
+            self.state["lesson_turns"] = [t for t in self.state.get("lesson_turns", []) if t["turn_index"] > upto]
+            self.journal.save(self.sid, self.state)
+            return None
         self.journal.advance_lesson_watermark(self.sid, upto)
         self.state["lesson_turns"] = [t for t in self.state.get("lesson_turns", []) if t["turn_index"] > upto]
         self.journal.save(self.sid, self.state)
@@ -1913,6 +1949,18 @@ class RecordInsightTool:
                 and isinstance(item.get("version"), int) and not isinstance(item["version"], bool)
                 and item["version"] >= 1 for item in results):
             return unknown_outcome()
+        # A DELIBERATE record suppresses the automatic one for this window.
+        # Proven necessary by a DTU run: the session recorded a lesson through
+        # this tool AND a detector recorded the same lesson independently, in
+        # different words -- so claim-text fingerprinting could not catch it.
+        # The detectors exist to catch what a session did NOT record; once it
+        # has recorded, their job for that window is done. Stamped on state so
+        # it survives the journal round trip the detectors read from.
+        self.hook.state["deliberate_record_turn"] = max(
+            self.hook.state.get("deliberate_record_turn", 0),
+            self.hook.state.get("turn_index", 0),
+        )
+        self.hook.journal.save(self.hook.sid, self.hook.state)
         return ToolResult(success=True, output={
             "recorded": record_id, "title": title or claim[:100],
             "note": "Visible to the project as a new insight. This tool does not edit earlier records."})
