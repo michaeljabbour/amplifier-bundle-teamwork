@@ -311,6 +311,12 @@ def build_tally(cache, *, max_entries=MAX_TALLY_ENTRIES, max_chars=MAX_TALLY_CLA
         if not isinstance(version, int) or isinstance(version, bool):
             continue
         content = record.get("content") if isinstance(record.get("content"), dict) else {}
+        # The tally has no status field. Do not strip a correction's status and
+        # present an unaccepted or retired claim as standing project knowledge.
+        if (content.get("knowledge_state") in ("proposed", "superseded", "rejected")
+                or content.get("review_state") == "rejected"
+                or (content.get("supersedes") and content.get("review_state") != "accepted")):
+            continue
         claim = next(
             (content[key] for key in _TALLY_CLAIM_FIELDS
              if isinstance(content.get(key), str) and content[key].strip()),

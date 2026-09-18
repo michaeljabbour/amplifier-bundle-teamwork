@@ -31,9 +31,9 @@ credential than anything needs.
 Records the new position as its own record, **citing the original at the version it was
 when cited**, saying plainly what it replaces and why the evidence forces it.
 
-Then — because nothing links the old record forward to the new one — says so: names the
-superseded record explicitly in the new one, rather than assuming a reader who starts at
-the old one will ever arrive.
+Proposes it for the original author's or a project maintainer's review. Acceptance
+links the original forward to the replacement; until then it is a proposed correction,
+not a silently changed project position.
 
 ## What a bad teammate does
 
@@ -95,25 +95,25 @@ reading mine?** If not, there is nothing to replace.
 Written in [07b](07b-the-record-that-is-right-and-you-merely-know-more.md).
 Same pairing logic as `01`/`02`, `03`/`03b` and `06`/`06b`.
 
-## Open questions
+## Mechanism and open questions
 
-- **The mechanism for the good move does not exist yet, and neither does the guard against
-  the bad one.** Only the author or a maintainer may edit an idea or insight
-  (`core.py:610`), so "edit the original in place" is already refused for most
-  participants — but a maintainer can still do it, and nothing stops them. Meanwhile
-  there is no forward pointer and no state meaning *retired*: `superseded` exists for
-  `plan` (`core.py:408`), for routing and for interviews, never for a knowledge record.
-  Version history *is* preserved (`knowledge.py`, and an evidence reference of
-  `kind: "record"` cites a record at a specific version, `core.py:308-311`), so the
-  backward link is real. Only the forward one is missing.
-- **Can a reviewer disagree at all?** `review_state` accepts only `unreviewed` or
-  `review_requested`, because `core.py:620` says in as many words that *"Review results
-  are not supported yet"*. A record can be sent for review and the reviewer cannot record
-  what they concluded. That makes "somebody else refines it" a one-way street today.
-- **May a harness supersede a *person's* recorded position?** Everything above is written
-  machine-to-machine. A session overturning a person's decision on evidence is the same
-  act and does not feel like it, and nothing in the project says whether it is allowed,
-  or whether it becomes a question to that person instead — which would make this
-  scenario collapse into `01`.
-- **Who adjudicates two live contradicting records** in the window before anybody
-  supersedes anything? Today: nobody, and the excerpt would deliver both.
+The versioned correction API adds the missing forward link and a human review
+decision. `teamwork_record_insight` proposes a new record with `supersedes` and
+`correction_reason`; the original remains intact. Its author or a signed-in project
+maintainer can accept or reject it through Knowledge. A harness cannot make that
+review decision. Acceptance retires the exact source version, links it forward,
+and freezes both reviewed records against silent rewrites. History retains their
+text, evidence and attribution. Stale proposals fail acceptance on a version
+conflict rather than rebasing without review.
+
+Proposed, rejected and superseded states remain explicit in context, including
+truncated excerpts. Thus the API resolves the earlier absence of a retirement
+pointer and recorded disagreement; it does not establish that models choose good
+corrections, that reviewers judge accurately, or that later sessions benefit.
+
+- A participant may propose a correction to another person's record, but only the
+  original author or a project maintainer may accept it. Proposal is not authority.
+- Competing proposals may coexist while awaiting review. Only one can retire a
+  given source version. Timely adjudication still depends on a reviewer.
+- Pair this case with `07b`; additional detail that changes no decision is not a
+  useful correction. The mechanism alone cannot prove that discrimination.

@@ -1936,6 +1936,127 @@ class RecordInsight(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(op["data"]["source_session_id"], hook.sid)
         self.assertNotEqual(op["data"]["source_session_id"], "somebody-elses-session")
 
+    async def test_correction_adds_a_versioned_review_proposal_without_editing_source(self):
+        hook, client = self.build()
+        source = {"record_type": "insight", "record_id": "original", "version": 3}
+        result = await RecordInsightTool(hook).execute(self.valid_input(
+            supersedes=source, correction_reason="New relay measurements change the retry limit.",
+            review_state="accepted", source_session_id="forged"))
+        self.assertTrue(result.success, result.error)
+        ops = [op for endpoint, body, _ in client.requests if endpoint == "publish"
+               for op in body["operations"]]
+        self.assertEqual(len(ops), 1)
+        self.assertNotEqual(ops[0]["id"], source["record_id"])
+        self.assertEqual(ops[0]["expected_version"], 0)
+        data = ops[0]["data"]
+        self.assertEqual(data["supersedes"], source)
+        self.assertIn({"kind": "record", **source}, data["evidence_refs"])
+        self.assertEqual(data["review_state"], "review_requested")
+        self.assertEqual(data["source_session_id"], hook.sid)
+        self.assertIn("original remains current", result.output["note"])
+
+    async def test_malformed_or_incomplete_correction_never_publishes(self):
+        source = {"record_type": "insight", "record_id": "original", "version": 3}
+        cases = [
+            {"supersedes": source}, {"correction_reason": "changed"},
+            {"supersedes": None, "correction_reason": "changed"},
+            *[{"supersedes": source | {"version": version}, "correction_reason": "changed"}
+              for version in (0, -1, True, "3", 3.0)],
+            {"supersedes": source | {"record_type": "work"}, "correction_reason": "changed"},
+            {"supersedes": source | {"record_id": " "}, "correction_reason": "changed"},
+            {"supersedes": source | {"project_id": "other"}, "correction_reason": "changed"},
+            *[{"supersedes": source, "correction_reason": reason} for reason in (None, " ", "x" * 2001)],
+        ]
+        for payload in cases:
+            with self.subTest(payload=payload):
+                hook, client = self.build()
+                result = await RecordInsightTool(hook).execute(self.valid_input(**payload))
+                self.assertFalse(result.success)
+                self.assertEqual(client.requests, [])
+
+    async def test_automatic_detector_cannot_propose_a_correction(self):
+        hook, client = self.build()
+        result = await RecordInsightTool(hook, automatic=True).execute(self.valid_input(
+            supersedes={"record_type": "insight", "record_id": "original", "version": 1},
+            correction_reason="Changed decision"))
+        self.assertFalse(result.success)
+        self.assertIn("deliberate", result.error["message"])
+        self.assertEqual(client.requests, [])
+
+    async def test_correction_conflict_requires_rereading_instead_of_automatic_retry(self):
+        hook, client = self.build(fail_status=409)
+        result = await RecordInsightTool(hook).execute(self.valid_input(
+            supersedes={"record_type": "insight", "record_id": "original", "version": 1},
+            correction_reason="Changed decision"))
+        self.assertFalse(result.success)
+        self.assertIn("retrieve the current record", result.error["message"])
+        self.assertEqual(len(client.requests), 1)
+
+    async def test_correction_metadata_redacts_credential_and_does_not_duplicate_source_ref(self):
+        hook, client = self.build()
+        source = {"record_type": "idea", "record_id": "original", "version": 2}
+        result = await RecordInsightTool(hook).execute(self.valid_input(
+            supersedes=source, correction_reason="Decision changed " + hook.connection["token"],
+            evidence=[{"kind": "record", **source}]))
+        self.assertTrue(result.success)
+        self.assertNotIn(hook.connection["token"], json.dumps(client.requests))
+        data = client.requests[0][1]["operations"][0]["data"]
+        self.assertEqual(data["evidence_refs"], [{"kind": "record", **source}])
+
+    async def test_knowledge_excerpt_keeps_status_and_replacement_before_truncated_claim(self):
+        hook, _ = self.build()
+        for state in ("proposed", "superseded", "rejected"):
+            source = {"record": {"key": "insight:original:2", "id": "original", "version": 2,
+                                 "record_type": "insight", "content": {
+                                     "claim": "old claim " * 500, "knowledge_state": state,
+                                     "superseded_by": {"record_type": "insight", "record_id": "replacement", "version": 2}}}}
+            rendered = hook.part(source)
+            self.assertIn("not current accepted guidance", rendered)
+            self.assertLess(rendered.index(state), rendered.index("old claim"))
+            self.assertIn("superseded_by: insight:replacement at version 2", rendered)
+            self.assertIn("excerpt truncated", rendered)
+
+    async def test_omitted_review_update_evicts_stale_claim_and_retries_snapshot_without_false_ack(self):
+        from amplifier_module_hooks_teamwork.decision_judge import build_tally
+        hook, client = self.build()
+        stale = {"key": "insight:old:1", "id": "old", "version": 1,
+                 "record_type": "insight", "change": "upsert", "content_sha256": "old-hash",
+                 "content": {"claim": "Obsolete guidance", "knowledge_state": "active"}}
+        hook.state["cache"]["insight:old"] = {"record": stale, "delivery_id": "old-delivery"}
+        hook.state["cursor"] = "previous-cursor"
+        omitted = {"key": "insight:old:2", "id": "old", "version": 2, "record_type": "insight",
+                   "change": "upsert", "content_omitted": True,
+                   "knowledge_status": {"knowledge_state": "superseded", "review_state": "unreviewed"}}
+        def page(endpoint, body, key=None):
+            client.requests.append((endpoint, body, key))
+            return {"next_cursor": "new-cursor", "delivery_id": "new-delivery", "has_more": False,
+                    "truncated": True, "items": [omitted]}
+        client.request = page
+        await hook.retrieve()
+        self.assertNotIn("insight:old", hook.state["cache"])
+        text, selected = hook.render()
+        self.assertNotIn("Obsolete guidance", text)
+        self.assertIn("baseline is partial", text)
+        self.assertEqual(selected, [])
+        self.assertEqual(build_tally(hook.state["cache"]), [])
+        self.assertTrue(hook.state["knowledge_refetch"])
+        fresh = stale | {"key": "insight:old:2", "version": 2, "content_sha256": "new-hash",
+                         "content": {"claim": "Obsolete guidance", "knowledge_state": "superseded"}}
+        def snapshot(endpoint, body, key=None):
+            client.requests.append((endpoint, body, key))
+            self.assertIsNone(body["cursor"])
+            return {"next_cursor": "complete-cursor", "delivery_id": "fresh-delivery", "has_more": False,
+                    "truncated": False, "items": [fresh]}
+        client.request = snapshot
+        await hook.retrieve()
+        text, selected = hook.render()
+        self.assertIn("not current accepted guidance", text)
+        self.assertFalse(hook.state["partial"])
+        self.assertEqual(build_tally(hook.state["cache"]), [])
+        self.assertEqual(selected[0]["delivery_id"], "fresh-delivery")
+        self.assertEqual(selected[0]["record"]["content_sha256"], "new-hash")
+        self.assertTrue(all(endpoint == "context" for endpoint, _, _ in client.requests))
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -202,19 +202,31 @@ The refusal is deliberate and is not a validation quirk: a claim nobody can chec
 opinion, and a project filling with unfalsifiable opinions is worse than one with none.
 If you have nothing to cite, you have a hunch — keep working until you have a reason.
 
-**It is deliberate.** Nothing records on your behalf, and being able to record is not a
+**This tool is deliberate.** Separately opted-in decision and lesson detectors can
+record automatically; they cannot propose corrections. Being able to record is not a
 reason to. Most turns produce nothing worth keeping; a session that records something
 every time has stopped discriminating, and the cost lands on every future reader.
 
-**Correcting one.** This tool creates a new insight; it does not expose record editing.
-When a later finding changes an earlier claim, create a correction with a record evidence
-reference to the original, and state what changed. The service also supports versioned
-revisions by an authorized author, but that operation is not exposed by this tool.
+**Correcting one.** First ask whether the new evidence changes what a reader should
+do. More detail alone does not justify another record or a review verdict. (`07b`)
+When the decision changes, retrieve the current source and call this tool with
+`supersedes: {record_type: "idea" | "insight", record_id, version}` plus
+`correction_reason`. Keep the usual claim, evidence, confidence and limitations.
+The tool cites that source version and creates a separate proposal; the original
+remains current until its author or a project maintainer accepts the proposal in
+the signed-in Knowledge view. Automatic detectors cannot propose corrections.
 
-Two limits, named because you will meet them: a superseded record has no way to point
-forward at what replaced it, and a reviewer who is asked for a verdict cannot record one
-(`teamwork-s7d`). So if a record you are correcting has been cited elsewhere, say what it
-replaces **inside the new one** — the link will not be visible from the old.
+Acceptance preserves the old text and adds a forward link to the reviewed
+replacement. Rejection retains the proposal with its rejected status. Neither
+outcome is independent verification of the claim. Reviewed or retired text is
+immutable; later changes use another additive proposal. A version conflict means
+retrieve and reassess, not retry against an invented version. On a service without
+this API, report the unsupported operation rather than pretending a citation
+alone retired the earlier claim. (`07`)
+
+Read knowledge status before relying on a claim. Proposed, rejected and superseded
+records remain evidence of the discussion; they are not the current accepted
+position. Follow the versioned replacement and retain what changed and why.
 
 Derived from scenarios `06` (record the lesson, not the incident) and `07` (replace by
 addition, never by erasure).
@@ -230,7 +242,7 @@ addition, never by erasure).
 | distinguish retrieval from an undelegated decision | `docs/scenarios/04`, `04b` |
 | request a bounded contribution only under existing delegation | `docs/scenarios/05`, `05b` |
 | record what will still be true when the task is forgotten | `docs/scenarios/06` |
-| replace by addition, never by erasure | `docs/scenarios/07` |
+| replace materially changed guidance by addition; leave immaterial detail alone | `docs/scenarios/07`, `07b` |
 
 Enum values and status transitions are enforced by the service; where this file and the
 service disagree, the service is right and this file is a bug.

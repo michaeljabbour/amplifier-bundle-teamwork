@@ -257,6 +257,18 @@ class BuildTallyTests(unittest.TestCase):
         tally = decision_judge.build_tally(cache)
         self.assertEqual([e["record_id"] for e in tally], ["new", "old"])
 
+    def test_pending_rejected_and_retired_claims_do_not_become_standing_tally_knowledge(self):
+        cache = {state: self._source("insight", state, 1, {
+            "claim": "claim " + state, "knowledge_state": state,
+        }) for state in ("active", "proposed", "rejected", "superseded")}
+        cache["pending"] = self._source("insight", "pending", 1, {
+            "claim": "pending correction", "supersedes": {"record_id": "old"},
+            "review_state": "review_requested"})
+        cache["accepted"] = self._source("insight", "accepted", 2, {
+            "claim": "accepted correction", "supersedes": {"record_id": "old"},
+            "review_state": "accepted"})
+        self.assertEqual({e["record_id"] for e in decision_judge.build_tally(cache)}, {"active", "accepted"})
+
     def test_falls_back_to_created_at_when_never_updated(self):
         cache = {
             "insight:a": self._source("insight", "a", 1,
