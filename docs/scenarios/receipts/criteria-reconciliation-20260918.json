@@ -1,0 +1,226 @@
+{
+  "schema_version": 1,
+  "checked_on": "2026-09-18",
+  "scope": "Reconcile the original roadmap criteria with authored rubrics and existing frozen evidence. Documentation only; no new model calls or production actions.",
+  "baseline": {
+    "repository": "michaeljabbour/amplifier-app-teamwork",
+    "commit": "ea8c5585edafe27bf837a2d1954fb588a2312e6a",
+    "path": "docs/roadmap/sources/roadmap-baseline.json",
+    "sha256": "0d9dcdecc40ade32d582dc984a401a21d21985503a107db2e58d665c4b805c31",
+    "inventory_count": 85,
+    "index_base": 0
+  },
+  "bundle_base_commit": "d740b466f3a33c6bc12c1b4822880670d82d8d3a",
+  "scenario_count": 14,
+  "scenario_coverage": [
+    {
+      "scenario": "01",
+      "source": "docs/scenarios/01-ask-the-expert-not-the-owner.md",
+      "source_sha256": "10e7823411ee162222947f16db9bbe6bac97693bc5685057ce93295e6aa06204",
+      "rubric": "evals/01-guidance-contribution/tasks/01-ask-the-expert/grader.yaml",
+      "rubric_sha256": "c819e499ac2c7919083abcc33afe09610daa27aad5a557f728f3ada2a057d9c7"
+    },
+    {
+      "scenario": "02",
+      "source": "docs/scenarios/02-when-the-owner-is-the-expert.md",
+      "source_sha256": "7cd2a220fcf1ddf743b93f40fd7d36e2852aa8df5e3ace66486dcc4729fe4424",
+      "rubric": "evals/01-guidance-contribution/tasks/02-owner-is-the-expert/grader.yaml",
+      "rubric_sha256": "574fc8b05e4cf2ff2a226ee4c8ff99eb83c09cd1ab40749d38f8abaed00d41b1"
+    },
+    {
+      "scenario": "03",
+      "source": "docs/scenarios/03-say-what-changes-what-someone-else-would-do.md",
+      "source_sha256": "1cca9cae426785ba910cc71b177d9be73a29dc44f0dfa003abbc24eefbed3291",
+      "rubric": "docs/scenarios/PAIRED-RUBRIC.md",
+      "rubric_sha256": "1b947167d00e474c638f67ff6bc35cc39b9969aeac2aef032d0c8daa88267d03"
+    },
+    {
+      "scenario": "03b",
+      "source": "docs/scenarios/03b-the-busy-hour-that-nobody-needs-to-hear-about.md",
+      "source_sha256": "155dbb68e76d8db565b6b46d805ff4c5a7047709f810411c505da56133bfe181",
+      "rubric": "docs/scenarios/PAIRED-RUBRIC.md",
+      "rubric_sha256": "1b947167d00e474c638f67ff6bc35cc39b9969aeac2aef032d0c8daa88267d03"
+    },
+    {
+      "scenario": "04",
+      "source": "docs/scenarios/04-ask-the-machine-that-knows.md",
+      "source_sha256": "5ff9f880df870989b9e7e3ec07674118ff6c694691fe2cf932d75a7dc9bd91e5",
+      "rubric": "docs/scenarios/PAIRED-RUBRIC.md",
+      "rubric_sha256": "1b947167d00e474c638f67ff6bc35cc39b9969aeac2aef032d0c8daa88267d03"
+    },
+    {
+      "scenario": "04b",
+      "source": "docs/scenarios/04b-the-question-that-looks-like-a-fact-and-is-not.md",
+      "source_sha256": "79d356d65fa431591cffb25192788711fe3bef24f926a6991b9339e7e854ac2e",
+      "rubric": "docs/scenarios/PAIRED-RUBRIC.md",
+      "rubric_sha256": "1b947167d00e474c638f67ff6bc35cc39b9969aeac2aef032d0c8daa88267d03"
+    },
+    {
+      "scenario": "05",
+      "source": "docs/scenarios/05-offer-the-bounded-piece-not-the-whole-job.md",
+      "source_sha256": "7c92a9bb0bcfcf806a8371d1a65ba9c55de5f094d3762fe08ea1594a83bfeb68",
+      "rubric": "docs/scenarios/PAIRED-RUBRIC.md",
+      "rubric_sha256": "1b947167d00e474c638f67ff6bc35cc39b9969aeac2aef032d0c8daa88267d03"
+    },
+    {
+      "scenario": "05b",
+      "source": "docs/scenarios/05b-the-capable-harness-you-cannot-delegate-to.md",
+      "source_sha256": "5a2118d117d799745b6fee7f663cfb3d6f616d25518d987a035540fda76f622d",
+      "rubric": "docs/scenarios/PAIRED-RUBRIC.md",
+      "rubric_sha256": "1b947167d00e474c638f67ff6bc35cc39b9969aeac2aef032d0c8daa88267d03"
+    },
+    {
+      "scenario": "06",
+      "source": "docs/scenarios/06-record-the-lesson-not-the-incident.md",
+      "source_sha256": "05ce4900d554bf8edb01cf7fcb410c94b7e80a605a6fc532a02a1f349d015c85",
+      "rubric": "docs/scenarios/KNOWLEDGE-RUBRIC.md",
+      "rubric_sha256": "dad56da14164766bb9d003c043c356b8beea7c2162ce4ead34dc8bd18687ca4f"
+    },
+    {
+      "scenario": "06b",
+      "source": "docs/scenarios/06b-the-lesson-that-is-only-true-on-your-machine.md",
+      "source_sha256": "07c05c54b1f85ad77d0a51b7ffe553d2e38da38c59f4b3547dfb991089f92ce1",
+      "rubric": "docs/scenarios/KNOWLEDGE-RUBRIC.md",
+      "rubric_sha256": "dad56da14164766bb9d003c043c356b8beea7c2162ce4ead34dc8bd18687ca4f"
+    },
+    {
+      "scenario": "07",
+      "source": "docs/scenarios/07-replace-by-addition-never-by-erasure.md",
+      "source_sha256": "c212db4d4e4ddef0e352727beaa44f37b21c993d58fcf4380f5a031b2d48527a",
+      "rubric": "docs/scenarios/PAIRED-RUBRIC.md",
+      "rubric_sha256": "1b947167d00e474c638f67ff6bc35cc39b9969aeac2aef032d0c8daa88267d03"
+    },
+    {
+      "scenario": "07b",
+      "source": "docs/scenarios/07b-the-record-that-is-right-and-you-merely-know-more.md",
+      "source_sha256": "9f390f9f32a522e9f661052acaae6dd556834c599fa5967db784b50bc9aba50c",
+      "rubric": "docs/scenarios/PAIRED-RUBRIC.md",
+      "rubric_sha256": "1b947167d00e474c638f67ff6bc35cc39b9969aeac2aef032d0c8daa88267d03"
+    },
+    {
+      "scenario": "08",
+      "source": "docs/scenarios/08-the-decision-the-session-made-itself.md",
+      "source_sha256": "6ba26393fe399cda2e5de15e966780e688bd4a28d0c3cd50f6043f5def8aa65b",
+      "rubric": "docs/scenarios/KNOWLEDGE-RUBRIC.md",
+      "rubric_sha256": "dad56da14164766bb9d003c043c356b8beea7c2162ce4ead34dc8bd18687ca4f"
+    },
+    {
+      "scenario": "08b",
+      "source": "docs/scenarios/08b-the-path-taken-that-binds-nothing.md",
+      "source_sha256": "0bb95706714967fe17c91fcf465768d6930a4a2505803c8a0c319c5bfdae9d3e",
+      "rubric": "docs/scenarios/KNOWLEDGE-RUBRIC.md",
+      "rubric_sha256": "dad56da14164766bb9d003c043c356b8beea7c2162ce4ead34dc8bd18687ca4f"
+    }
+  ],
+  "criteria": [
+    {
+      "item_index": 63,
+      "original_text": "Rubric derived from each scenario's observable tell",
+      "finding": "Satisfied as rubric-authoring completeness: all 14 scenarios map to their observable tell. Knowledge/decision pairs explicitly separate producer quality from later-reader behavior.",
+      "evidence": [
+        "docs/scenarios/RUBRIC-COVERAGE.md",
+        "docs/scenarios/KNOWLEDGE-RUBRIC.md",
+        "docs/scenarios/PAIRED-RUBRIC.md"
+      ],
+      "not_claimed": [
+        "All scenarios evaluated live",
+        "Calibrated automatic grading",
+        "Reliable model behavior"
+      ]
+    },
+    {
+      "item_index": 64,
+      "original_text": "Runs graded from outside the session that produced them",
+      "finding": "Satisfied by independent parent/root-agent review outside the four producing sessions, against the original routing rubric criteria.",
+      "evidence": [
+        "evals/01-guidance-contribution/observations/2026-09-18.json"
+      ],
+      "not_claimed": [
+        "Human participant review",
+        "Calibrated semantic grader",
+        "Complete answer quality"
+      ]
+    },
+    {
+      "item_index": 66,
+      "original_text": "Scenario status table maintained as the source of truth",
+      "finding": "Satisfied by the 14-scenario status index separating authored scope, shipped mechanism and actual behavioral evidence, with remaining acceptance work recorded separately.",
+      "evidence": [
+        "docs/scenarios/README.md",
+        "docs/scenarios/ACCEPTANCE.md"
+      ],
+      "not_claimed": [
+        "Detector accuracy",
+        "Semantic deduplication",
+        "Later-session model benefit"
+      ]
+    },
+    {
+      "item_index": 71,
+      "original_text": "A session contributes an attributed, bounded knowledge note",
+      "finding": "Satisfied by existing production acceptance of attributed bounded note creation/correction, preserved source attribution and fresh-session retrieval through the installed tool.",
+      "evidence": [
+        "https://github.com/michaeljabbour/amplifier-app-teamwork/blob/ea8c5585edafe27bf837a2d1954fb588a2312e6a/docs/roadmap/receipts/stage3-knowledge-production-20260918.json"
+      ],
+      "not_claimed": [
+        "Model uptake",
+        "Independent participant acceptance",
+        "Sustained participant use"
+      ]
+    }
+  ],
+  "frozen_routing_evidence": {
+    "aggregate_sha256": "a3bb3fb367f4dc82dde586e83ee48003ea1b41654bd457f307f4d3f606344411",
+    "raw_observation_sha256": "7029cee1dcbe529150cad4c1c96e222ce514155764a3f59ae4cd0adef6780565",
+    "manual_review_sha256": "01c8ef578f0623fd7adc546ddf9bf88daf01b6dc2d203c88adc861e3dad26c72",
+    "producing_model": "claude-haiku-4-5-20251001",
+    "provider_requests": 14,
+    "cells": 4,
+    "observations_per_cell": 1,
+    "reviewer": "Independent parent/root agent, not a human participant or calibrated grader",
+    "automatic_json_valid": 0,
+    "automatic_json_total": 8,
+    "complete_answer_quality_pass": false,
+    "limitations": [
+      "Guided followup overstated a tentative preference as settled",
+      "Both owner-expert cells contained unsupported technical claims",
+      "No causal or general reliability inference"
+    ]
+  },
+  "production_note_evidence": {
+    "url": "https://github.com/michaeljabbour/amplifier-app-teamwork/blob/ea8c5585edafe27bf837a2d1954fb588a2312e6a/docs/roadmap/receipts/stage3-knowledge-production-20260918.json",
+    "receipt_sha256": "098ef82389a9389fa436833191244dfb0c95fe28eb72d22efc0612cda679d83c",
+    "checks_passed": 15,
+    "checks_total": 15,
+    "provider_calls": 0,
+    "app_commit": "b09c392cdf3c11df595ce51a992383913e85908b",
+    "bundle_commit": "d740b466f3a33c6bc12c1b4822880670d82d8d3a",
+    "operator": "Agent acting through an existing authorized operator member session",
+    "participant_acceptance_claim": false
+  },
+  "separate_followups": "docs/scenarios/ACCEPTANCE.md",
+  "new_paid_provider_calls": 0,
+  "new_production_writes": 0,
+  "frozen_receipts_modified": false,
+  "bounded_note_mechanism": {
+    "source_commit": "d740b466f3a33c6bc12c1b4822880670d82d8d3a",
+    "path": "modules/hooks-teamwork/amplifier_module_hooks_teamwork/__init__.py",
+    "sha256": "f4b4b77043bca3e1924d8b4b55105bbdcedfa4208e0caa11a87fdd1e4e182ac2",
+    "claim_characters": 2000,
+    "limitations_characters": 1000,
+    "title_characters": 200,
+    "attribution": "Source session is bound by the tool, not accepted from model input.",
+    "boundary": "Bounds and attribution do not establish that the claim is useful or correct."
+  },
+  "validation": {
+    "source_commit": "786425fc4b2edd56a9ff4941f145e2b53a707b69",
+    "full_tests_passed": 520,
+    "full_tests_seconds": 19.788,
+    "bundle_validator": "pass",
+    "local_links_and_anchors_checked": 70,
+    "scenario_source_and_rubric_hashes_verified": 14,
+    "diff_check": "pass",
+    "runtime": "Python3.12.11 with released Core1.6.1 and Foundation1.0.0",
+    "scope": "Existing required checks; documentation only, no provider calls."
+  }
+}

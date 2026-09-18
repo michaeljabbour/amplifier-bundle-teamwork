@@ -112,29 +112,26 @@ observed differ between my environment and the one this claim is about?** If it 
 it is not a lesson yet — it is an observation awaiting evidence from that other
 environment.
 
-Not yet written. Same pairing logic as `01`/`02` and `03`/`03b`.
+Written in [06b](06b-the-lesson-that-is-only-true-on-your-machine.md).
+The [paired knowledge rubric](KNOWLEDGE-RUBRIC.md) preserves the later-session tell.
 
-## Open questions
+## Mechanism and open questions
 
-- **There is no tool for this.** `01`–`04` argue about judgment over capabilities the
-  bundle already has. This one argues for a capability it does not have at all: the
-  server carries `idea` and `insight` as first-class record types (`INCLUDES`,
-  `core.py:719`) and the hook already reads them into the excerpt
-  (`__init__.py:58,63,70`), but not one of the eight tools writes one. The bundle can
-  consume the team's knowledge and contribute none. This scenario is therefore a
-  capability argument first and a guidance argument second, which no other scenario here
-  is.
-- **Does `decide-1`'s rule reach this?** The shared project holds that recording is
-  "deliberately named and never automatic", on the grounds that a model narrating its own
-  reasoning would flood the project with unfalsifiable noise. That was written about
-  decisions. Whether an insight is the same kind of thing — and so whether a session may
-  ever be prompted to record one — is unsettled, and it decides whether the guidance
-  above is about *choosing* to record or about *what to put in* a record that something
-  else initiates.
-- **Who curates, and what happens to a lesson that turns out to be wrong?** This scenario
-  produces durable claims by design. `decide-2` already rules that a superseded decision
-  must stay findable rather than be quietly replaced. Nothing says whether an insight
-  works the same way, and an unfalsifiable insight is worse than an absent one.
+The original scenario exposed a missing write path. The bundle now ships
+`teamwork_record_insight` for bounded, evidenced contributions under the enrolled
+session's attribution. Narrow session credentials authorize creation. Production
+operator/tool acceptance and fresh-session retrieval are recorded in the
+[criterion reconciliation](receipts/criteria-reconciliation-20260918.json); those
+checks made no model calls and do not demonstrate the later behavioral tell above.
+
+- **What initiates recording?** Deliberate recording remains available. Automatic
+  lesson detection is a separate explicit opt-in, off by default. Its classifier
+  and lifecycle checks do not establish useful discrimination or later benefit.
+- **Who curates a wrong lesson?** [07](07-replace-by-addition-never-by-erasure.md)
+  now has a versioned proposal/review mechanism for insights and decisions. It keeps
+  the original and its attribution, and only the authorized author or project
+  maintainer can accept a correction. Model judgement and timely review remain
+  separate questions.
 - **The excerpt already starves them.** Insights were being crowded out of the bounded
   excerpt by work items at real data volume — fixed once by seating one record of each
   kind. Writing more insights makes that pressure worse, and a lesson that is never

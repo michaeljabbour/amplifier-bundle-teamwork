@@ -86,7 +86,13 @@ fork later be worse off not knowing?**
 and recording it is wrong. The signal is identical; only the second half of the definition
 separates them.
 
-## Open questions
+## Mechanism and open questions
+
+The bundle now ships an explicit, default-off decision detector, with source-session
+attribution, lifecycle cleanup and exact-reference validation. The [window evaluation](../../evals/02-decision-detection/README.md)
+states its historical result and current evidence limits. The [paired knowledge
+rubric](KNOWLEDGE-RUBRIC.md#08-durable-decision) additionally requires the later
+reader described above; classifying a window does not establish that benefit.
 
 - **What fires this, and what does it cost?** Two candidate signals: the `pre` of a
   delegation call, and `session:end`, which sees which choices actually survived the
@@ -121,7 +127,8 @@ separates them.
   to that item. This says what was settled for anybody who arrives later. The boundary is
   not sharp, and a session that gets it wrong makes the work item unreadable or the
   knowledge plane noisy -- in opposite directions.
-- **Automatic recording has no undo.** A superseded record cannot yet point at what
-  replaced it, and no reviewer can record a verdict on one (`teamwork-s7d`). Until that
-  changes, every wrong automatic record is permanent, which should raise the bar for what
-  the detector accepts rather than being discovered later as a surprise.
+- **A wrong automatic record still needs review.** [Versioned corrections](07-replace-by-addition-never-by-erasure.md)
+  now preserve the original and link it to an accepted replacement. Automatic
+  detectors cannot propose corrections or exercise member review authority. This
+  resolves the former missing-retirement mechanism, not the need for accurate
+  recording or timely human review.

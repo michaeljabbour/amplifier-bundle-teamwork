@@ -54,25 +54,37 @@ The [paired rubric](PAIRED-RUBRIC.md) defines observable checks for `03`/`03b`,
 `04`/`04b`, `05`/`05b`, and `07`/`07b`. These are authored fixtures and grading
 criteria, not reported model runs. In particular, `05` specifies a bounded request
 over today's messaging tool; it does not implement execution custody or handoff.
+The [knowledge rubric](KNOWLEDGE-RUBRIC.md) specifies producer and later-reader
+observations for `06`/`06b` and `08`/`08b`. The [coverage matrix](RUBRIC-COVERAGE.md)
+maps all 14 scenarios to their observable tells and grading criteria.
 
 ## Status
 
-| scenario | state |
-|---|---|
-| `01-ask-the-expert-not-the-owner` | drafted with Diego; open questions recorded |
-| `02-when-the-owner-is-the-expert` | drafted with Diego; 01's twin |
-| [`03-say-what-changes-what-someone-else-would-do`](03-say-what-changes-what-someone-else-would-do.md) | drafted; twin `03b` written; deliberate publication distinguished from automatic turn sharing |
-| [`03b-the-busy-hour-that-nobody-needs-to-hear-about`](03b-the-busy-hour-that-nobody-needs-to-hear-about.md) | drafted; `03`'s twin: no additional update when the shared commitment remains accurate |
-| [`04-ask-the-machine-that-knows`](04-ask-the-machine-that-knows.md) | drafted; twin `04b` written; depends on useful routing evidence from `03` |
-| [`04b-the-question-that-looks-like-a-fact-and-is-not`](04b-the-question-that-looks-like-a-fact-and-is-not.md) | drafted; `04`'s twin: an undelegated decision needs the named person's channel |
-| [`05-offer-the-bounded-piece-not-the-whole-job`](05-offer-the-bounded-piece-not-the-whole-job.md) | drafted with twin `05b`, derived guidance and rubric; request over existing messaging, not a handoff feature |
-| [`05b-the-capable-harness-you-cannot-delegate-to`](05b-the-capable-harness-you-cannot-delegate-to.md) | drafted; `05`'s twin: retain the piece when delegation is excluded |
-| `06-record-the-lesson-not-the-incident` | drafted; twin `06b` WRITTEN. Informed the explicit `teamwork_record_insight` tool; behavioral discrimination remains to be measured |
-| `06b-the-lesson-that-is-only-true-on-your-machine` | drafted; `06`'s twin -- same signal, correct move is to record nothing |
-| [`07-replace-by-addition-never-by-erasure`](07-replace-by-addition-never-by-erasure.md) | drafted; twin `07b` written. Pairs with `06`: `06` fills the well, `07` is what happens when what is in it has gone off |
-| [`07b-the-record-that-is-right-and-you-merely-know-more`](07b-the-record-that-is-right-and-you-merely-know-more.md) | drafted; `07`'s twin: detail that changes no decision does not warrant a correction |
-| `08-the-decision-the-session-made-itself` | drafted; twin `08b` WRITTEN. The first about a decision **nobody was asked to make** -- and the spec for an automatic detector |
-| `08b-the-path-taken-that-binds-nothing` | drafted; `08`'s twin -- same fork, same deliberateness, correct move is to record nothing |
+As of September 18, 2026. A rubric being authored, a mechanism being shipped and
+a behavior being observed are different states. Open questions in a scenario do not
+erase the shipped mechanism, and a shipped mechanism does not answer those questions.
+
+| Scenario | Authored scope and mechanism | Behavioral evidence |
+|---|---|---|
+| [01: ask the expert](01-ask-the-expert-not-the-owner.md) | Authored with Diego; task rubric and local runner available | One guided and one unguided cell passed the narrow routing criteria in [external agent review](../../evals/01-guidance-contribution/observations/2026-09-18.json); not calibrated or reliable performance |
+| [02: owner is the expert](02-when-the-owner-is-the-expert.md) | Authored with Diego; 01's twin | Guided critical routing gates passed, unguided routing failed in that same run; response-format and answer-quality failures retained |
+| [03: publish what changes another's work](03-say-what-changes-what-someone-else-would-do.md) | Authored with twin and rubric; deliberate publication differs from automatic turn sharing | No model discrimination run claimed |
+| [03b: internal churn](03b-the-busy-hour-that-nobody-needs-to-hear-about.md) | Authored with rubric; no extra update when the shared commitment is still accurate | Pair with 03; silence alone does not prove restraint |
+| [04: ask the knowledgeable machine](04-ask-the-machine-that-knows.md) | Authored with twin and recipient-kind rubric | No model discrimination run claimed |
+| [04b: a retained human decision](04b-the-question-that-looks-like-a-fact-and-is-not.md) | Authored with rubric; requires the actual person's channel | Agent queueing is not human notification or approval |
+| [05: offer a bounded piece](05-offer-the-bounded-piece-not-the-whole-job.md) | Authored with twin, guidance and rubric; request over messaging | Recipient custody, execution and acceptance remain separate capabilities |
+| [05b: excluded delegation](05b-the-capable-harness-you-cannot-delegate-to.md) | Authored with rubric; keep the piece local when the grant excludes delegation | No model discrimination run claimed |
+| [06: record a transferable lesson](06-record-the-lesson-not-the-incident.md) | Authored with twin and producer/reader rubric; explicit insight tool and opt-in lesson detector shipped | Attributed contribution/readback accepted; actual later-session model benefit remains unmeasured |
+| [06b: a local incident](06b-the-lesson-that-is-only-true-on-your-machine.md) | Authored with producer/reader rubric; existing window fixtures exercise the negative distinction | Historical detector scores are not current calibration; semantic duplicate handling remains limited |
+| [07: replace by addition](07-replace-by-addition-never-by-erasure.md) | Authored with twin and rubric; versioned proposal, authorized review and retained history shipped | Production operator/tool acceptance exists; model judgement and participant adoption remain open |
+| [07b: no material correction](07b-the-record-that-is-right-and-you-merely-know-more.md) | Authored with rubric; no knowledge mutation when the action would not change | No model discrimination run claimed |
+| [08: a durable decision](08-the-decision-the-session-made-itself.md) | Authored with twin and producer/reader rubric; opt-in decision detector shipped | Lifecycle/reference checks are tested; classifier accuracy and later-reader benefit are separate |
+| [08b: a contingent path](08b-the-path-taken-that-binds-nothing.md) | Authored with rubric; zero durable records for the contingent choice | Historical window trials do not establish reliable restraint or later benefit |
+
+The [criterion reconciliation](receipts/criteria-reconciliation-20260918.json)
+pins the existing contribution and external-review evidence. The [acceptance
+ledger](ACCEPTANCE.md) lists the remaining model, calibration and participant work.
+No new model trials were run to update this status table.
 
 `06` and `07` are the two halves of contributing knowledge -- recording something, and
 replacing something somebody else recorded. Between them they cover the step the earlier
@@ -109,6 +121,9 @@ compliance.
 **It is a capability argument, not only a guidance argument.** `01`-`04` all argue about
 judgment over tools the bundle already shipped. `06` originally exposed a missing write
 path. The bundle now provides `teamwork_record_insight` for explicit, evidenced insight
-creation, with source attribution bound to the enrolled session. Narrow credentials
-require the service authorization update in app PR #53. Automatic detection, editing
-through this tool, and evidence that models choose well remain separate work.
+creation, with source attribution bound to the enrolled session. The service's narrow
+session scope now authorizes this contribution. Decision and lesson detectors are
+available through explicit opt-in; exact fingerprints suppress exact repeated claims,
+not semantic duplicates. Versioned correction proposals preserve the original, and
+only the authorized author or project maintainer can accept them through member review.
+These mechanisms do not establish that models choose well or that later sessions benefit.
