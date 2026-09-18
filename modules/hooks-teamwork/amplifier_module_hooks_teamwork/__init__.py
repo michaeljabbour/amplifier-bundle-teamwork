@@ -7,6 +7,7 @@ import inspect
 import json
 import logging
 import os
+import time
 import re
 import sqlite3
 import threading
@@ -86,6 +87,10 @@ SUMMARY_NAMED = 5
 # a longer field invites pasting the prompt, which is what the turn record is for.
 PRESENCE_SUMMARY = 200
 WAIT_REASON = 200
+# A wait that polls is still a wait a person is paying for. Bounded on purpose:
+# the session is blocked while this runs, so it must end on its own.
+WAIT_POLL_SECONDS = 5
+WAIT_MAX_SECONDS = 120
 # An insight is a durable claim, not a transcript -- bounded so it stays a
 # transferable statement rather than growing into a report.
 INSIGHT_CLAIM = 2000
@@ -754,6 +759,42 @@ class TeamworkHook:
     async def declare_wait(self, reason, request_id=None):
         self.waiting_reason, self.waiting_on = reason, request_id
         await asyncio.to_thread(self.report_presence, "waiting")
+
+    async def await_answer(self, seconds):
+        """Poll until the awaited request is answered, or the bound is reached.
+
+        THE DETECTION ALREADY EXISTED; ONLY THE CLOCK WAS MISSING. note_answer()
+        recognises a real answer and is careful about it -- a request record comes
+        back on every edit, so arrival is not resolution and only a response in
+        ANSWER_LABELS clears the wait. But it is reached only from retrieve(),
+        and retrieve() ran only from on_submit. So the whole mechanism was driven
+        by a human typing: an answer recorded while the session sat idle was seen
+        on the next prompt or never.
+
+        A tool call runs INSIDE the turn, which is why this can exist at all: the
+        session is live and awaiting this result, so it is a place the bundle can
+        honestly hold. That is also the limit -- this cannot wake a session that
+        has ended, and it is not a substitute for the harness being reachable
+        when nobody is at the keyboard.
+
+        Bounded and finite. The person whose session this is pays for every
+        second of it, so it ends on its own and says which way it ended.
+        """
+        deadline = time.monotonic() + seconds
+        while True:
+            async with self.lock:
+                try:
+                    await self.flush()
+                    await self.retrieve()
+                except SyncError as error:
+                    # A transient service failure must not be reported as an
+                    # answer, and must not spin. Stop and say what happened.
+                    return "unreachable", error.status
+            if not self.waiting_on:
+                return "answered", None
+            if time.monotonic() >= deadline:
+                return "timeout", None
+            await asyncio.sleep(min(WAIT_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
 
     async def announce(self):
         await asyncio.to_thread(self.register_agent)
@@ -1921,15 +1962,26 @@ class WaitTool:
 
     @property
     def description(self):
-        return ("Declare that this session is now waiting on a person -- for a decision, an approval "
-                "or an answer -- and say what for. It notifies nobody and assigns nobody; it only makes "
-                "the wait visible to teammates, and it clears by itself at the next prompt.")
+        return ("Say this session is waiting on a person -- for a decision, an approval or an answer -- "
+                "and what for. Supply request_id to actually WAIT: this call then holds, watching the "
+                "shared project, and returns the moment that request is answered, so the session resumes "
+                "without anyone typing. Bounded, and it reports which way it ended. Without request_id the "
+                "wait is only declared and nothing is watched. It notifies nobody and assigns nobody.")
 
     @property
     def input_schema(self):
         return {"type": "object",
-                "properties": {"reason": {"type": "string",
-                                          "description": "What this session is waiting for, in a short phrase (200 characters)."}},
+                "properties": {
+                    "reason": {"type": "string",
+                               "description": "What this session is waiting for, in a short phrase (200 characters)."},
+                    "request_id": {"type": "string",
+                                   "description": ("The request whose answer this session is waiting for. Supply it and "
+                                                   "this call BLOCKS until that request is answered or the bound is "
+                                                   "reached. Omit it and the wait is only declared, never observed.")},
+                    "seconds": {"type": "integer",
+                                "description": ("How long to hold, when request_id is given. Default 120, capped at 120. "
+                                                "The session is blocked for this long, so ask for what the answer is "
+                                                "worth.")}},
                 "required": ["reason"]}
 
     async def execute(self, input):
@@ -1938,13 +1990,34 @@ class WaitTool:
         if not reason:
             return ToolResult(success=False, error={"message":
                 "reason is required: say what this session is waiting for"})
-        await self.hook.declare_wait(reason[:WAIT_REASON])
+        request_id = (input.get("request_id") or "").strip() or None
+        await self.hook.declare_wait(reason[:WAIT_REASON], request_id)
         if self.hook.presence_status != "waiting":
             return ToolResult(success=False, error={"message":
                 "Not declared: this project's service did not accept the waiting state. Nothing else changed."})
+        if not request_id:
+            return ToolResult(success=True, output={
+                "state": "waiting", "reason": reason[:WAIT_REASON], "observed": False,
+                "note": ("Declared only. Nothing was watched and nobody was notified: without request_id there is "
+                         "no answer this session could recognise. Visible to teammates until the next prompt.")})
+        seconds = input.get("seconds")
+        seconds = WAIT_MAX_SECONDS if not isinstance(seconds, int) or seconds <= 0 else min(seconds, WAIT_MAX_SECONDS)
+        outcome, status = await self.hook.await_answer(seconds)
+        if outcome == "answered":
+            return ToolResult(success=True, output={
+                "state": "answered", "request_id": request_id, "observed": True,
+                "note": ("The answer landed and this session saw it without anyone typing. It is in the shared "
+                         "context from here on.")})
+        if outcome == "unreachable":
+            return ToolResult(success=False, error={"message":
+                ("Stopped watching: the shared project could not be read (HTTP %s; 0 means transport failure). "
+                 "The waiting state stands and nothing was lost -- but no answer was observed, and absence of an "
+                 "answer here is not evidence there is none." % status)})
         return ToolResult(success=True, output={
-            "state": "waiting", "reason": reason[:WAIT_REASON],
-            "note": "Visible to teammates until this session's next prompt. Nobody was notified."})
+            "state": "waiting", "request_id": request_id, "observed": True, "held_seconds": seconds,
+            "note": ("Held %d seconds and no answer arrived. That is a real absence over that window, not a "
+                     "refusal and not a failure. The wait stays visible to teammates; ask again, or let the "
+                     "session go and pick the answer up on a later turn." % seconds)})
 
 
 class RecordInsightTool:

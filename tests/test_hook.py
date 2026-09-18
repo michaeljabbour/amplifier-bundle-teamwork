@@ -5,6 +5,11 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+import amplifier_module_hooks_teamwork as teamwork_module
+
+
+async def _noop(*a, **k):
+    return None
 from types import SimpleNamespace
 import urllib.request
 import urllib.error
@@ -532,6 +537,92 @@ class HookTests(unittest.IsolatedAsyncioTestCase):
         await self.hook.on_start("session:start", {})
         await WaitTool(self.hook).execute({"reason": "y" * 500})
         self.assertEqual(len(self.presences()[-1][1]["operations"][0]["data"]["reason"]), 200)
+
+    async def test_a_wait_without_a_request_id_watches_nothing_and_says_so(self):
+        """The old behaviour, now named honestly rather than sold as waiting.
+
+        Without a request id there is no answer this session could recognise, so
+        nothing is polled. It must not read as a wait that observed anything.
+        """
+        await self.hook.on_start("session:start", {})
+        result = await WaitTool(self.hook).execute({"reason": "Waiting on Alex"})
+        self.assertTrue(result.success)
+        self.assertIs(result.output["observed"], False)
+        self.assertEqual(result.output["state"], "waiting")
+
+    async def test_a_wait_on_a_request_returns_the_moment_it_is_answered(self):
+        """THE POINT OF THE CHANGE. Before this, an answer recorded while the
+        session sat idle was seen on the next human prompt or never. The session
+        must resume on the answer, with nobody typing.
+        """
+        await self.hook.on_start("session:start", {})
+        answered = {"n": 0}
+
+        async def fake_retrieve():
+            answered["n"] += 1
+            if answered["n"] >= 2:          # arrives on the second look
+                self.hook.waiting_reason = self.hook.waiting_on = None
+
+        self.hook.retrieve = fake_retrieve
+        self.hook.flush = _noop
+        with patch.object(teamwork_module, "WAIT_POLL_SECONDS", 0):
+            result = await WaitTool(self.hook).execute(
+                {"reason": "Waiting on Alex", "request_id": "req-1", "seconds": 5})
+        self.assertTrue(result.success)
+        self.assertEqual(result.output["state"], "answered")
+        self.assertIs(result.output["observed"], True)
+        self.assertGreaterEqual(answered["n"], 2)
+
+    async def test_an_unanswered_wait_ends_on_its_own_and_reports_a_real_absence(self):
+        """A blocked session is a person's time. It must end, and must not
+        report silence as a refusal.
+        """
+        await self.hook.on_start("session:start", {})
+        looks = {"n": 0}
+
+        async def never_answers():
+            looks["n"] += 1
+
+        self.hook.retrieve = never_answers
+        self.hook.flush = _noop
+        with patch.object(teamwork_module, "WAIT_POLL_SECONDS", 0):
+            result = await WaitTool(self.hook).execute(
+                {"reason": "Waiting on Alex", "request_id": "req-1", "seconds": 1})
+        self.assertTrue(result.success)
+        self.assertEqual(result.output["state"], "waiting")
+        self.assertIn("real absence", result.output["note"])
+        self.assertGreater(looks["n"], 0)
+
+    async def test_a_service_failure_stops_the_watch_and_never_claims_an_answer(self):
+        """A transient failure must not spin, and must not be reported as an
+        answer. Absence observed through a broken pipe is not absence.
+        """
+        await self.hook.on_start("session:start", {})
+
+        async def explodes():
+            raise SyncError(503)
+
+        self.hook.retrieve = explodes
+        self.hook.flush = _noop
+        with patch.object(teamwork_module, "WAIT_POLL_SECONDS", 0):
+            result = await WaitTool(self.hook).execute(
+                {"reason": "Waiting on Alex", "request_id": "req-1", "seconds": 5})
+        self.assertFalse(result.success)
+        self.assertIn("not evidence there is none", result.error["message"])
+
+    async def test_the_hold_is_capped_however_long_is_asked_for(self):
+        await self.hook.on_start("session:start", {})
+        seen = {}
+
+        async def capture(seconds):
+            seen["seconds"] = seconds
+            return "timeout", None
+
+        self.hook.await_answer = capture
+        result = await WaitTool(self.hook).execute(
+            {"reason": "Waiting on Alex", "request_id": "req-1", "seconds": 99999})
+        self.assertEqual(seen["seconds"], teamwork_module.WAIT_MAX_SECONDS)
+        self.assertEqual(result.output["held_seconds"], teamwork_module.WAIT_MAX_SECONDS)
 
     async def test_the_wait_tool_is_mounted_beside_the_others(self):
         class Hooks:
