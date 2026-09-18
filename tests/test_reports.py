@@ -473,3 +473,77 @@ class Projection(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+from amplifier_module_hooks_teamwork import reports  # noqa: E402  (module handle for the two classes below)
+
+
+class ObjectivesAreWhatIsActuallyInHand(unittest.TestCase):
+    """A count of ready work says a queue exists. It does not say what this
+    machine is FOR right now, which is what an agent deciding whom to ask needs.
+    """
+
+    def queue(self):
+        return reports.Queue.__new__(reports.Queue)
+
+    def test_a_resolved_item_is_never_an_objective_even_though_it_has_a_holder(self):
+        """The trap this whole function exists to avoid.
+
+        `holder` records who worked an item and SURVIVES resolution. Measured on
+        the real project: 28 of 62 items carried a holder and 27 were already
+        resolved. A naive holder filter would publish 27 finished pieces of work
+        as current objectives -- every one a confident lie about what this
+        machine is doing.
+        """
+        items = [{"id": "a", "title": "done", "status": "resolved", "holder": "agent-h-1"},
+                 {"id": "b", "title": "put down", "status": "deferred", "holder": "agent-h-1"},
+                 {"id": "c", "title": "live work", "status": "open", "holder": "agent-h-1"}]
+        got = self.queue().objectives(items)
+        self.assertEqual([o["id"] for o in got], ["c"])
+
+    def test_a_blocked_item_IS_an_objective_and_says_so(self):
+        # "held but blocked" is the state a teammate most needs to see: it is
+        # the difference between a machine that is busy and one that is stuck.
+        items = [{"id": "c", "title": "stuck work", "status": "blocked", "holder": "agent-h-1"}]
+        got = self.queue().objectives(items)
+        self.assertEqual(got, [{"id": "c", "title": "stuck work", "status": "blocked"}])
+
+    def test_an_unheld_item_is_not_an_objective(self):
+        items = [{"id": "d", "title": "nobody has this", "status": "open", "holder": ""},
+                 {"id": "e", "title": "nor this", "status": "open"}]
+        self.assertEqual(self.queue().objectives(items), [])
+
+    def test_the_list_is_bounded(self):
+        items = [{"id": str(n), "title": "t", "status": "open", "holder": "h"} for n in range(50)]
+        self.assertEqual(len(self.queue().objectives(items)), reports.OBJECTIVE_LIMIT)
+
+    def test_the_holder_never_travels(self):
+        # An actor id names a host and a process. No teammate needs that to
+        # decide whom to ask, so it must not leave this machine.
+        items = [{"id": "c", "title": "t", "status": "open", "holder": "agent-secret-host-4242"}]
+        got = self.queue().objectives(items)
+        self.assertNotIn("holder", got[0])
+        self.assertNotIn("secret-host", json.dumps(got))
+
+
+class ObjectivesSurviveTheOutboundSanitizer(unittest.TestCase):
+    """sanitize_outbound is an ALLOW-LIST -- its own docstring says unknown keys
+    are dropped. A new field that nobody adds to it is not rejected, logged, or
+    surfaced: it silently never arrives. This is the assertion that proves the
+    key was actually added rather than merely produced.
+    """
+
+    def test_objectives_reach_the_wire(self):
+        payload = {"queue_status": "ready", "ready_count": 3,
+                   "objectives": [{"id": "c", "title": "live work", "status": "open"}]}
+        got = reports.sanitize_outbound(payload)
+        self.assertEqual(got["objectives"], [{"id": "c", "title": "live work", "status": "open"}])
+
+    def test_an_unknown_nested_key_is_still_dropped(self):
+        payload = {"objectives": [{"id": "c", "title": "t", "status": "open",
+                                   "holder": "agent-h-1", "path": "/home/someone/secret"}]}
+        got = reports.sanitize_outbound(payload)
+        self.assertEqual(sorted(got["objectives"][0]), ["id", "status", "title"])
+
+    def test_a_non_list_objectives_value_is_dropped_not_published(self):
+        self.assertEqual(reports.sanitize_outbound({"objectives": "not a list"}), {})

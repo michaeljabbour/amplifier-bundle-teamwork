@@ -30,6 +30,8 @@ COMMAND = "amplifier-work-tracker"
 PROBE_TIMEOUT = 20
 FILE_TIMEOUT = 30
 VERIFY_LIMIT = 500
+# A teammate reads objectives to decide whom to ask; a wall of them answers nothing.
+OBJECTIVE_LIMIT = 5
 TITLE_LIMIT = 120
 # The service caps a message body at 4000 characters, so this is headroom rather
 # than a working limit. Over it the message is REFUSED rather than shortened: a
@@ -65,9 +67,14 @@ OUTBOUND_ALLOWED = {
     "requested_person_id": (str, 128),
 }
 
-# The only nested shape that travels, and the only keys it may carry. A locator
+# The only nested shapes that travel, and the only keys they may carry. A locator
 # is an id and a label; a path is neither.
 REF_ALLOWED = {"kind": 40, "uri": 2048, "label": 200, "revision": 128}
+
+# An objective is what this machine has in hand: which item, called what, in what
+# state. Nothing else -- a holder is an actor id naming a host and a process, and
+# no teammate needs that to decide whom to ask.
+OBJECTIVE_ALLOWED = {"id": 64, "title": 160, "status": 24}
 
 
 def sanitize_outbound(payload):
@@ -86,6 +93,16 @@ def sanitize_outbound(payload):
                 refs.append({k: ref[k][:limit] for k, limit in REF_ALLOWED.items()
                              if isinstance(ref.get(k), str)})
             result[key] = refs
+            continue
+        if key == "objectives":
+            # A list of dicts needs its own branch: the scalar rules below would
+            # drop it whole, which is how a field silently never arrives.
+            if not isinstance(value, list):
+                continue
+            result[key] = [
+                {k: item[k][:limit] for k, limit in OBJECTIVE_ALLOWED.items()
+                 if isinstance(item.get(k), str)}
+                for item in value[:OBJECTIVE_LIMIT] if isinstance(item, dict)]
             continue
         rule = OUTBOUND_ALLOWED.get(key)
         if rule is None:
@@ -334,13 +351,49 @@ class Queue:
         except ValueError:
             code = "the work tracker returned output this bundle could not read"
         else:
-            ready = [i for i in (page.get("items") or []) if (i.get("status") or "open") in ("open", "ready")]
+            items = page.get("items") or []
+            ready = [i for i in items if (i.get("status") or "open") in ("open", "ready")]
             self.last_status = {"queue_status": "ready", "observed_at": observed,
                                 "ready_count": len(ready), "integration": COMMAND}
+            objectives = self.objectives(items)
+            if objectives:
+                self.last_status["objectives"] = objectives
             return dict(self.last_status)
         if self.last_status:
             return dict(self.last_status, queue_status="stale", reason_code=code[:120])
         return {"queue_status": "unavailable", "observed_at": observed, "reason_code": code[:120]}
+
+    def objectives(self, items):
+        """What this machine actually has in hand, so another agent can judge it.
+
+        A count of ready work says a queue exists; it does not say what this
+        machine is FOR right now. An agent deciding whom to ask needs the
+        second thing.
+
+        `holder` ALONE IS NOT THE ANSWER, and the difference is not subtle.
+        Measured on a real project: 28 of 62 items carried a holder and 27 of
+        those were already `resolved` -- the field records who worked an item,
+        and it survives resolution. Filtering on it alone would publish 27
+        finished pieces of work as current objectives, every one of them a
+        confident lie about what this machine is doing.
+
+        So an objective is an item that is held AND still live. `resolved` is
+        finished, `deferred` was put down on purpose. Both are excluded. A
+        `blocked` item IS included and carries its status, because "held but
+        blocked" is exactly the state a teammate most needs to see -- it is the
+        difference between a machine that is busy and one that is stuck.
+
+        Bounded on purpose: titles are free text this harness did not author, so
+        they are capped and count-limited here, and the caller passes the whole
+        observation through the outbound sanitizer before any of it leaves.
+        """
+        live = [i for i in items
+                if (i.get("holder") or "").strip()
+                and (i.get("status") or "open") not in ("resolved", "deferred")]
+        return [{"id": str(i.get("id") or "")[:64],
+                 "title": str(i.get("title") or "")[:160],
+                 "status": str(i.get("status") or "open")[:24]}
+                for i in live[:OBJECTIVE_LIMIT]]
 
     def find(self, message_id):
         """Has this message already been filed? Used only to resolve an ambiguous write.
