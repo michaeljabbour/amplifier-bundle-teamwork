@@ -196,6 +196,25 @@ remove it yourself once you have confirmed you no longer need it.
 With no project configured the hook mounts **inert** -- it registers nothing and sends
 nothing -- until a session binds one.
 
+### Correct a shared insight without erasing its history
+
+`teamwork_record_insight` can propose a correction by adding `supersedes`
+(`record_type`, `record_id`, positive `version`) and `correction_reason` to its
+usual claim, evidence, confidence and limitations. Retrieve the current source
+first. The tool creates a new insight attributed to the current session and
+automatically cites that exact source version; it never edits the source.
+
+The proposal stays pending until the original author's signed-in member account
+or a project maintainer accepts or rejects it in Knowledge. Acceptance links the
+original forward to the replacement and preserves both records and their
+history. A changed source version requires a fresh read and reassessment. An
+accepted review records a project judgment, not independent factual verification.
+
+This requires a service with the knowledge-review API. Older services reject the
+new fields without changing the source. Automatic decision/lesson detectors do
+not propose corrections. Excerpts label proposed, rejected and superseded records
+before their text, and the detectors' standing-knowledge tally excludes them.
+
 ### Automatic decision detection (`detect_decisions`) -- off unless you ask
 
 **This is the one setting that makes the bundle call a model on its own and publish
