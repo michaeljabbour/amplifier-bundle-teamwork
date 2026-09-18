@@ -201,5 +201,26 @@
   "separate_followups": "docs/scenarios/ACCEPTANCE.md",
   "new_paid_provider_calls": 0,
   "new_production_writes": 0,
-  "frozen_receipts_modified": false
+  "frozen_receipts_modified": false,
+  "bounded_note_mechanism": {
+    "source_commit": "d740b466f3a33c6bc12c1b4822880670d82d8d3a",
+    "path": "modules/hooks-teamwork/amplifier_module_hooks_teamwork/__init__.py",
+    "sha256": "f4b4b77043bca3e1924d8b4b55105bbdcedfa4208e0caa11a87fdd1e4e182ac2",
+    "claim_characters": 2000,
+    "limitations_characters": 1000,
+    "title_characters": 200,
+    "attribution": "Source session is bound by the tool, not accepted from model input.",
+    "boundary": "Bounds and attribution do not establish that the claim is useful or correct."
+  },
+  "validation": {
+    "source_commit": "786425fc4b2edd56a9ff4941f145e2b53a707b69",
+    "full_tests_passed": 520,
+    "full_tests_seconds": 19.788,
+    "bundle_validator": "pass",
+    "local_links_and_anchors_checked": 70,
+    "scenario_source_and_rubric_hashes_verified": 14,
+    "diff_check": "pass",
+    "runtime": "Python3.12.11 with released Core1.6.1 and Foundation1.0.0",
+    "scope": "Existing required checks; documentation only, no provider calls."
+  }
 }
