@@ -132,11 +132,26 @@ acknowledges it. Delivery is not agreement and not action.
 
 ### Saying this session is waiting on a person
 
-The `teamwork_wait` tool declares that this session is now waiting on a person --
-for a decision, an approval or an answer -- and says what for, in at most 200
-characters. It notifies nobody and assigns nobody; it only makes the wait visible
-to teammates. A wait with no reason is refused, and the declaration clears by
-itself at this session's next prompt, so a wait can never outlive the waiting.
+The `teamwork_wait` tool declares what this session is waiting for. Without
+`request_id`, it publishes a short reason and returns immediately; it does not
+notify or assign anyone. The declaration clears at the next prompt.
+
+With `request_id`, it watches for that exact request's answer for at most 120
+seconds, including waiting-state publication and network reads. A previously
+cached answer is returned immediately. The tool result includes the response,
+note and attribution; the bounded shared excerpt is not the answer channel.
+A project change or replacement wait stops the old call without reporting an
+answer. A timeout reports the elapsed time and whether a context read completed;
+it is not evidence that no answer exists.
+
+`teamwork_tasks` lists the requests/work assigned to this session's person,
+reading bounded pages and reporting an incomplete list. `teamwork_answer`
+records `act`, `defer`, or `context` with an optional note on an existing assigned
+request. The service enforces recipient permissions and record versions. This
+records an answer; it does not execute the requested work or grant authority.
+Question creation remains a portal/API action; these tools do not create or
+assign new work. A live host is needed to receive arbitrary arrivals while idle;
+`teamwork_wait` only holds an already-running tool call.
 
 ### Inbound messages as queued work
 

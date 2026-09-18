@@ -95,17 +95,16 @@ def stamp(t0):
 
 
 
-async def main():
-    connection_a, connection_b = load("TEAMWORK_CONNECTION_A"), load("TEAMWORK_CONNECTION_B")
+async def run(connection_a, connection_b, work, owned, tasks):
     if connection_a["token"] == connection_b["token"]:
         raise SystemExit("A and B are the same credential; that proves nothing about two harnesses")
 
     t0 = time.monotonic()
-    work = Path(tempfile.mkdtemp(prefix="teamwork-live-loop-"))
     hook = TeamworkHook(Coordinator(), connection_a, Journal(work / "a.sqlite3"))
     # B is a REAL session too, not a raw client: it has to SEE the question before
     # it can honestly be said to have answered one.
     hook_b = TeamworkHook(Coordinator(), connection_b, Journal(work / "b.sqlite3"))
+    owned.extend((hook, hook_b))
 
     print("%s harness A session %s" % (stamp(t0), hook.sid))
     await hook.on_start("session:start", {})
@@ -119,7 +118,7 @@ async def main():
     if not person:
         raise SystemExit("TEAMWORK_PERSON_ID is required: the request must name its recipient")
     request_id = str(uuid.uuid4())
-    hook.client.request("publish", {"operations": [{
+    await asyncio.to_thread(hook.client.request, "publish", {"operations": [{
         "op": "request.upsert", "id": request_id, "expected_version": 0,
         "data": {
             "title": QUESTION_TITLE,
@@ -156,10 +155,11 @@ async def main():
         result = await AnswerTool(hook_b).execute({
             "request_id": request_id, "response": "context", "note": ANSWER_NOTE})
         print("%s harness B answered with teamwork_answer: success=%s %s"
-              % (stamp(t0), result.success, result.output or result.error))
+              % (stamp(t0), result.success, "recorded" if result.success else "refused"))
         return bool(result.success)
 
     answering = asyncio.create_task(asyncio.sleep(0) if NO_ANSWER else harness_b_sees_and_answers())
+    tasks.append(answering)
     print("%s harness A: teamwork_wait(request_id=..., seconds=%d), holding...%s"
           % (stamp(t0), HOLD_SECONDS, " (NEGATIVE CONTROL: nobody will answer)" if NO_ANSWER else ""))
     started = time.monotonic()
@@ -206,8 +206,30 @@ async def main():
     return 0 if resumed and ontime and told else 1
 
 
+async def main():
+    connection_a, connection_b = load("TEAMWORK_CONNECTION_A"), load("TEAMWORK_CONNECTION_B")
+    if (connection_a["base_url"], connection_a["project_id"]) != (connection_b["base_url"], connection_b["project_id"]):
+        raise SystemExit("Both explicit connections must name the same service and QA project")
+    owned, tasks = [], []
+    with tempfile.TemporaryDirectory(prefix="teamwork-live-loop-") as work:
+        try:
+            return await asyncio.wait_for(run(connection_a, connection_b, Path(work), owned, tasks),
+                                          timeout=min(HOLD_SECONDS, 120) + 120)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            for hook in owned:
+                try:
+                    await asyncio.wait_for(hook.cleanup(), timeout=10)
+                except (TimeoutError, SyncError):
+                    print("Shared-session cleanup not confirmed; inspect the isolated QA session.")
+
+
 if __name__ == "__main__":
     try:
         raise SystemExit(asyncio.run(main()))
     except SyncError as error:
-        raise SystemExit("service refused the run: HTTP %s %s" % (error.status, error.body))
+        raise SystemExit("service refused the run: HTTP %s" % error.status)
+    except Exception as error:
+        raise SystemExit("loop check failed (%s); private details omitted" % type(error).__name__)

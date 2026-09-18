@@ -569,7 +569,8 @@ class HookTests(unittest.IsolatedAsyncioTestCase):
         async def fake_retrieve():
             answered["n"] += 1
             if answered["n"] >= 2:          # arrives on the second look
-                self.hook.waiting_reason = self.hook.waiting_on = None
+                self.hook.note_answer({"record_type": "request", "id": "req-1", "change": "upsert",
+                                       "content": {"response": "act", "progress_note": "Verified answer"}})
 
         self.hook.retrieve = fake_retrieve
         self.hook.flush = _noop
@@ -646,7 +647,7 @@ class HookTests(unittest.IsolatedAsyncioTestCase):
                 {"reason": "Waiting on Alex", "request_id": "req-1", "seconds": 1})
         self.assertTrue(result.success)
         self.assertEqual(result.output["state"], "waiting")
-        self.assertIn("real absence", result.output["note"])
+        self.assertIn("not evidence", result.output["note"])
         self.assertGreater(looks["n"], 0)
 
     async def test_a_service_failure_stops_the_watch_and_never_claims_an_answer(self):
@@ -670,15 +671,16 @@ class HookTests(unittest.IsolatedAsyncioTestCase):
         await self.hook.on_start("session:start", {})
         seen = {}
 
-        async def capture(seconds):
+        async def capture(seconds, ticket):
             seen["seconds"] = seconds
             return "timeout", None
 
         self.hook.await_answer = capture
         result = await WaitTool(self.hook).execute(
             {"reason": "Waiting on Alex", "request_id": "req-1", "seconds": 99999})
-        self.assertEqual(seen["seconds"], teamwork_module.WAIT_MAX_SECONDS)
-        self.assertEqual(result.output["held_seconds"], teamwork_module.WAIT_MAX_SECONDS)
+        self.assertLessEqual(seen["seconds"], teamwork_module.WAIT_MAX_SECONDS)
+        self.assertGreater(seen["seconds"], teamwork_module.WAIT_MAX_SECONDS - 1)
+        self.assertLess(result.output["held_seconds"], 1)
 
     async def test_the_wait_tool_is_mounted_beside_the_others(self):
         class Hooks:
