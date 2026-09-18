@@ -780,7 +780,7 @@ class NativeToolTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(result.success)
                 self.assertNotIn('harness-fixture', str(result))
                 self.assertNotIn(str(path), str(result))
-                self.assertEqual(len(root.handlers), 5)
+                self.assertEqual(len(root.handlers), 6)
                 hook = root.handlers[0][1].__self__
                 self.assertIsNone(hook.state.get('turn'))
                 # Completing the connection prompt cannot publish it.
@@ -794,7 +794,7 @@ class NativeToolTests(unittest.IsolatedAsyncioTestCase):
                 again = await tool.execute({})
                 self.assertTrue(again.success)
                 self.assertEqual(browser.call_count, 2)
-                self.assertEqual(len(root.handlers), 5)
+                self.assertEqual(len(root.handlers), 6)
                 self.assertNotEqual(hook.sid, bound)
                 self.assertEqual(hook.connection['project_id'], 'second-project')
 
@@ -806,13 +806,13 @@ class NativeToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(root.handlers)
         result = await tool.execute({'project_id': 'chosen'})
         self.assertTrue(result.success)
-        self.assertEqual(len(root.handlers), 5)
+        self.assertEqual(len(root.handlers), 6)
         hook = root.handlers[0][1].__self__
         self.assertEqual(hook.connection['project_id'], 'chosen')
         first = hook.sid
         moved = await tool.execute({'project_id': 'another'})
         self.assertTrue(moved.success)
-        self.assertEqual(len(root.handlers), 5)
+        self.assertEqual(len(root.handlers), 6)
         self.assertEqual(hook.connection['project_id'], 'another')
         self.assertNotEqual(hook.sid, first)
 
