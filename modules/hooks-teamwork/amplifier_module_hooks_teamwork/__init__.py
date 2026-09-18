@@ -490,15 +490,7 @@ class TeamworkHook:
             # A different project is a different queue. Re-resolving rather than
             # carrying the old name over is what stops one project's inbound
             # requests being filed into another project's backlog.
-            self.filing.project_id = self.connection["project_id"]
-            self.filing.service = self.connection["base_url"]
-            self.filing.name = None
-            self.filing.last_status = None
-            self.filing._last_status_binding = None
-            # Objective attribution and topic consent apply to the original
-            # project binding. A new project must not inherit either grant.
-            self.filing.actor = None
-            self.filing.share_topic = False
+            self.filing.rebind(self.connection["project_id"], self.connection["base_url"])
         self.queue_said = None
         return self.sid
 

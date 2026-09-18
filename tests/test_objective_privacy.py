@@ -76,6 +76,20 @@ class ObjectivePrivacy(unittest.TestCase):
         self.assertNotIn('Private fixture topic', json.dumps(got))
         self.assertEqual(got['queue_status'], 'unavailable')
 
+    def test_title_bound_is_utf8_bytes_in_both_projection_and_sanitizer(self):
+        text = "🔐" * 80
+        projected = self.queue(topic=True).objectives([item(title=text)])[0]
+        sanitized = reports.sanitize_outbound({'objectives': [{'id': 'safe', 'status': 'held', 'title': text}]})['objectives'][0]
+        for row in (projected, sanitized):
+            self.assertLessEqual(len(row['title'].encode('utf-8')), 160)
+            self.assertTrue(text.startswith(row['title']))
+            self.assertTrue(row['title'])
+
+    def test_invalid_unicode_objective_is_omitted_before_encoding(self):
+        invalid = chr(0xd800)
+        self.assertEqual(self.queue(topic=True).objectives([item(title=invalid), item(id=invalid)]), [])
+        self.assertEqual(reports.sanitize_outbound({'objectives': [{'id': 'safe', 'status': 'held', 'title': invalid}]}), {'objectives': []})
+
     def test_sanitizer_rejects_invalid_nested_state_and_empty_ids(self):
         got = reports.sanitize_outbound({'objectives': [
             {'id': '', 'status': 'held'}, {'id': 'x', 'status': 'secret text'},
@@ -175,3 +189,24 @@ class ObjectiveLifecycle(unittest.IsolatedAsyncioTestCase):
             result = await asyncio.wait_for(task, 3)
         self.assertIsNone(self.q.last_status)
         self.assertNotIn('FIRST_PROJECT_ONLY', json.dumps(result))
+
+    async def test_initial_ready_probe_cannot_restore_old_queue_name_after_rebind(self):
+        started, release = threading.Event(), threading.Event(); calls = []
+        self.q.name = None
+        def run(verb, args, timeout):
+            calls.append(list(args))
+            if len(calls) == 1:
+                started.set()
+                if not release.wait(3): raise RuntimeError('fixture barrier timed out')
+            return json.dumps({'items': []})
+        with patch.object(self.q, 'run', side_effect=run):
+            task = asyncio.create_task(asyncio.to_thread(self.q.status))
+            try:
+                self.assertTrue(await asyncio.to_thread(started.wait, 2))
+                self.hook.rebind('second')
+            finally:
+                release.set()
+            self.assertEqual((await asyncio.wait_for(task, 3))['queue_status'], 'unavailable')
+            self.assertIsNone(self.q.name)
+            self.q.status()
+        self.assertEqual(calls[-1][1], 'second')

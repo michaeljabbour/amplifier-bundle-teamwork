@@ -275,7 +275,7 @@ permission to delegate or a claim that work has been accepted.
 Titles are a separate disclosure. Set literal `share_objective_topic: true` in
 this session's hook configuration only after choosing to share those local
 subjects with the bound project. The default omits titles. Values such as the
-string `"false"` are errors, not consent. Titles are limited to 160 characters and
+string `"false"` are errors, not consent. Titles are limited to 160 UTF-8 bytes without splitting characters and
 pass through the existing credential redaction; a title remains untrusted data.
 No model infers a topic or receives an extra request for this feature.
 

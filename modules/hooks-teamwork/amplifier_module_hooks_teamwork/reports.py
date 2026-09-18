@@ -23,6 +23,7 @@ reaching past it to Beads is how a coordination layer stops coordinating.
 import hashlib
 import json
 import subprocess
+import threading
 from datetime import datetime, timezone
 
 from .queue_name import QueueNameConflict, bind
@@ -127,9 +128,15 @@ def sanitize_outbound(payload):
                         or not isinstance(status, str) or status not in OBJECTIVE_STATES
                         or item_id in seen):
                     continue
+                try:
+                    if len(item_id.encode("utf-8")) > 64:
+                        continue
+                    entry = {k: item[k].encode("utf-8")[:limit].decode("utf-8", errors="ignore")
+                             for k, limit in OBJECTIVE_ALLOWED.items() if isinstance(item.get(k), str)}
+                except UnicodeEncodeError:
+                    continue
                 seen.add(item_id)
-                entries.append({k: item[k][:limit] for k, limit in OBJECTIVE_ALLOWED.items()
-                                if isinstance(item.get(k), str)})
+                entries.append(entry)
                 if len(entries) == OBJECTIVE_LIMIT:
                     break
             result[key] = entries
@@ -325,6 +332,14 @@ class Queue:
         # Whether an objective may carry its TITLE. See objectives().
         self.share_topic = topic_sharing(share_topic)
         self.actor = objective_actor(actor)
+        self._binding_lock = threading.RLock()
+
+    def rebind(self, project_id, service):
+        """Drop observation caches and disclosure grants atomically."""
+        with self._binding_lock:
+            self.project_id, self.service = project_id, service
+            self.name = self.last_status = self._last_status_binding = None
+            self.actor, self.share_topic = None, False
 
     def run(self, verb, args, timeout):
         command = [self.command, verb]
@@ -359,12 +374,17 @@ class Queue:
         verbatim. It still files nothing -- which is the point -- but a naming
         clash between two projects must not be the thing that breaks a turn.
         """
+        with self._binding_lock:
+            project, service = self.project_id, self.service
         try:
-            name = bind(self.project_id, self.registry_path, self.service)
+            name = bind(project, self.registry_path, service)
         except QueueNameConflict as refusal:
             raise QueueUnavailable(str(refusal)) from None
         self.run("list", ["--project", name, "--limit", "1", "--json"], PROBE_TIMEOUT)
-        self.name = name
+        with self._binding_lock:
+            if (project, service) != (self.project_id, self.service):
+                raise QueueUnavailable("project changed during queue observation")
+            self.name = name
         return name
 
     def status(self):
@@ -376,7 +396,8 @@ class Queue:
         queue reports `unavailable` and a reason, which is a complete answer.
         """
         observed = datetime.now(timezone.utc).isoformat()
-        binding = (self.project_id, self.service, self.actor, self.share_topic)
+        with self._binding_lock:
+            binding = (self.project_id, self.service, self.actor, self.share_topic)
         def changed():
             return binding != (self.project_id, self.service, self.actor, self.share_topic)
         interrupted = {"queue_status": "unavailable", "observed_at": observed,
@@ -396,25 +417,25 @@ class Queue:
         except ValueError:
             code = "the work tracker returned output this bundle could not read"
         else:
+            with self._binding_lock:
+                if changed():
+                    return interrupted
+                items = page["items"][:VERIFY_LIMIT]
+                ready = [i for i in items if i.get("status") in ("open", "ready")]
+                observation = {"queue_status": "ready", "observed_at": observed,
+                               "ready_count": len(ready), "integration": COMMAND}
+                objectives = self.objectives(items)
+                if objectives:
+                    observation["objectives"] = objectives
+                self.last_status = observation
+                self._last_status_binding = binding
+                return dict(observation)
+        with self._binding_lock:
             if changed():
                 return interrupted
-            items = page["items"][:VERIFY_LIMIT]
-            ready = [i for i in items if i.get("status") in ("open", "ready")]
-            observation = {"queue_status": "ready", "observed_at": observed,
-                           "ready_count": len(ready), "integration": COMMAND}
-            objectives = self.objectives(items)
-            if objectives:
-                observation["objectives"] = objectives
-            if changed():
-                return interrupted
-            self.last_status = observation
-            self._last_status_binding = binding
-            return dict(observation)
-        if changed():
-            return interrupted
-        if self.last_status and self._last_status_binding == binding:
-            return dict(self.last_status, queue_status="stale", reason_code=code[:120])
-        return {"queue_status": "unavailable", "observed_at": observed, "reason_code": code[:120]}
+            if self.last_status and self._last_status_binding == binding:
+                return dict(self.last_status, queue_status="stale", reason_code=code[:120])
+            return {"queue_status": "unavailable", "observed_at": observed, "reason_code": code[:120]}
 
     def objectives(self, items):
         """Bounded observed assignments for this session's declared local actor.
@@ -442,11 +463,14 @@ class Queue:
                 continue
             if self.share_topic and not isinstance(item.get("title"), str):
                 continue
-            seen.add(item_id)
             locator = json.dumps([self.service, self.project_id, item_id], ensure_ascii=False)
-            entry = {"id": hashlib.sha256(locator.encode("utf-8")).hexdigest(), "status": status}
-            if self.share_topic:
-                entry["title"] = item["title"][:160]
+            try:
+                entry = {"id": hashlib.sha256(locator.encode("utf-8")).hexdigest(), "status": status}
+                if self.share_topic:
+                    entry["title"] = item["title"].encode("utf-8")[:160].decode("utf-8", errors="ignore")
+            except UnicodeEncodeError:
+                continue
+            seen.add(item_id)
             published.append(entry)
             if len(published) == OBJECTIVE_LIMIT:
                 break
