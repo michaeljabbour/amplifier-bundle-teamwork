@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 import uuid
 import urllib.error
 import urllib.request
@@ -427,6 +428,8 @@ class TeamworkHook:
         # exactly like a declared one, and no reader could tell them apart.
         self.responsibility = responsibility
         self.skills = [v for v in (skills or []) if isinstance(v, str)]
+        self._card_lock = threading.RLock()
+        self._card_versions = {}
         self.agent_version = 0
         self.agent_status = "unregistered"
         self.presence_version = 0
@@ -454,6 +457,11 @@ class TeamworkHook:
         self.entered = False
 
     def rebind(self, project_id, credential=None):
+        """Change project atomically with card/presence bookkeeping."""
+        with self._card_lock:
+            return self._rebind(project_id, credential)
+
+    def _rebind(self, project_id, credential=None):
         """Point this mounted hook at another project without re-registering handlers.
 
         A different project is a different shared session, so the correlation id
@@ -472,6 +480,11 @@ class TeamworkHook:
                 updates[key] = credential[key]
         if "base_url" in updates:
             updates["base_url"] = validate_service_url(updates["base_url"])
+        next_connection = dict(self.connection, **updates)
+        next_sid = str(uuid.uuid5(uuid.NAMESPACE_URL, next_connection["base_url"] + "/" + next_connection["project_id"] + "/" + sha(next_connection["token"]) + "/" + self.native))
+        if next_sid == self.sid:
+            return self.sid
+        self._card_versions[self.sid] = (self.agent_version, self.presence_version)
         # A project change ends consent for this detector's old window. The
         # async done callback/host cleanup owns completion of cancellation.
         for task in tuple(self._decision_tasks | self._lesson_tasks):
@@ -480,9 +493,14 @@ class TeamworkHook:
             # Close the open turn under the project it started in, so a turn is
             # never split across two projects or silently dropped.
             self.finish("", "interrupted")
-        self.connection = dict(self.connection, **updates)
+        self.connection = next_connection
         self.client = HTTPClient(self.connection)
-        self.sid = str(uuid.uuid5(uuid.NAMESPACE_URL, self.connection["base_url"] + "/" + self.connection["project_id"] + "/" + sha(self.connection["token"]) + "/" + self.native))
+        self.sid = next_sid
+        self.agent_version, self.presence_version = self._card_versions.get(self.sid, (0, 0))
+        self.agent_status, self.presence_status = "unregistered", "unreported"
+        self.presence_summary = ""
+        self.waiting_reason = self.waiting_on = None
+        self.mirror_said = False
         self.state = self.journal.load(self.sid)
         self.entered = False
         self._session_ended = False
@@ -578,10 +596,11 @@ class TeamworkHook:
         late truth. So this is sent directly, and a failure disables it for the rest
         of the session rather than accumulating.
         """
-        if self.agent_status == "unavailable" or not self.entered:
-            return
-        sid, client, connection = self.sid, self.client, self.connection
-        version = self.agent_version
+        with self._card_lock:
+            if self.agent_status == "unavailable" or not self.entered:
+                return
+            sid, client, connection = self.sid, self.client, self.connection
+            version = self.agent_version
         def current():
             return self.sid == sid and self.client is client and self.connection is connection
         data = {"session_id": sid}
@@ -617,16 +636,20 @@ class TeamworkHook:
                 data["queue"] = {k: v for k, v in data["queue"].items() if k != "objectives"}
                 client.request("publish", {"operations": [operation]}, uid())
         except SyncError as error:
-            if not current():
-                return
-            # Never fatal: sharing does not depend on being addressable.
-            self.agent_status = "unavailable"
+            with self._card_lock:
+                if not current():
+                    return
+                # Never fatal: sharing does not depend on being addressable.
+                self.agent_status = "unavailable"
             logger.info("Teamwork agent registration unavailable (HTTP %s; 0 means transport failure); "
                         "sharing is unaffected", error.status)
             return
-        if current():
-            self.agent_version = version + 1
-            self.agent_status = "registered"
+        with self._card_lock:
+            versions = self._card_versions.get(sid, (0, 0))
+            self._card_versions[sid] = (max(versions[0], version + 1), versions[1])
+            if current():
+                self.agent_version = self._card_versions[sid][0]
+                self.agent_status = "registered"
 
     def report_presence(self, state, summary=""):
         """Say what this session is doing. Best effort, never queued.
@@ -641,38 +664,40 @@ class TeamworkHook:
         and bounded by the same projection the shared excerpt uses -- never a model's
         narrative of its own work, which would be unfalsifiable and always flattering.
         """
-        if self.presence_status == "unavailable" or not self.entered:
-            return
-        # Any non-waiting report resolves the wait. The turn starting IS the
-        # resolution as far as this session can honestly observe -- it is running
-        # again -- and a wait that outlives the waiting is worse than none.
-        # A wait that named a request ends when that request is answered, and
-        # not before: the session running again says nothing about whether the
-        # person replied. A wait naming only a person still ends here, because
-        # there is nothing to observe and pretending otherwise strands it.
-        if state != "waiting" and not self.waiting_on:
-            self.waiting_reason = None
-        # An idle session reports no NEW subject, which is not the same as having
-        # had none. Blanking it would empty the field almost whenever anyone looks,
-        # since a session is idle far more often than it is running; "idle, last on
-        # X" is both more useful and no less true, because `state` already says idle.
-        if summary:
-            self.presence_summary = self.clean(summary)[:PRESENCE_SUMMARY]
-        try:
-            data = {"session_id": self.sid, "state": state, "summary": self.presence_summary}
+        with self._card_lock:
+            if self.presence_status == "unavailable" or not self.entered:
+                return
+            sid, client, connection = self.sid, self.client, self.connection
+            version = self.presence_version
+            # A request-bound wait ends on its answer; an unbound wait may end
+            # when execution resumes. Project rebind always clears both.
+            if state != "waiting" and not self.waiting_on:
+                self.waiting_reason = None
+            if summary:
+                self.presence_summary = self.clean(summary)[:PRESENCE_SUMMARY]
+            data = {"session_id": sid, "state": state, "summary": self.presence_summary}
             if state == "waiting" and self.waiting_reason:
                 data["reason"] = self.waiting_reason
-            self.client.request("publish", {"operations": [
-                {"op": "presence.upsert", "id": self.sid, "expected_version": self.presence_version,
+        def current():
+            return self.sid == sid and self.client is client and self.connection is connection
+        try:
+            client.request("publish", {"operations": [
+                {"op": "presence.upsert", "id": sid, "expected_version": version,
                  "data": data}]}, uid())
         except SyncError as error:
-            # Never fatal: sharing does not depend on being legible.
-            self.presence_status = "unavailable"
+            with self._card_lock:
+                if not current():
+                    return
+                self.presence_status = "unavailable"
             logger.info("Teamwork presence unavailable (HTTP %s; 0 means transport failure); "
                         "sharing is unaffected", error.status)
             return
-        self.presence_version += 1
-        self.presence_status = state
+        with self._card_lock:
+            versions = self._card_versions.get(sid, (0, 0))
+            self._card_versions[sid] = (versions[0], max(versions[1], version + 1))
+            if current():
+                self.presence_version = self._card_versions[sid][1]
+                self.presence_status = state
 
     async def sense(self, state, summary=""):
         await asyncio.to_thread(self.report_presence, state, summary)
