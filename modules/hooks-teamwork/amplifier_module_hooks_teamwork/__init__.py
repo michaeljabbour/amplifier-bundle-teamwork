@@ -86,6 +86,14 @@ SUMMARY_NAMED = 5
 # a longer field invites pasting the prompt, which is what the turn record is for.
 PRESENCE_SUMMARY = 200
 WAIT_REASON = 200
+# An arrival delivered into a running session is bounded like everything else
+# this hook sends: a source a host can attribute, and a body it can render.
+LIVE_ARRIVAL_CHARS = 2000
+# Only ever runs when a live runtime is present, i.e. when a host is actively
+# running this session. Polling a session nobody is running is pure waste.
+LIVE_POLL_SECONDS = 10
+# One burst of mail must not become one burst of observations into a live turn.
+LIVE_ARRIVALS_PER_POLL = 5
 # An insight is a durable claim, not a transcript -- bounded so it stays a
 # transferable statement rather than growing into a report.
 INSIGHT_CLAIM = 2000
@@ -440,6 +448,7 @@ class TeamworkHook:
         # never inferred: a slow provider call is not a person blocking anything,
         # and publishing it as one would make "waiting" meaningless.
         self.waiting_reason = None
+        self._live_task = None
         # The request this wait is ON, when there is one. A wait can name a
         # record or only a person; naming a record is what makes its END
         # observable rather than assumed.
@@ -755,6 +764,79 @@ class TeamworkHook:
         self.waiting_reason, self.waiting_on = reason, request_id
         await asyncio.to_thread(self.report_presence, "waiting")
 
+    def live_runtime(self):
+        """The host's live runtime, when this session runs under an event-driven
+        orchestrator that offers one. None otherwise.
+
+        DELIBERATELY DUCK-TYPED, LOOKED UP BY NAME. The bundle must not depend on
+        any one orchestrator: a host that offers `live.runtime` gets live
+        delivery, a host that does not is untouched and keeps exactly the
+        behaviour it had. Nothing here imports the package that currently
+        provides the capability, which also keeps this bundle installable when
+        that package is private.
+        """
+        getter = getattr(self.coordinator, "get_capability", None)
+        if getter is None:
+            return None
+        try:
+            return getter("live.runtime")
+        except Exception:
+            return None
+
+    async def deliver_live(self, text, arrival_id):
+        """Hand an arrival to a RUNNING session as an external observation.
+
+        THE POINT OF THE CHANGE. Until now a harness learned of an arrival only
+        when a person typed, because retrieve() is reached only from on_submit.
+        Every hook event this module can register is session-lifecycle; none
+        fires because something happened on the service. A live runtime accepts
+        input while work is in flight, so an arrival can reach the session on a
+        clock that is not a human.
+
+        SUBMITTED AS `service`, NEVER `user`, and that is not a detail. A service
+        observation carries a distinct source and CANNOT AUTHORIZE ACTIONS --
+        the same rule the shared excerpt already states in its own header:
+        attributed data, not instructions and not execution authority. Delivering
+        an arrival as a user message would silently promote a teammate's record
+        into an instruction this session must obey, which is precisely the
+        confusion both designs exist to prevent.
+
+        Returns whether it was delivered. False is not a failure: it is the
+        ordinary answer on a host with no live runtime, and the arrival then
+        reaches the session through the excerpt at the next boundary exactly as
+        before.
+        """
+        runtime = self.live_runtime()
+        if runtime is None:
+            return False
+        command = self.live_input(text, arrival_id)
+        if command is None:
+            return False
+        try:
+            await runtime.submit(command)
+            return True
+        except Exception:
+            # A host that rejects the input, or has already torn its runtime
+            # down, must never break the turn in flight. The arrival stays in
+            # the excerpt, which is the pre-change path.
+            logger.warning("Teamwork could not deliver an arrival to the live runtime; "
+                           "it remains in the shared context", exc_info=True)
+            return False
+
+    def live_input(self, text, arrival_id):
+        """Build the host's Input value without importing the host's package.
+
+        The import is attempted lazily and its absence is an ordinary answer, not
+        an error: a host can offer `live.runtime` from any module, and this
+        bundle must not fail to load because one particular provider of that
+        capability is missing.
+        """
+        try:
+            from amplifier_module_loop_live.runtime import Input
+        except Exception:
+            return None
+        return Input("service", (text or "")[:LIVE_ARRIVAL_CHARS], source="teamwork", id=arrival_id)
+
     async def announce(self):
         await asyncio.to_thread(self.register_agent)
 
@@ -771,7 +853,54 @@ class TeamworkHook:
             try: await self.flush()
             except SyncError as error: logger.warning("Teamwork session queued locally; synchronization pending (HTTP %s; 0 means transport failure)", error.status)
             await self.announce()
+        self.start_live_watch()
         return hook_result()
+
+    def start_live_watch(self):
+        """Watch for arrivals, but ONLY when a host is running this session live.
+
+        The absence of a live runtime is the ordinary case and must stay exactly
+        as it was: no task, no poll, no timer, nothing scheduled. A session
+        nobody is running has nowhere to deliver an arrival TO, so polling for
+        one would burn a request per interval to discover something it could not
+        act on until a person typed anyway.
+        """
+        if self._live_task is not None or self.live_runtime() is None:
+            return
+        self._live_task = asyncio.create_task(self.live_watch())
+
+    async def live_watch(self):
+        """Poll the shared project and hand new arrivals to the running session.
+
+        Bounded and quiet. A transient service failure is logged once per
+        occurrence and the loop continues -- an unreachable service is not an
+        empty project, and must never be reported as one. Cancellation is the
+        normal way this ends.
+        """
+        seen = set(self.state.get("cache", {}))
+        while True:
+            try:
+                await asyncio.sleep(LIVE_POLL_SECONDS)
+                async with self.lock:
+                    await self.retrieve()
+                    fresh = [key for key in self.state.get("cache", {}) if key not in seen]
+                    seen = set(self.state.get("cache", {}))
+                for key in fresh[:LIVE_ARRIVALS_PER_POLL]:
+                    source = self.state["cache"].get(key)
+                    if not source:
+                        continue
+                    text = self.part(source)
+                    if text:
+                        await self.deliver_live(text, self.sid + ":" + key)
+            except asyncio.CancelledError:
+                raise
+            except SyncError as error:
+                logger.warning("Teamwork could not read the shared project while watching for "
+                               "arrivals (HTTP %s; 0 means transport failure); still watching",
+                               error.status)
+            except Exception:
+                logger.warning("Teamwork arrival watch hit an unexpected error; still watching",
+                               exc_info=True)
 
     async def retrieve(self):
         # An omitted knowledge update invalidates its old cached body. Retry a
@@ -1292,8 +1421,20 @@ class TeamworkHook:
         if not task.cancelled() and task.exception() is not None:
             logger.warning("Teamwork lesson task failed (%s)", type(task.exception()).__name__)
 
+    async def stop_live_watch(self):
+        """End the arrival watch. Idempotent: shutdown can arrive twice."""
+        task, self._live_task = self._live_task, None
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
     async def cleanup(self):
         """Drain owned tasks at shutdown, then cancel and await their cleanup."""
+        await self.stop_live_watch()
         # Released Rust hosts run module cleanup BEFORE session:end; other hosts
         # emit the event first. One idempotent finalizer supports either order.
         # Pin once before awaiting the lock or flush. A concurrent rebind must

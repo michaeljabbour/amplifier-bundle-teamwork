@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+import amplifier_module_hooks_teamwork as teamwork_module
 from types import SimpleNamespace
 import urllib.request
 import urllib.error
@@ -30,6 +31,29 @@ class Coordinator:
     def __init__(self, context): self.context = context; self.tools = {}
     def get(self, name): return self.context if name == "context" else None
     async def mount(self, point, value, name): self.tools[name] = value
+
+
+class LiveRuntime:
+    """Stands in for a host's live runtime. Mirrors the two rules that matter:
+    a `service` observation needs a distinct source, and it cannot be `user`.
+    """
+    def __init__(self, fails=False):
+        self.submitted, self.fails = [], fails
+
+    async def submit(self, command):
+        if self.fails:
+            raise RuntimeError("runtime torn down")
+        if command.kind == "service" and command.source in {"", "user", "system", "developer"}:
+            raise ValueError("Service observations need a distinct source")
+        self.submitted.append(command)
+
+
+class LiveCoordinator(Coordinator):
+    def __init__(self, context, runtime=None):
+        super().__init__(context)
+        self.runtime = runtime
+    def get_capability(self, name):
+        return self.runtime if name == "live.runtime" else None
 
 
 class RecordingDisplay:
@@ -512,6 +536,62 @@ class HookTests(unittest.IsolatedAsyncioTestCase):
                             filing=Exploding())
         await hook.on_start("session:start", {})
         self.assertEqual(hook.agent_status, "registered")
+
+    async def test_no_live_runtime_means_no_watch_and_nothing_scheduled(self):
+        """The ordinary case, and it must stay EXACTLY as it was. A session
+        nobody is running has nowhere to deliver an arrival to, so polling for
+        one would burn a request per interval to find something it could not act
+        on until a person typed anyway.
+        """
+        await self.hook.on_start("session:start", {})
+        self.assertIsNone(self.hook._live_task)
+        self.assertIsNone(self.hook.live_runtime())
+
+    async def test_a_live_runtime_starts_the_watch(self):
+        runtime = LiveRuntime()
+        hook = TeamworkHook(LiveCoordinator(self.context, runtime), self.connection,
+                            self.journal, self.client)
+        await hook.on_start("session:start", {})
+        self.assertIsNotNone(hook._live_task)
+        await hook.stop_live_watch()
+        self.assertIsNone(hook._live_task)
+
+    async def test_an_arrival_is_delivered_as_service_never_as_user(self):
+        """Not a detail. A `service` observation carries a distinct source and
+        cannot authorize actions -- the same rule the shared excerpt states in
+        its own header. Delivering an arrival as a user message would promote a
+        teammate's record into an instruction this session must obey.
+        """
+        runtime = LiveRuntime()
+        hook = TeamworkHook(LiveCoordinator(self.context, runtime), self.connection,
+                            self.journal, self.client)
+        hook.ensure_session()
+        delivered = await hook.deliver_live("work-1 was assigned to you", "arrival-1")
+        self.assertTrue(delivered)
+        self.assertEqual(len(runtime.submitted), 1)
+        command = runtime.submitted[0]
+        self.assertEqual(command.kind, "service")
+        self.assertEqual(command.source, "teamwork")
+        self.assertNotEqual(command.source, "user")
+        self.assertEqual(command.id, "arrival-1")
+
+    async def test_a_runtime_that_rejects_never_breaks_the_turn(self):
+        """A host that has torn its runtime down must not take the in-flight turn
+        with it. The arrival stays in the excerpt, which is the pre-change path.
+        """
+        runtime = LiveRuntime(fails=True)
+        hook = TeamworkHook(LiveCoordinator(self.context, runtime), self.connection,
+                            self.journal, self.client)
+        hook.ensure_session()
+        self.assertFalse(await hook.deliver_live("work-1", "arrival-1"))
+
+    async def test_an_arrival_is_bounded_before_it_is_submitted(self):
+        runtime = LiveRuntime()
+        hook = TeamworkHook(LiveCoordinator(self.context, runtime), self.connection,
+                            self.journal, self.client)
+        hook.ensure_session()
+        await hook.deliver_live("z" * 9000, "arrival-1")
+        self.assertEqual(len(runtime.submitted[0].text), teamwork_module.LIVE_ARRIVAL_CHARS)
 
     async def test_a_declared_wait_publishes_its_reason(self):
         await self.hook.on_start("session:start", {})
