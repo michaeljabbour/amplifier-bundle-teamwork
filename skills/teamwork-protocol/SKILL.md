@@ -3,8 +3,8 @@ name: teamwork-protocol
 description: >-
   USE WHEN enrolled in a shared Teamwork project and something must cross to teammates:
   who to ask (person or harness), whether an arriving request wants action or a note,
-  what to publish about your own work, declaring a wait. DO NOT USE WHEN the work is
-  local and nothing is asked of, or told to, anyone else.
+  what to publish about your own work, requesting a bounded contribution, declaring a
+  wait. DO NOT USE WHEN the work is local and nothing is asked of, or told to, anyone else.
 ---
 
 # Working in a shared Teamwork project
@@ -38,23 +38,28 @@ Those are different questions that happen to have the same easy answer most of t
 
 **Then: is this a fact, or a decision?**
 
-> Facts about live work live in machines. Decisions live in people.
+> Retrieve facts from a source that holds them. Route decisions to whoever has the
+> applicable authority.
 
 The test is not who is closer, cheaper, or likelier to reply. It is *what kind of thing
 am I asking for* — something somebody already knows, or something somebody has to decide.
 
 - **Retrieval** — "what shape does that output have right now", "have you touched this
-  yet" — address to the harness working there. It should never cost a person anything.
-- **Judgment** — "should we still support the old format" — address to a person. A
-  confident answer from a machine is *worse* than no answer, because it carries no
-  authority and looks like it does. (`04`)
+  yet" — address to a harness with current, attributable knowledge of that work. No
+  human relay is needed when it already holds the answer. (`04`)
+- **An undelegated decision** — "may we stop supporting the old format" when the
+  product owner has retained that choice — goes to that person. A harness can retrieve
+  an existing decision or apply an explicitly delegated policy; proximity to the code
+  supplies neither. (`04b`)
 
-A harness's published state is evidence about what it can answer. A harness working in an
-area can be trusted on the state of that area. It cannot be trusted on whether the area
-should exist.
+A harness's published state helps identify what it may know. Check its subject and
+freshness; "active" alone says nothing about expertise, capacity, or authority.
 
 **Address exactly one recipient.** Addressing by node label or person is supported;
 ambiguity is refused with `409 ambiguous_recipient` and candidates, rather than guessed.
+`teamwork_send(to_person=...)` addresses that person's **agent**, not a human inbox.
+For a human decision, use an available authorized human request channel. If none is
+available, state the routing limit; `teamwork_wait` does not notify the person.
 
 ---
 
@@ -96,12 +101,22 @@ churn. It is *if a teammate read this, would they do something differently?*
 - A piece blocked — publish. Somebody may be able to unblock it.
 - A piece completed — publish. Somebody may be waiting on it.
 - A piece you dropped as unnecessary — usually **do not**. Nobody was going to act on a
-  thing that turned out not to exist.
+  thing that turned out not to exist. Report it if it changes an agreed commitment,
+  scope, dependency, or delivery expectation.
 - The internal shape of your decomposition — **do not**. The shared project is not a
   mirror of one machine's private backlog.
 
 **A blocker published without its cause is not a published blocker.** "Stuck" is a status;
 "stuck on whether we support the old format" is a question somebody can answer. (`03`)
+
+Internal activity alone needs no extra update when the shared commitment remains
+accurate and no promised update is due. This is restraint about deliberate status
+notes, not a change to consented automatic sharing of visible turns. (`03b`)
+
+Use the actual tool's vocabulary: `teamwork_progress` writes a note on assigned work;
+its optional status is only `in_progress` or `completed`. Describe a blocker in the
+note without inventing a `blocked` argument. Local work projection is limited to
+items explicitly named by the user.
 
 Two failures, and the second is invisible: publishing nothing until you are done (correct
 at the end, useless throughout), and publishing everything (the project becomes a log, and
@@ -125,8 +140,34 @@ linked to a Teamwork request persists across unrelated prompts until that reques
 Say what the wait costs. "Waiting" is a state; "waiting on whether we support the old
 format, and the migration cannot start without it" is a thing someone can act on.
 
-**Delivery is not agreement, and not action.** A message that arrived has not been
-accepted. Do not record, report, or reason as though it has.
+**Delivery is not agreement, and not action.** A message's transport acknowledgement
+does not mean the recipient agreed to the work. Do not report or reason as though it has.
+
+---
+
+## Requesting a contribution from another harness
+
+**A message can request work; it cannot transfer authority or execution custody.**
+
+When delegation is already permitted, send one bounded request to the eligible
+harness: the outcome, approved input and revision, action/resource limits, expected
+evidence, and unchanged accountable owner. Ask it to say whether it can take the
+piece. Its expertise, presence, project access, or offer of help is not a substitute
+for the existing permission required on both sides. (`05`)
+
+If the current grant excludes delegation, retain the piece within local authority.
+Do not disguise an execution request as a question or ask someone to relay it. (`05b`)
+
+`teamwork_send` carries plain text to one agent in the same project, at most 4000
+characters. These boundaries belong in the message; they are not new tool fields
+or runtime-enforced grants. Share only approved inputs, never credentials or a
+private transcript to make the other harness resemble this one.
+
+Report a queued request as a request. Message `accepted` means context
+acknowledgement, not willingness to perform the work, execution, or success. A
+recipient's explicit reply is still separate from result evidence and verification.
+Keep independent work moving; messaging does not wake a recipient or guarantee a
+reply. There is no custody-transfer operation in this tool.
 
 ---
 
@@ -185,8 +226,9 @@ addition, never by erasure).
 | rule | derived from |
 |---|---|
 | route on the subject, not the relationship | `docs/scenarios/01`, `02` |
-| publish what changes someone else's next move | `docs/scenarios/03` |
-| facts to machines, decisions to people | `docs/scenarios/04` |
+| publish an actionable change; omit internal churn | `docs/scenarios/03`, `03b` |
+| distinguish retrieval from an undelegated decision | `docs/scenarios/04`, `04b` |
+| request a bounded contribution only under existing delegation | `docs/scenarios/05`, `05b` |
 | record what will still be true when the task is forgotten | `docs/scenarios/06` |
 | replace by addition, never by erasure | `docs/scenarios/07` |
 
