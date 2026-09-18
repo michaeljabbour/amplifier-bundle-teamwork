@@ -103,6 +103,15 @@ LIVE_STOP_SECONDS = 1
 # the session is blocked while this runs, so it must end on its own.
 WAIT_POLL_SECONDS = 5
 WAIT_MAX_SECONDS = 120
+# How many past decisions a recall serves, and the ceiling a caller cannot raise
+# past. A local store that grows without limit becomes a per-turn tax the moment
+# anything injects from it, so the bound lives at the read.
+DECISION_RECALL = 5
+DECISION_RECALL_MAX = 50
+# How much of one decision's claim a recall returns. The shared excerpt is capped
+# at 10KB for the same reason; a local store needs its own discipline or it
+# quietly becomes the larger cost.
+DECISION_RECALL_CLAIM = 1000
 # An insight is a durable claim, not a transcript -- bounded so it stays a
 # transferable statement rather than growing into a report.
 INSIGHT_CLAIM = 2000
@@ -301,6 +310,22 @@ class Journal:
             # tables here rather than opening a second store.
             conn.execute("CREATE TABLE IF NOT EXISTS decision_watermark (session TEXT PRIMARY KEY, turn_index INTEGER NOT NULL)")
             conn.execute("CREATE TABLE IF NOT EXISTS decision_fingerprint (session TEXT NOT NULL, fingerprint TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (session, fingerprint))")
+            # The decision's own WORDS, not only its hash.
+            #
+            # `decision_fingerprint` above answers "have we said this already?"
+            # and nothing else -- a hash cannot be read back. So a decision this
+            # machine reached existed in exactly two places, the service and the
+            # transcript, and neither is reachable as local context. A session
+            # could not be reminded of what it had already decided.
+            #
+            # Keyed by session, like every other table here: one file per
+            # credential, rows scoped to the shared session that wrote them, so
+            # a rebind reads the new binding's rows rather than the old one's.
+            conn.execute("CREATE TABLE IF NOT EXISTS decision_body ("
+                         "session TEXT NOT NULL, fingerprint TEXT NOT NULL, kind TEXT NOT NULL, "
+                         "claim TEXT NOT NULL, basis TEXT, confidence TEXT, limitations TEXT, "
+                         "record_id TEXT, created_at TEXT NOT NULL, "
+                         "PRIMARY KEY (session, fingerprint))")
             # Private diagnostic metadata only; never claim text or provider output.
             conn.execute("CREATE TABLE IF NOT EXISTS detection_outcome ("
                          "session TEXT NOT NULL, kind TEXT NOT NULL, outcome TEXT NOT NULL, "
@@ -365,6 +390,44 @@ class Journal:
                 "INSERT OR IGNORE INTO decision_fingerprint(session, fingerprint, created_at) VALUES (?,?,?)",
                 (sid, fingerprint, now()))
             return cursor.rowcount == 1
+
+    def record_decision_body(self, sid, fingerprint, kind, claim, basis=None,
+                             confidence=None, limitations=None, record_id=None):
+        """Keep what was decided, beside the hash that says it was.
+
+        Best-effort, exactly like `record_detection_outcome`: a local copy is a
+        convenience for later context, and failing to keep one must never turn a
+        recorded decision into a failed one.
+        """
+        try:
+            with self.connect() as conn, conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO decision_body"
+                    "(session, fingerprint, kind, claim, basis, confidence, limitations, record_id, created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                    (sid, fingerprint, kind, claim, basis, confidence, limitations, record_id, now()))
+        except Exception:
+            logger.debug("Teamwork decision body not kept locally", exc_info=True)
+
+    def decisions(self, sid, limit=DECISION_RECALL):
+        """The most recent decisions this shared session recorded, newest first.
+
+        BOUNDED AT THE READ, not at the caller. An unbounded local store grows
+        forever and would be injected into every turn, so the bound lives here
+        where it cannot be forgotten by a consumer.
+        """
+        limit = max(1, min(int(limit or DECISION_RECALL), DECISION_RECALL_MAX))
+        try:
+            with self.connect() as conn:
+                rows = conn.execute(
+                    "SELECT kind, claim, basis, confidence, limitations, record_id, created_at "
+                    "FROM decision_body WHERE session=? ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                    (sid, limit)).fetchall()
+        except Exception:
+            logger.debug("Teamwork local decisions unreadable", exc_info=True)
+            return []
+        return [{"kind": r[0], "claim": r[1], "basis": r[2], "confidence": r[3],
+                 "limitations": r[4], "record_id": r[5], "recorded_at": r[6]} for r in rows]
 
     def release_decision_fingerprint(self, sid, fingerprint):
         """Release only after a definite refusal; unknown writes stay reserved."""
@@ -1683,6 +1746,27 @@ class TeamworkHook:
             window, upto, binding = captured
             await self._judge_and_record_lesson(window, upto, binding)
 
+    def recall_decisions(self, limit=None):
+        """This session's own recent decisions, read from the local journal.
+
+        BINDING-RESOLVED AT CALL TIME, and that is the whole reason this exists
+        rather than handing the Journal out through the capability. One journal
+        file serves every binding this credential has had, with rows keyed by
+        shared session id -- so a consumer that captured `hook.sid` once and read
+        with it would serve the PREVIOUS project's decisions after a rebind. The
+        id is read from the hook on every call; nothing caches it.
+
+        Bounded at the journal, and the claim bounded here: a local store is only
+        cheap while something stops it being injected whole.
+        """
+        found = self.journal.decisions(self.sid, limit)
+        for entry in found:
+            claim = entry.get("claim") or ""
+            if len(claim) > DECISION_RECALL_CLAIM:
+                entry["claim"] = claim[:DECISION_RECALL_CLAIM - 1].rstrip() + "\u2026"
+                entry["truncated"] = True
+        return found
+
     async def detection_outcome(self, sid, kind, outcome, tally_size=None, link_count=None):
         """Record one detection outcome locally AND announce it on the hook bus.
 
@@ -1852,6 +1936,19 @@ class TeamworkHook:
         if not result.success:
             logger.warning("Teamwork %s recording outcome unknown for attempted insight %s; not retrying",
                            log_label, error.get("attempted_record_id"))
+        # KEEP WHAT WAS DECIDED, not only that something was. The fingerprint
+        # above answers "have we said this already?" and cannot be read back, so
+        # until now a decision this machine reached was legible only on the
+        # service or in the transcript -- neither reachable as local context.
+        #
+        # Written on an unknown acceptance too, and deliberately: the claim was
+        # judged and sent, and a local copy of what we tried to say is exactly
+        # what a later turn needs in order to tell whether it landed.
+        if result.success or error.get("outcome") == "unknown":
+            self.journal.record_decision_body(
+                binding[0], fingerprint, log_label, claim, basis, confidence, limitations,
+                (result.output or {}).get("recorded") if result.success
+                else error.get("attempted_record_id"))
         await self.detection_outcome(binding[0], log_label,
             "recorded" if result.success else "acceptance_unknown", tally_size, len(links))
 
@@ -2839,6 +2936,10 @@ async def mount(coordinator, config=None):
         coordinator.register_contributor(
             "observability.events", "bundle-teamwork:hooks-teamwork",
             lambda: list(detection_events.ALL_EVENTS))
+    # The accessor, never the store. Handing out the Journal would hand out a
+    # file that outlives the binding it was opened for; this resolves the current
+    # session id on every call (see recall_decisions).
+    coordinator.register_capability("teamwork.decisions", hook.recall_decisions)
     coordinator.register_capability("teamwork.session_id", hook.sid)
     coordinator.register_capability("teamwork.rebind", hook.rebind)
     # Core/Foundation register a returned callable as module-owned cleanup.
