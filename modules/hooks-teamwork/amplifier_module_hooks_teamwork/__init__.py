@@ -8,6 +8,7 @@ import inspect
 import json
 import logging
 import os
+import time
 import re
 import sqlite3
 import threading
@@ -95,6 +96,10 @@ LIVE_ARRIVAL_CHARS = 2000
 LIVE_POLL_SECONDS = 10
 # One burst of mail must not become one burst of observations into a live turn.
 LIVE_ARRIVALS_PER_POLL = 5
+# A wait that polls is still a wait a person is paying for. Bounded on purpose:
+# the session is blocked while this runs, so it must end on its own.
+WAIT_POLL_SECONDS = 5
+WAIT_MAX_SECONDS = 120
 # An insight is a durable claim, not a transcript -- bounded so it stays a
 # transferable statement rather than growing into a report.
 INSIGHT_CLAIM = 2000
@@ -470,6 +475,11 @@ class TeamworkHook:
         # record or only a person; naming a record is what makes its END
         # observable rather than assumed.
         self.waiting_on = None
+        # The answer itself, once one has been observed -- see note_answer. None
+        # until then, and never an empty shape: "answered with nothing" is a
+        # claim nobody made, and it must not be possible to read one.
+        self.answer = None
+        self._wait = None
         # Said once, on the first notice, so a misconfiguration is not silent.
         self.complaint = complaint
         self.client = client or HTTPClient(connection)
@@ -527,7 +537,8 @@ class TeamworkHook:
         self.agent_version, self.presence_version = self._card_versions.get(self.sid, (0, 0))
         self.agent_status, self.presence_status = "unregistered", "unreported"
         self.presence_summary = ""
-        self.waiting_reason = self.waiting_on = None
+        self.waiting_reason = self.waiting_on = self.answer = None
+        self._wait = None
         self.mirror_said = False
         self.state = self.journal.load(self.sid)
         self.entered = False
@@ -614,6 +625,27 @@ class TeamworkHook:
             return {}
         return reports.sanitize_outbound(self.clean_json(observation))
 
+    def _publish_card(self, client, operation, current, allow_rebase=True):
+        """Rebase once after a definite conflict for this one bound card.
+
+        A fresh process has no in-memory heartbeat version. The server's exact
+        single-operation conflict response supplies it without replaying an
+        ambiguous transport failure or following a project rebind.
+        """
+        try:
+            client.request("publish", {"operations": [operation]}, uid())
+        except SyncError as error:
+            detail = error.body.get("error") if isinstance(error.body, dict) else None
+            actual = detail.get("current_version") if isinstance(detail, dict) else None
+            if not (allow_rebase and error.status == 409 and isinstance(detail, dict)
+                    and detail.get("code") == "version_conflict"
+                    and type(detail.get("operation_index")) is int and detail["operation_index"] == 0
+                    and type(actual) is int and actual > operation["expected_version"] and current()):
+                raise
+            operation["expected_version"] = actual
+            client.request("publish", {"operations": [operation]}, uid())
+        return operation["expected_version"]
+
     def register_agent(self):
         """Announce this session as an addressable agent. Best effort, never queued.
 
@@ -660,7 +692,7 @@ class TeamworkHook:
         operation = {"op": "agent.upsert", "id": sid, "expected_version": version, "data": data}
         try:
             try:
-                client.request("publish", {"operations": [operation]}, uid())
+                version = self._publish_card(client, operation, current)
             except SyncError as error:
                 # Older released servers reject this optional extension before
                 # committing. Retry only that exact definite refusal, once,
@@ -673,7 +705,10 @@ class TeamworkHook:
                     raise
                 logger.info("Teamwork service does not support objective observations; registering the ordinary card")
                 data["queue"] = {k: v for k, v in data["queue"].items() if k != "objectives"}
-                client.request("publish", {"operations": [operation]}, uid())
+                # A prior conflict may already have advanced the operation
+                # before this 422. The compatibility retry gets no second rebase.
+                version = self._publish_card(client, operation, current,
+                                             allow_rebase=operation["expected_version"] == version)
         except SyncError as error:
             with self._card_lock:
                 if not current():
@@ -693,7 +728,7 @@ class TeamworkHook:
             if current():
                 self.agent_status = "registered"
 
-    def report_presence(self, state, summary=""):
+    def report_presence(self, state, summary="", *, binding=None):
         """Say what this session is doing. Best effort, never queued.
 
         Off the durable outbox for the same two reasons registration is: that queue
@@ -707,6 +742,8 @@ class TeamworkHook:
         narrative of its own work, which would be unfalsifiable and always flattering.
         """
         with self._card_lock:
+            if binding is not None and not self.detection_binding_current(binding):
+                return
             if self.presence_status == "unavailable" or not self.entered:
                 return
             sid, client, connection = self.sid, self.client, self.connection
@@ -734,9 +771,8 @@ class TeamworkHook:
         def current():
             return self.sid == sid and self.client is client and self.connection is connection
         try:
-            client.request("publish", {"operations": [
-                {"op": "presence.upsert", "id": sid, "expected_version": version,
-                 "data": data}]}, uid())
+            operation = {"op": "presence.upsert", "id": sid, "expected_version": version, "data": data}
+            version = self._publish_card(client, operation, current)
         except SyncError as error:
             with self._card_lock:
                 if not current():
@@ -775,11 +811,82 @@ class TeamworkHook:
             return
         content = record.get("content") if isinstance(record.get("content"), dict) else {}
         if content.get("response") in ANSWER_LABELS:
+            # KEEP THE ANSWER, not just the fact of one. The excerpt this record
+            # also lands in is a BOUNDED, BEST-EFFORT sample -- measured live, a
+            # session rendered 12 of 221 records and a request addressed to that
+            # very session was not among them. Ambient context may drop things;
+            # that is what makes it cheap. The answer to a question this session
+            # is BLOCKED on is the one thing that must not be dropped, so it
+            # leaves by the channel the caller is already awaiting: the return
+            # value of the call that is waiting for it.
+            self.answer = {"request_id": self.waiting_on,
+                           "response": content["response"],
+                           "means": ANSWER_LABELS[content["response"]],
+                           "note": " ".join(str(content.get("progress_note") or "").split()) or None,
+                           "answered_by": content.get("responded_by"),
+                           "asked": content.get("title")}
+            ticket = getattr(self, "_wait", None)
+            if ticket is not None and self.wait_current(ticket):
+                ticket["answer"] = self.clean_json(self.answer)
             self.waiting_reason = self.waiting_on = None
 
+    def wait_current(self, ticket):
+        return (self._wait is ticket and not self._session_ended
+                and self.detection_binding_current(ticket["binding"]))
+
     async def declare_wait(self, reason, request_id=None):
-        self.waiting_reason, self.waiting_on = reason, request_id
-        await asyncio.to_thread(self.report_presence, "waiting")
+        # Every invocation owns its answer. Replacing a wait or changing consent
+        # cancels the old observation; neither event is an answer.
+        ticket = {"binding": self.detection_binding(), "request_id": request_id,
+                  "answer": None, "observed": False}
+        self._wait = ticket
+        self.waiting_reason, self.waiting_on, self.answer = reason, request_id, None
+        await asyncio.to_thread(self.report_presence, "waiting", binding=ticket["binding"])
+        if self.wait_current(ticket) and request_id:
+            cached = self.state["cache"].get("request:" + request_id)
+            if cached:
+                self.note_answer(cached["record"])
+        return ticket
+
+    async def await_answer(self, seconds, ticket):
+        """Observe this request within one binding and one wall-clock budget.
+
+        Cancellation of a threaded HTTP read cannot stop its socket. retrieve()
+        applies replies only in its coroutine, after checking the pinned binding;
+        a cancelled or rebound read therefore cannot mutate the new project.
+        """
+        deadline = time.monotonic() + seconds
+
+        async def poll():
+            async with self.lock:
+                if not self.wait_current(ticket):
+                    return
+                await self.flush()
+                if not self.wait_current(ticket):
+                    return
+                await self.retrieve()
+                if self.wait_current(ticket):
+                    ticket["observed"] = True
+
+        while self.wait_current(ticket):
+            answer = ticket["answer"]
+            if answer is not None and answer["request_id"] == ticket["request_id"]:
+                return "answered", None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return "timeout", None
+            try:
+                await asyncio.wait_for(poll(), timeout=remaining)
+            except TimeoutError:
+                return "timeout", None
+            except SyncError as error:
+                return "unreachable", error.status
+            if not self.wait_current(ticket):
+                break
+            if ticket["answer"] is not None:
+                continue
+            await asyncio.sleep(min(WAIT_POLL_SECONDS, max(0, deadline - time.monotonic())))
+        return "superseded", None
 
     def live_runtime(self):
         """The host's live runtime, when this session runs under an event-driven
@@ -859,7 +966,7 @@ class TeamworkHook:
     def ensure_session(self):
         if self.entered: return
         version = self.state["version"]; self.state["version"] += 1; self.entered = True
-        data = {"status": "active"}
+        data = {"status": "active", "ended_at": None}
         if version == 0: data.update(title="Amplifier shared session", external_session_id=self.native, started_at=now())
         self.queue([{"op": "session.upsert", "id": self.sid, "expected_version": version, "data": data}])
 
@@ -919,6 +1026,7 @@ class TeamworkHook:
                                exc_info=True)
 
     async def retrieve(self):
+        binding = self.detection_binding()
         # An omitted knowledge update invalidates its old cached body. Retry a
         # baseline on the next turn; a delta cursor alone will never resend it.
         if self.state.pop("knowledge_refetch", False):
@@ -927,9 +1035,13 @@ class TeamworkHook:
             body = {"session_id": self.sid, "cursor": self.state["cursor"], "selection": {"include": ["direction", "plans", "work", "ideas", "insights", "people", "presence", "messages", "agents"]}, "page_size": 100, "max_text_bytes": 262144}
             try: page = await asyncio.to_thread(self.client.request, "context", body)
             except SyncError as error:
+                if not self.detection_binding_current(binding):
+                    return
                 if error.status == 410:
                     self.state["cursor"] = None; self.state["cache"] = {}; self.journal.save(self.sid, self.state)
                 raise
+            if not self.detection_binding_current(binding):
+                return
             for record in page["items"]:
                 record = self.clean_json(record)
                 key = record["record_type"] + ":" + record["id"]
@@ -1733,6 +1845,9 @@ def resolve_connection(config):
 # from before the portal mapped them on write. Reading must tolerate both. Writing
 # must emit canonical only -- a third dialect is exactly what this table exists to
 # prevent, and the server refuses anything outside the canonical set anyway.
+# A paging read must be bounded, and the bound must be visible when it bites:
+# a short list that looks complete is worse than a long one that says it is not.
+PAGE_LIMIT = 20
 LEGACY_STATUS = {"Proposed": "requested", "Ready": "requested", "In progress": "in_progress",
                  "Needs review": "in_progress", "Done": "completed"}
 
@@ -1755,44 +1870,82 @@ class WorkTools:
     def __init__(self, hook):
         self.hook = hook
 
-    def project(self):
-        """Records this session may see, with each work item's status normalised."""
-        body = {"session_id": self.hook.sid, "selection": {"include": ["work", "agents"]},
-                "page_size": 100, "max_text_bytes": 262144}
-        page = self.hook.client.request("context", body)
-        work, mine = [], None
-        for entry in page.get("items", []):
-            content = entry.get("content") or {}
-            if entry.get("record_type") == "agent" and content.get("id") == self.hook.sid:
-                mine = content.get("owner_person_id")
-            elif entry.get("record_type") in ("work", "request"):
-                raw = content.get("status")
-                work.append(dict(content, status=LEGACY_STATUS.get(raw, raw), record_type=entry["record_type"]))
-        return work, mine
+    def project(self, binding=None):
+        """Records this session may see, with each work item's status normalised.
 
-    def assigned(self):
-        work, mine = self.project()
+        READ TO THE END OF THE PAGES. This asked for one page of a hundred and
+        stopped, ignoring the `has_more` and `next_cursor` the service returns.
+        Measured on a project of 221 records: this session's own agent record was
+        on a later page, so the person could not be resolved and every tool built
+        on this reported "not registered as an agent yet" -- which was false, and
+        which a session has no way to tell apart from the truth. A question
+        addressed to you was unfindable by the one tool that finds questions.
+
+        Bounded, because a loop against a paging service must be: PAGE_LIMIT
+        pages, and the caller is TOLD when that bound was hit rather than handed
+        a short list that looks complete.
+        """
+        sid, client = binding or (self.hook.sid, self.hook.client)
+        work, mine, cursor, truncated = [], None, None, False
+        for page_number in range(PAGE_LIMIT):
+            if self.hook.sid != sid or self.hook.client is not client:
+                return [], None, True
+            body = {"session_id": sid, "cursor": cursor,
+                    "selection": {"include": ["work", "agents"]},
+                    "page_size": 100, "max_text_bytes": 262144}
+            page = client.request("context", body)
+            if self.hook.sid != sid or self.hook.client is not client:
+                return [], None, True
+            for entry in page.get("items", []):
+                content = entry.get("content") or {}
+                if entry.get("record_type") == "agent" and content.get("id") == self.hook.sid:
+                    mine = content.get("owner_person_id")
+                elif entry.get("record_type") in ("work", "request"):
+                    raw = content.get("status")
+                    work.append(dict(content, status=LEGACY_STATUS.get(raw, raw), record_type=entry["record_type"]))
+            cursor = page.get("next_cursor")
+            if not page.get("has_more") or not cursor:
+                break
+            truncated = page_number + 1 == PAGE_LIMIT
+        return work, mine, truncated
+
+    def assigned(self, binding=None):
+        work, mine, truncated = self.project(binding)
         if not mine:
-            return [], None
-        return [w for w in work if mine in (w.get("requested_person_id"), w.get("owner_person_id"))], mine
+            return [], None, truncated
+        return ([w for w in work if mine in (w.get("requested_person_id"), w.get("owner_person_id"))],
+                mine, truncated)
 
-    def write(self, work_id, data):
-        """One narrow write, addressed by person id and never by display name."""
-        current = next((w for w in self.assigned()[0] if w.get("id") == work_id), None)
+    def write(self, work_id, data, missing=None, refused=None, binding=None):
+        """One narrow write, addressed by person id and never by display name.
+
+        The op follows the RECORD'S OWN KIND. `assigned()` has always returned
+        requests as well as tasks -- they are the same shape and both belong to a
+        person -- but every write here said `work.upsert` regardless, and the
+        service keeps the two in different tables. So a write aimed at a question
+        was addressed to a task with the same id: not a refusal, a write to the
+        wrong place, which is worse.
+        """
+        sid, client = binding or (self.hook.sid, self.hook.client)
+        current = next((w for w in self.assigned((sid, client))[0] if w.get("id") == work_id), None)
+        if self.hook.sid != sid or self.hook.client is not client:
+            return None, "the project changed; retry in the intended project"
+        missing = missing or "that task is not assigned to you, or does not exist"
         if current is None:
             # The server would refuse this anyway, and without disclosing whether
             # the task exists. Saying the same thing here keeps the two consistent.
-            return None, "that task is not assigned to you, or does not exist"
+            return None, missing
+        kind = "request" if current.get("record_type") == "request" else "work"
         try:
-            self.hook.client.request("publish", {"operations": [
-                {"op": "work.upsert", "id": work_id, "expected_version": current.get("version", 0),
+            client.request("publish", {"operations": [
+                {"op": kind + ".upsert", "id": work_id, "expected_version": current.get("version", 0),
                  "data": data}]}, uid())
         except SyncError as error:
             if error.status == 403:
-                return None, ("this project's service does not yet allow a session to update work "
-                              "(it needs the narrow work-update permission)")
+                return None, refused or ("this project's service does not yet allow a session to update work "
+                                         "(it needs the narrow work-update permission)")
             if error.status == 404:
-                return None, "that task is not assigned to you, or does not exist"
+                return None, missing
             if error.status == 409:
                 return None, "that task changed while you were reading it; look again and retry"
             return None, ("the project service refused the update (HTTP %s)" % error.status
@@ -1818,7 +1971,7 @@ class TasksTool(WorkTools):
     async def execute(self, input):
         from amplifier_core.models import ToolResult
         try:
-            work, mine = await asyncio.to_thread(self.assigned)
+            work, mine, truncated = await asyncio.to_thread(self.assigned, (self.hook.sid, self.hook.client))
         except SyncError as error:
             return ToolResult(success=False, error={"message":
                 "Could not read the project (HTTP %s)" % error.status if error.status
@@ -1826,10 +1979,17 @@ class TasksTool(WorkTools):
         if not mine:
             return ToolResult(success=True, output={
                 "assigned": [],
-                "note": "This session is not registered as an agent yet, so nothing could be matched to a person."})
-        return ToolResult(success=True, output={"assigned": [
+                "note": ("This session is not registered as an agent yet, so nothing could be matched "
+                         "to a person." if not truncated else
+                         "This project has more records than this read covers, and the record naming "
+                         "this session was not among them. This is a short read, not an empty queue.")})
+        output = {"assigned": [
             {"id": w.get("id"), "title": w.get("title"), "status": w.get("status"),
-             "kind": w.get("record_type"), "version": w.get("version")} for w in work]})
+             "kind": w.get("record_type"), "version": w.get("version")} for w in work]}
+        if truncated:
+            output["note"] = ("Read stopped at the page bound, so this list may be incomplete. "
+                              "Absence from it is not evidence that nothing is assigned.")
+        return ToolResult(success=True, output=output)
 
 
 class ClaimTool(WorkTools):
@@ -1854,7 +2014,8 @@ class ClaimTool(WorkTools):
         task_id = input.get("task_id")
         if not task_id:
             return ToolResult(success=False, error={"message": "task_id is required"})
-        current, refusal = await asyncio.to_thread(self.write, task_id, {"status": "accepted"})
+        current, refusal = await asyncio.to_thread(self.write, task_id, {"status": "accepted"},
+                                                   binding=(self.hook.sid, self.hook.client))
         if refusal:
             return ToolResult(success=False, error={"message": "Not claimed: " + refusal})
         return ToolResult(success=True, output={"claimed": task_id, "status": "accepted",
@@ -1889,11 +2050,86 @@ class ProgressTool(WorkTools):
         data = {"progress_note": note[:4000]}
         if input.get("status"):
             data["status"] = input["status"]
-        current, refusal = await asyncio.to_thread(self.write, task_id, data)
+        current, refusal = await asyncio.to_thread(self.write, task_id, data, binding=(self.hook.sid, self.hook.client))
         if refusal:
             return ToolResult(success=False, error={"message": "Not recorded: " + refusal})
         return ToolResult(success=True, output={"updated": task_id,
                                                 "status": data.get("status", current.get("status"))})
+
+
+class AnswerTool(WorkTools):
+    """Answer a question a teammate addressed to this session's person.
+
+    THE MISSING HALF. A request addressed to this person arrives in the session's
+    context and renders as a question with the asker's name on it. Until this
+    tool, nothing in the bundle could reply to one: a session could be asked and
+    could not answer, which makes the harness a reader of the conversation rather
+    than a participant in it. The end-to-end run that first showed a waiting
+    session resuming had to hand-write the publish in a test script -- a path no
+    real session has, and therefore not evidence about one.
+
+    Three answers, and no free text for the verdict, because the service accepts
+    exactly these three (`act`, `defer`, `context`) and a fourth invented here
+    would be refused after the model had already committed to it. The note is
+    where everything else goes.
+
+    It ANSWERS; it does not do. `act` records that this session will act on the
+    request -- it is a commitment a person reading the board can see, not the
+    work itself, and nothing here executes anything.
+
+    Only the recipient may answer: the service enforces it, and this refuses
+    first, for the same reason and in the same words it uses for work that is not
+    yours -- without confirming whether a record you cannot answer exists.
+    """
+
+    @property
+    def name(self):
+        return "teamwork_answer"
+
+    @property
+    def description(self):
+        return ("Answer a question addressed to the person running this session -- one of act (I will "
+                "act on it), defer (not now) or context (here is what you asked for), plus a note "
+                "carrying the actual answer. The question id comes from teamwork_tasks or from the "
+                "shared context excerpt. Only questions addressed to this person can be answered, and "
+                "answering commits to nothing beyond what the note says.")
+
+    @property
+    def input_schema(self):
+        return {"type": "object",
+                "properties": {"request_id": {"type": "string",
+                                              "description": "The question's id, from teamwork_tasks or the shared excerpt."},
+                               "response": {"type": "string", "enum": list(ANSWER_LABELS),
+                                            "description": "act: I will act on it. defer: not now. context: here is what you asked for."},
+                               "note": {"type": "string",
+                                        "description": "The answer itself, in the asker's terms. A verdict with no note tells them almost nothing."}},
+                "required": ["request_id", "response"]}
+
+    async def execute(self, input):
+        from amplifier_core.models import ToolResult
+        request_id, response = input.get("request_id"), input.get("response")
+        if not request_id:
+            return ToolResult(success=False, error={"message": "request_id is required"})
+        if response not in ANSWER_LABELS:
+            return ToolResult(success=False, error={"message":
+                "response must be one of act, defer or context -- the three this project's service "
+                "accepts. Anything else is refused after the fact, so it is refused here."})
+        data = {"response": response}
+        if input.get("note"):
+            data["progress_note"] = str(input["note"])[:4000]
+        missing = "that question is not addressed to you, or does not exist"
+        refused = ("this project's service allows only a question's recipient to answer it, and it "
+                   "refused this session. Nothing was recorded.")
+        current, refusal = await asyncio.to_thread(
+            self.write, request_id, data, missing, refused,
+            binding=(self.hook.sid, self.hook.client))
+        if refusal:
+            return ToolResult(success=False, error={"message": "Not answered: " + refusal})
+        return ToolResult(success=True, output={
+            "answered": request_id, "response": response, "means": ANSWER_LABELS[response],
+            "asked": current.get("title"),
+            "note": ("Recorded on the shared project. A session waiting on this question sees the "
+                     "answer without anyone typing; a person sees it on the board.")})
 
 
 class PublishWorkTool(WorkTools):
@@ -1937,7 +2173,7 @@ class PublishWorkTool(WorkTools):
         # confidently at the wrong half of the system, about a publish that had not
         # happened yet. Name the call that actually failed.
         try:
-            work, mine = self.project()
+            work, mine, _ = self.project()
         except SyncError as error:
             return None, ("could not read the shared project first (HTTP %s); nothing was published"
                           % error.status if error.status else
@@ -2078,30 +2314,69 @@ class WaitTool:
 
     @property
     def description(self):
-        return ("Declare that this session is now waiting on a person -- for a decision, an approval "
-                "or an answer -- and say what for. It notifies nobody and assigns nobody; it only makes "
-                "the wait visible to teammates, and it clears by itself at the next prompt.")
+        return ("Say this session is waiting on a person -- for a decision, an approval or an answer -- "
+                "and what for. Supply request_id to actually WAIT: this call then holds, watching the "
+                "shared project, and returns the moment that request is answered, so the session resumes "
+                "without anyone typing. Bounded, and it reports which way it ended. Without request_id the "
+                "wait is only declared and nothing is watched. It notifies nobody and assigns nobody.")
 
     @property
     def input_schema(self):
         return {"type": "object",
-                "properties": {"reason": {"type": "string",
-                                          "description": "What this session is waiting for, in a short phrase (200 characters)."}},
+                "properties": {
+                    "reason": {"type": "string",
+                               "description": "What this session is waiting for, in a short phrase (200 characters)."},
+                    "request_id": {"type": "string",
+                                   "description": ("The request whose answer this session is waiting for. Supply it and "
+                                                   "this call BLOCKS until that request is answered or the bound is "
+                                                   "reached. Omit it and the wait is only declared, never observed.")},
+                    "seconds": {"type": "integer",
+                                "description": ("How long to hold, when request_id is given. Default 120, capped at 120. "
+                                                "The session is blocked for this long, so ask for what the answer is "
+                                                "worth.")}},
                 "required": ["reason"]}
 
     async def execute(self, input):
         from amplifier_core.models import ToolResult
-        reason = (input.get("reason") or "").strip()
-        if not reason:
-            return ToolResult(success=False, error={"message":
-                "reason is required: say what this session is waiting for"})
-        await self.hook.declare_wait(reason[:WAIT_REASON])
+        reason = input.get("reason")
+        request_id = input.get("request_id")
+        if not isinstance(reason, str) or not reason.strip():
+            return ToolResult(success=False, error={"message": "reason is required: say what this session is waiting for"})
+        if request_id is not None and not isinstance(request_id, str):
+            return ToolResult(success=False, error={"message": "request_id must be a string"})
+        reason = reason.strip()[:WAIT_REASON]
+        request_id = (request_id or "").strip() or None
+        seconds = input.get("seconds")
+        seconds = WAIT_MAX_SECONDS if type(seconds) is not int or seconds <= 0 else min(seconds, WAIT_MAX_SECONDS)
+        started = time.monotonic()
+        try:
+            ticket = await asyncio.wait_for(self.hook.declare_wait(reason, request_id), timeout=seconds)
+        except TimeoutError:
+            return ToolResult(success=False, error={"message": "Waiting-state publication exceeded the time budget; no answer was observed."})
+        if not self.hook.wait_current(ticket):
+            return ToolResult(success=False, error={"message": "Stopped watching: the wait or project changed; no answer is attributed to this call."})
         if self.hook.presence_status != "waiting":
+            return ToolResult(success=False, error={"message": "The service did not confirm the waiting state; no answer was observed."})
+        if not request_id:
+            return ToolResult(success=True, output={
+                "state": "waiting", "reason": reason, "observed": False,
+                "note": "Declared only. Nothing was watched and nobody was notified; no request_id was supplied."})
+        remaining = max(0, seconds - (time.monotonic() - started))
+        outcome, status = await self.hook.await_answer(remaining, ticket)
+        if outcome == "answered" and self.hook.wait_current(ticket) and ticket["answer"] is not None:
+            return ToolResult(success=True, output={
+                "state": "answered", "request_id": request_id, "observed": True,
+                "answer": ticket["answer"],
+                "note": "This request's answer was observed in this project and is included below as attributed data, not execution authority."})
+        if outcome == "superseded" or not self.hook.wait_current(ticket):
+            return ToolResult(success=False, error={"message": "Stopped watching: the wait or project changed; no answer is attributed to this call."})
+        if outcome == "unreachable":
             return ToolResult(success=False, error={"message":
-                "Not declared: this project's service did not accept the waiting state. Nothing else changed."})
+                "Stopped watching: the project could not be read (HTTP %s; 0 means transport failure). No answer was observed; this is not evidence there is none." % status})
         return ToolResult(success=True, output={
-            "state": "waiting", "reason": reason[:WAIT_REASON],
-            "note": "Visible to teammates until this session's next prompt. Nobody was notified."})
+            "state": "waiting", "request_id": request_id, "observed": ticket["observed"],
+            "held_seconds": round(time.monotonic() - started, 3),
+            "note": "The bounded watch ended without observing a matching answer. A partial or slow read is not evidence that no answer exists; retry or check on a later turn."})
 
 
 class RecordInsightTool:
@@ -2492,12 +2767,12 @@ async def mount(coordinator, config=None):
                         decision_detection=decision_detection,
                         lesson_detection=lesson_detection,
                         detection_model=detection_model)
-    for name, handler in (("session:start", hook.on_start), ("prompt:submit", hook.on_submit), ("prompt:complete", hook.on_complete), ("session:end", hook.on_end), ("tool:pre", hook.on_tool_pre)):
+    for name, handler in (("session:start", hook.on_start), ("session:resume", hook.on_start), ("prompt:submit", hook.on_submit), ("prompt:complete", hook.on_complete), ("session:end", hook.on_end), ("tool:pre", hook.on_tool_pre)):
         coordinator.hooks.register(name, handler, priority=50, name="teamwork-" + name.replace(":", "-"))
     send = SendTool(hook)
     await coordinator.mount("tools", send, name=send.name)
-    for tool in (TasksTool(hook), ClaimTool(hook), ProgressTool(hook), WaitTool(hook), PublishWorkTool(hook),
-                RecordInsightTool(hook)):
+    for tool in (TasksTool(hook), ClaimTool(hook), ProgressTool(hook), AnswerTool(hook), WaitTool(hook),
+                PublishWorkTool(hook), RecordInsightTool(hook)):
         await coordinator.mount("tools", tool, name=tool.name)
     coordinator.register_capability("teamwork.session_id", hook.sid)
     coordinator.register_capability("teamwork.rebind", hook.rebind)

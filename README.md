@@ -132,11 +132,26 @@ acknowledges it. Delivery is not agreement and not action.
 
 ### Saying this session is waiting on a person
 
-The `teamwork_wait` tool declares that this session is now waiting on a person --
-for a decision, an approval or an answer -- and says what for, in at most 200
-characters. It notifies nobody and assigns nobody; it only makes the wait visible
-to teammates. A wait with no reason is refused, and the declaration clears by
-itself at this session's next prompt, so a wait can never outlive the waiting.
+The `teamwork_wait` tool declares what this session is waiting for. Without
+`request_id`, it publishes a short reason and returns immediately; it does not
+notify or assign anyone. The declaration clears at the next prompt.
+
+With `request_id`, it watches for that exact request's answer for at most 120
+seconds, including waiting-state publication and network reads. A previously
+cached answer is returned immediately. The tool result includes the response,
+note and attribution; the bounded shared excerpt is not the answer channel.
+A project change or replacement wait stops the old call without reporting an
+answer. A timeout reports the elapsed time and whether a context read completed;
+it is not evidence that no answer exists.
+
+`teamwork_tasks` lists the requests/work assigned to this session's person,
+reading bounded pages and reporting an incomplete list. `teamwork_answer`
+records `act`, `defer`, or `context` with an optional note on an existing assigned
+request. The service enforces recipient permissions and record versions. This
+records an answer; it does not execute the requested work or grant authority.
+Question creation remains a portal/API action; these tools do not create or
+assign new work. A live host is needed to receive arbitrary arrivals while idle;
+`teamwork_wait` only holds an already-running tool call.
 
 ### Inbound messages as queued work
 
@@ -592,7 +607,7 @@ Ask a short, non-sensitive project prompt and confirm the expected project activ
 
 ## What is shared and retained
 
-The hook responds only to visible lifecycle events: `session:start`, `prompt:submit`, `prompt:complete`, and `session:end`. Child/delegated sessions are excluded.
+The hook responds to visible lifecycle events: `session:start`, `session:resume`, `prompt:submit`, `prompt:complete`, and `session:end`, plus the opted-in decision detector's `tool:pre` boundary. Child/delegated sessions are excluded. An explicitly opted-in resumed session announces its agent card and clears its previous session end timestamp when its first resumed turn starts executing, before the orchestrator processes that prompt. Opening the CLI and waiting at its input prompt does not trigger this registration; the resumed session still needs an explicit sharing overlay or native consent. Existing agent and presence cards may rebase once on the service's exact version-conflict response; ambiguous transport failures are not retried by this recovery path.
 
 Before a visible prompt, it flushes durable pending work, retrieves selected project context, derives a bounded excerpt, and awaits Amplifier context acceptance. Only that successful acceptance can produce a `harness_input_accepted` receipt. A receipt proves the context manager accepted a message; it does not prove provider submission, model attention, comprehension, agreement, or completion.
 

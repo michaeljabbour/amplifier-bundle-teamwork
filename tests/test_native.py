@@ -780,7 +780,7 @@ class NativeToolTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(result.success)
                 self.assertNotIn('harness-fixture', str(result))
                 self.assertNotIn(str(path), str(result))
-                self.assertEqual(len(root.handlers), 5)
+                self.assertEqual(len(root.handlers), 6)
                 hook = root.handlers[0][1].__self__
                 self.assertIsNone(hook.state.get('turn'))
                 # Completing the connection prompt cannot publish it.
@@ -794,7 +794,7 @@ class NativeToolTests(unittest.IsolatedAsyncioTestCase):
                 again = await tool.execute({})
                 self.assertTrue(again.success)
                 self.assertEqual(browser.call_count, 2)
-                self.assertEqual(len(root.handlers), 5)
+                self.assertEqual(len(root.handlers), 6)
                 self.assertNotEqual(hook.sid, bound)
                 self.assertEqual(hook.connection['project_id'], 'second-project')
 
@@ -806,13 +806,13 @@ class NativeToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(root.handlers)
         result = await tool.execute({'project_id': 'chosen'})
         self.assertTrue(result.success)
-        self.assertEqual(len(root.handlers), 5)
+        self.assertEqual(len(root.handlers), 6)
         hook = root.handlers[0][1].__self__
         self.assertEqual(hook.connection['project_id'], 'chosen')
         first = hook.sid
         moved = await tool.execute({'project_id': 'another'})
         self.assertTrue(moved.success)
-        self.assertEqual(len(root.handlers), 5)
+        self.assertEqual(len(root.handlers), 6)
         self.assertEqual(hook.connection['project_id'], 'another')
         self.assertNotEqual(hook.sid, first)
 
@@ -1026,3 +1026,111 @@ class TheSuccessLineNamesTheProjectThatGotConsent(unittest.TestCase):
                  "--connection-file", str(Path(tmp) / "c.json"),
                  "--output", str(Path(tmp) / "o.yaml")], tmp)
         self.assertIn("Enrolled project: typed-project", out)
+
+
+class TheOriginComesFromTheDeploymentNotFromGuesswork(unittest.TestCase):
+    """A deployment that moved its web origin must not 403 every new joiner.
+
+    MEASURED, 2026-09-18, against the live project. The shipped default base URL
+    still names the Azure Container Apps web host. The member plane is gated on
+    `TEAMWORK_PUBLIC_ORIGIN` (`backend/http.py:origin_check`), and that value is
+    now `https://teamwork.amplifier.ms`. Same credentials, one variable changed:
+
+        POST <aca-host>/api/login   Origin: <aca-host>   -> 403 invalid_origin
+        POST teamwork.amplifier.ms/api/login  (same)     -> 200, harness minted
+
+    So enrollment followed the README and was refused BEFORE the credential was
+    examined -- and the error a joiner sees, "check login and project membership",
+    points at the two things that were fine.
+
+    The deployment already publishes the answer. `/api/config` returns `share_url`,
+    and that field IS `core.public_origin()` (`backend/http.py:64`) -- the exact
+    value the check compares against. Deriving the Origin from --base-url asks the
+    joiner to know something the service will tell us; `--origin` stays as the
+    escape hatch for anyone who needs to override it.
+    """
+
+    def _module(self):
+        import importlib.util
+        path = Path(__file__).resolve().parents[1] / "setup_teamwork.py"
+        spec = importlib.util.spec_from_file_location("setup_origin_probe", path)
+        module = importlib.util.module_from_spec(spec)
+        exec(compile(path.read_text(), str(path), "exec"), module.__dict__)
+        return module
+
+    def _published(self, module, body):
+        opener = patch.object(module.urllib.request, "build_opener")
+        started = opener.start()
+        self.addCleanup(opener.stop)
+        started.return_value.open.return_value.__enter__.return_value.read.return_value = body
+        return started
+
+    def test_a_published_share_url_is_used_as_the_origin(self):
+        module = self._module()
+        self._published(module, json.dumps({"share_url": "https://teamwork.example.ms"}).encode())
+        self.assertEqual(module.discover_origin("https://aca-host.example.invalid"),
+                         "https://teamwork.example.ms")
+
+    def test_an_absent_or_unusable_share_url_leaves_the_derived_origin_alone(self):
+        module = self._module()
+        for body in (json.dumps({"project_id": "teamwork"}).encode(),
+                     json.dumps({"share_url": "   "}).encode(),
+                     json.dumps({"share_url": 7}).encode(),
+                     b"not json at all"):
+            with patch.object(module.urllib.request, "build_opener") as opener:
+                opener.return_value.open.return_value.__enter__.return_value.read.return_value = body
+                self.assertIsNone(module.discover_origin("https://svc.example.invalid"))
+
+    def test_an_unreachable_service_never_raises(self):
+        module = self._module()
+        with patch.object(module.urllib.request, "build_opener", side_effect=OSError("down")):
+            self.assertIsNone(module.discover_origin("https://svc.example.invalid"))
+
+    def test_enrollment_sends_the_published_origin_not_the_base_host(self):
+        """The whole point: the header that actually leaves the machine."""
+        import contextlib
+        module = self._module()
+        sent = []
+
+        def enroll(post, *args, **kwargs):
+            post("/api/login", {"name": "Someone", "token": "code"})
+            return Path(args[6]), Path(args[7])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(module, "discover_project", return_value="teamwork"), \
+                 patch.object(module, "discover_origin", return_value="https://teamwork.example.ms"), \
+                 patch.object(module, "send", side_effect=lambda request, **k: (sent.append(request), ({}, {}))[1]), \
+                 patch.object(module, "enroll_and_save", side_effect=enroll), \
+                 patch.object(module, "input", create=True, return_value="Someone"), \
+                 patch.object(module, "getpass", create=True, return_value="code"), \
+                 patch.object(sys, "argv",
+                              ["setup_teamwork.py", "--bundle", "b.yaml",
+                               "--base-url", "https://aca-host.example.invalid",
+                               "--connection-file", str(Path(tmp) / "c.json"),
+                               "--output", str(Path(tmp) / "o.yaml")]), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                module.main()
+
+        self.assertEqual([r.headers.get("Origin") for r in sent], ["https://teamwork.example.ms"])
+
+    def test_an_explicit_origin_flag_still_wins(self):
+        module = self._module()
+        import contextlib
+        sent = []
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(module, "discover_project", return_value="teamwork"), \
+                 patch.object(module, "discover_origin", return_value="https://teamwork.example.ms"), \
+                 patch.object(module, "send", side_effect=lambda request, **k: (sent.append(request), ({}, {}))[1]), \
+                 patch.object(module, "enroll_and_save",
+                              side_effect=lambda post, *a, **k: (post("/api/login", {}), (Path(a[6]), Path(a[7])))[1]), \
+                 patch.object(module, "input", create=True, return_value="Someone"), \
+                 patch.object(module, "getpass", create=True, return_value="code"), \
+                 patch.object(sys, "argv",
+                              ["setup_teamwork.py", "--bundle", "b.yaml",
+                               "--base-url", "https://aca-host.example.invalid",
+                               "--origin", "https://typed.example.ms",
+                               "--connection-file", str(Path(tmp) / "c.json"),
+                               "--output", str(Path(tmp) / "o.yaml")]), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                module.main()
+        self.assertEqual([r.headers.get("Origin") for r in sent], ["https://typed.example.ms"])
