@@ -248,11 +248,46 @@ All optional. Set under the hook's module config.
 | `file_inbound_reports` | `true` | Set `false` to never file, even with a tracker present |
 | `work_tracker_command` | `amplifier-work-tracker` | The CLI to run |
 | `work_tracker_root` | the CLI's own default | Passed through as `--root` (read the warning above) |
+| `work_tracker_actor` | absent | Explicit local actor assigned to this session; exact holder match required for objective observations; never transmitted |
+| `share_objective_topic` | `false` | Literal `true` permits bounded titles of matched objectives; strings such as `"false"` are refused |
 | `queue_registry_path` | `<connection dir>/queue-names.json` | Where the name binding is remembered |
 
 Every write goes through the `amplifier-work-tracker` CLI, never `bd` directly.
 That CLI is the sanctioned seam and owns the contention/retry contract; reaching
 past it to Beads is how a coordination layer stops coordinating.
+
+## Objective observations
+
+A project's tracker listing contains work held by many actors. The bundle never
+claims all of it as this session's work. Objective observations require an
+explicit `work_tracker_actor` value matching the identity this session uses when
+claiming work. Without that binding, normal queue counts and message filing
+continue, and no objective list is published.
+
+Only `held` and `blocked` items matching that actor qualify. Resolved, deferred,
+open, unknown and malformed items do not establish current custody. At most five
+distinct assignments are included. Their IDs are service/project-scoped digests,
+not local task locators; raw IDs can themselves reveal subject matter. Holder,
+host names, paths and arbitrary tracker fields are excluded. This observation is
+harness-reported assignment metadata, not verified process liveness, expertise,
+permission to delegate or a claim that work has been accepted.
+
+Titles are a separate disclosure. Set literal `share_objective_topic: true` in
+this session's hook configuration only after choosing to share those local
+subjects with the bound project. The default omits titles. Values such as the
+string `"false"` are errors, not consent. Titles are limited to 160 characters and
+pass through the existing credential redaction; a title remains untrusted data.
+No model infers a topic or receives an extra request for this feature.
+
+Changing the project clears cached observations, the actor binding and topic
+consent. Start a newly configured session to opt in for a different project.
+An observation already in flight cannot be published under the new binding.
+If a released service rejects the optional objective field with its exact
+validation error, the bundle retries registration once without that field. The
+ordinary card, presence and sharing remain available; the rejected objective
+payload is not queued for later replay. Other refusals and uncertain transport
+outcomes are not automatically retried. Older services therefore do not display
+objectives, even when local disclosure was explicitly configured.
 
 ## Bounds, and the two states that are not success
 

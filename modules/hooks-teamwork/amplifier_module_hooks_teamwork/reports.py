@@ -20,6 +20,7 @@ That CLI is the sanctioned seam -- it owns the contention/retry contract, and
 reaching past it to Beads is how a coordination layer stops coordinating.
 """
 
+import hashlib
 import json
 import subprocess
 from datetime import datetime, timezone
@@ -75,6 +76,24 @@ REF_ALLOWED = {"kind": 40, "uri": 2048, "label": 200, "revision": 128}
 # state. Nothing else -- a holder is an actor id naming a host and a process, and
 # no teammate needs that to decide whom to ask.
 OBJECTIVE_ALLOWED = {"id": 64, "title": 160, "status": 24}
+OBJECTIVE_STATES = frozenset(("held", "blocked"))
+
+
+def topic_sharing(value):
+    """Topic disclosure requires a literal boolean, never Python truthiness."""
+    if type(value) is not bool:
+        raise ValueError("Teamwork objective topics require explicit share_objective_topic: true opt-in")
+    return value
+
+
+def objective_actor(value):
+    """A local, explicitly configured tracker identity; never inferred or shared."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip() or len(value) > 512:
+        raise ValueError("Teamwork work_tracker_actor must be a non-empty local actor string")
+    return value.strip()
+
 
 
 def sanitize_outbound(payload):
@@ -99,10 +118,21 @@ def sanitize_outbound(payload):
             # drop it whole, which is how a field silently never arrives.
             if not isinstance(value, list):
                 continue
-            result[key] = [
-                {k: item[k][:limit] for k, limit in OBJECTIVE_ALLOWED.items()
-                 if isinstance(item.get(k), str)}
-                for item in value[:OBJECTIVE_LIMIT] if isinstance(item, dict)]
+            entries, seen = [], set()
+            for item in value[:VERIFY_LIMIT]:
+                if not isinstance(item, dict):
+                    continue
+                item_id, status = item.get("id"), item.get("status")
+                if (not isinstance(item_id, str) or not item_id.strip() or len(item_id) > 64
+                        or not isinstance(status, str) or status not in OBJECTIVE_STATES
+                        or item_id in seen):
+                    continue
+                seen.add(item_id)
+                entries.append({k: item[k][:limit] for k, limit in OBJECTIVE_ALLOWED.items()
+                                if isinstance(item.get(k), str)})
+                if len(entries) == OBJECTIVE_LIMIT:
+                    break
+            result[key] = entries
             continue
         rule = OUTBOUND_ALLOWED.get(key)
         if rule is None:
@@ -277,7 +307,7 @@ class Queue:
     """The local work queue for one bound teamwork project, if there is one."""
 
     def __init__(self, project_id, registry_path, command=COMMAND, root=None, service=None,
-                 share_topic=False):
+                 share_topic=False, actor=None):
         self.project_id = project_id
         self.registry_path = registry_path
         # A project id is unique only within a service, so the queue's owner is the
@@ -291,8 +321,10 @@ class Queue:
         # now reports a dated truth ("last readable at T") instead of either a
         # confident "connected" or a flat "gone", neither of which is what we know.
         self.last_status = None
+        self._last_status_binding = None
         # Whether an objective may carry its TITLE. See objectives().
-        self.share_topic = bool(share_topic)
+        self.share_topic = topic_sharing(share_topic)
+        self.actor = objective_actor(actor)
 
     def run(self, verb, args, timeout):
         command = [self.command, verb]
@@ -344,77 +376,80 @@ class Queue:
         queue reports `unavailable` and a reason, which is a complete answer.
         """
         observed = datetime.now(timezone.utc).isoformat()
+        binding = (self.project_id, self.service, self.actor, self.share_topic)
+        def changed():
+            return binding != (self.project_id, self.service, self.actor, self.share_topic)
+        interrupted = {"queue_status": "unavailable", "observed_at": observed,
+                       "reason_code": "project changed during queue observation"}
         try:
             if self.name is None:
                 self.ready()
+            if changed():
+                return interrupted
             page = json.loads(self.run("list", ["--project", self.name, "--limit", str(VERIFY_LIMIT), "--json"],
                                        PROBE_TIMEOUT))
+            if (not isinstance(page, dict) or not isinstance(page.get("items"), list)
+                    or any(not isinstance(i, dict) for i in page["items"])):
+                raise ValueError("Malformed queue listing")
         except QueueUnavailable as reason:
             code = str(reason)
         except ValueError:
             code = "the work tracker returned output this bundle could not read"
         else:
-            items = page.get("items") or []
-            ready = [i for i in items if (i.get("status") or "open") in ("open", "ready")]
-            self.last_status = {"queue_status": "ready", "observed_at": observed,
-                                "ready_count": len(ready), "integration": COMMAND}
+            if changed():
+                return interrupted
+            items = page["items"][:VERIFY_LIMIT]
+            ready = [i for i in items if i.get("status") in ("open", "ready")]
+            observation = {"queue_status": "ready", "observed_at": observed,
+                           "ready_count": len(ready), "integration": COMMAND}
             objectives = self.objectives(items)
             if objectives:
-                self.last_status["objectives"] = objectives
-            return dict(self.last_status)
-        if self.last_status:
+                observation["objectives"] = objectives
+            if changed():
+                return interrupted
+            self.last_status = observation
+            self._last_status_binding = binding
+            return dict(observation)
+        if changed():
+            return interrupted
+        if self.last_status and self._last_status_binding == binding:
             return dict(self.last_status, queue_status="stale", reason_code=code[:120])
         return {"queue_status": "unavailable", "observed_at": observed, "reason_code": code[:120]}
 
     def objectives(self, items):
-        """What this machine actually has in hand, so another agent can judge it.
+        """Bounded observed assignments for this session's declared local actor.
 
-        A count of ready work says a queue exists; it does not say what this
-        machine is FOR right now. An agent deciding whom to ask needs the
-        second thing.
+        Listing a project returns every actor's work. Without an exact local
+        actor binding, none can be attributed to this session. Even a matching
+        holder is only an observed assignment, not proof of process liveness,
+        accepted delegation or expertise. Only held/blocked states qualify;
+        resolved, deferred, open and unknown states do not establish custody.
 
-        THE TITLE IS OPT-IN, AND THE ROADMAP IS WHY. It names an open question:
-        "How much should a session say about what it is working on? Presence and
-        summaries exist today but deliberately withhold routing-useful topic ...
-        Saying more helps routing, costs privacy -- the roadmap does not decide
-        it." The withholding is deliberate, so this does not overturn it by
-        shipping.
-
-        The split is where the cost actually sits. An id and a status say THIS
-        MACHINE IS BUSY or THIS MACHINE IS STUCK -- near-zero disclosure, and
-        already most of the routing value, since the common question is whom to
-        interrupt. The title is the topic, and the topic is the disclosure. So
-        the card always carries the first and carries the second only when the
-        person whose workspace it is has said so, the same way sharing visible
-        turns is an explicit flag rather than a consequence of attaching.
-
-        `holder` ALONE IS NOT THE ANSWER, and the difference is not subtle.
-        Measured on a real project: 28 of 62 items carried a holder and 27 of
-        those were already `resolved` -- the field records who worked an item,
-        and it survives resolution. Filtering on it alone would publish 27
-        finished pieces of work as current objectives, every one of them a
-        confident lie about what this machine is doing.
-
-        So an objective is an item that is held AND still live. `resolved` is
-        finished, `deferred` was put down on purpose. Both are excluded. A
-        `blocked` item IS included and carries its status, because "held but
-        blocked" is exactly the state a teammate most needs to see -- it is the
-        difference between a machine that is busy and one that is stuck.
-
-        Bounded on purpose: titles are free text this harness did not author, so
-        they are capped and count-limited here, and the caller passes the whole
-        observation through the outbound sanitizer before any of it leaves.
+        Local IDs may contain topics too, so only a service/project-scoped digest
+        travels. Titles require separate explicit consent. Neither holder nor
+        arbitrary tracker metadata leaves the machine.
         """
-        live = [i for i in items
-                if (i.get("holder") or "").strip()
-                and (i.get("status") or "open") not in ("resolved", "deferred")]
-        published = []
-        for item in live[:OBJECTIVE_LIMIT]:
-            entry = {"id": str(item.get("id") or "")[:64],
-                     "status": str(item.get("status") or "open")[:24]}
+        if not self.actor or not isinstance(items, list):
+            return []
+        published, seen = [], set()
+        for item in items[:VERIFY_LIMIT]:
+            if not isinstance(item, dict) or item.get("holder") != self.actor:
+                continue
+            item_id, status = item.get("id"), item.get("status")
+            if (not isinstance(item_id, str) or not item_id.strip() or len(item_id) > 2048
+                    or not isinstance(status, str) or status not in OBJECTIVE_STATES
+                    or item_id in seen):
+                continue
+            if self.share_topic and not isinstance(item.get("title"), str):
+                continue
+            seen.add(item_id)
+            locator = json.dumps([self.service, self.project_id, item_id], ensure_ascii=False)
+            entry = {"id": hashlib.sha256(locator.encode("utf-8")).hexdigest(), "status": status}
             if self.share_topic:
-                entry["title"] = str(item.get("title") or "")[:160]
+                entry["title"] = item["title"][:160]
             published.append(entry)
+            if len(published) == OBJECTIVE_LIMIT:
+                break
         return published
 
     def find(self, message_id):

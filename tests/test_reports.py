@@ -9,7 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "modules/hooks-teamwork"))
 
-from amplifier_module_hooks_teamwork import Journal, TeamworkHook
+from amplifier_module_hooks_teamwork import Journal, TeamworkHook, reports
 from amplifier_module_hooks_teamwork.reports import (BODY_LIMIT, FilingUnknown, Queue, QueueUnavailable,
                                                      description, mirror_operation, projection_operation,
                                                      sanitize_outbound,
@@ -471,11 +471,6 @@ class Projection(unittest.TestCase):
         self.assertEqual(op["data"]["evidence_refs"][0]["revision"], "")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
-from amplifier_module_hooks_teamwork import reports  # noqa: E402  (module handle for the two classes below)
 
 
 class ObjectivesAreWhatIsActuallyInHand(unittest.TestCase):
@@ -484,12 +479,9 @@ class ObjectivesAreWhatIsActuallyInHand(unittest.TestCase):
     """
 
     def queue(self, share_topic=True):
-        # __new__ bypasses __init__, so the control is set explicitly here --
-        # which also keeps every assertion below honest about which mode it is
-        # asserting. Default True so the pre-existing cases still see titles.
-        q = reports.Queue.__new__(reports.Queue)
-        q.share_topic = share_topic
-        return q
+        return reports.Queue("fixture", Path("/unused-registry"),
+                             service="https://example.invalid",
+                             share_topic=share_topic, actor="agent-h-1")
 
     def test_a_resolved_item_is_never_an_objective_even_though_it_has_a_holder(self):
         """The trap this whole function exists to avoid.
@@ -502,16 +494,19 @@ class ObjectivesAreWhatIsActuallyInHand(unittest.TestCase):
         """
         items = [{"id": "a", "title": "done", "status": "resolved", "holder": "agent-h-1"},
                  {"id": "b", "title": "put down", "status": "deferred", "holder": "agent-h-1"},
-                 {"id": "c", "title": "live work", "status": "open", "holder": "agent-h-1"}]
+                 {"id": "c", "title": "live work", "status": "held", "holder": "agent-h-1"}]
         got = self.queue().objectives(items)
-        self.assertEqual([o["id"] for o in got], ["c"])
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["title"], "live work")
 
     def test_a_blocked_item_IS_an_objective_and_says_so(self):
         # "held but blocked" is the state a teammate most needs to see: it is
         # the difference between a machine that is busy and one that is stuck.
         items = [{"id": "c", "title": "stuck work", "status": "blocked", "holder": "agent-h-1"}]
         got = self.queue().objectives(items)
-        self.assertEqual(got, [{"id": "c", "title": "stuck work", "status": "blocked"}])
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["title"], "stuck work")
+        self.assertEqual(got[0]["status"], "blocked")
 
     def test_an_unheld_item_is_not_an_objective(self):
         items = [{"id": "d", "title": "nobody has this", "status": "open", "holder": ""},
@@ -519,7 +514,7 @@ class ObjectivesAreWhatIsActuallyInHand(unittest.TestCase):
         self.assertEqual(self.queue().objectives(items), [])
 
     def test_the_list_is_bounded(self):
-        items = [{"id": str(n), "title": "t", "status": "open", "holder": "h"} for n in range(50)]
+        items = [{"id": str(n), "title": "t", "status": "held", "holder": "agent-h-1"} for n in range(50)]
         self.assertEqual(len(self.queue().objectives(items)), reports.OBJECTIVE_LIMIT)
 
     def test_the_title_is_withheld_unless_this_workspace_opted_in(self):
@@ -533,9 +528,11 @@ class ObjectivesAreWhatIsActuallyInHand(unittest.TestCase):
         is whom to interrupt -- and none of the disclosure.
         """
         items = [{"id": "c", "title": "migrate the billing ledger",
-                  "status": "open", "holder": "agent-h-1"}]
+                  "status": "held", "holder": "agent-h-1"}]
         closed = self.queue(share_topic=False).objectives(items)
-        self.assertEqual(closed, [{"id": "c", "status": "open"}])
+        self.assertEqual(len(closed), 1)
+        self.assertEqual(set(closed[0]), {"id", "status"})
+        self.assertEqual(closed[0]["status"], "held")
         self.assertNotIn("billing", json.dumps(closed))
         opted_in = self.queue(share_topic=True).objectives(items)
         self.assertEqual(opted_in[0]["title"], "migrate the billing ledger")
@@ -543,8 +540,9 @@ class ObjectivesAreWhatIsActuallyInHand(unittest.TestCase):
     def test_the_holder_never_travels(self):
         # An actor id names a host and a process. No teammate needs that to
         # decide whom to ask, so it must not leave this machine.
-        items = [{"id": "c", "title": "t", "status": "open", "holder": "agent-secret-host-4242"}]
-        got = self.queue().objectives(items)
+        items = [{"id": "c", "title": "t", "status": "held", "holder": "agent-secret-host-4242"}]
+        q = self.queue(); q.actor = "agent-secret-host-4242"
+        got = q.objectives(items)
         self.assertNotIn("holder", got[0])
         self.assertNotIn("secret-host", json.dumps(got))
 
@@ -558,15 +556,19 @@ class ObjectivesSurviveTheOutboundSanitizer(unittest.TestCase):
 
     def test_objectives_reach_the_wire(self):
         payload = {"queue_status": "ready", "ready_count": 3,
-                   "objectives": [{"id": "c", "title": "live work", "status": "open"}]}
+                   "objectives": [{"id": "c", "title": "live work", "status": "held"}]}
         got = reports.sanitize_outbound(payload)
-        self.assertEqual(got["objectives"], [{"id": "c", "title": "live work", "status": "open"}])
+        self.assertEqual(got["objectives"], [{"id": "c", "title": "live work", "status": "held"}])
 
     def test_an_unknown_nested_key_is_still_dropped(self):
-        payload = {"objectives": [{"id": "c", "title": "t", "status": "open",
+        payload = {"objectives": [{"id": "c", "title": "t", "status": "held",
                                    "holder": "agent-h-1", "path": "/home/someone/secret"}]}
         got = reports.sanitize_outbound(payload)
         self.assertEqual(sorted(got["objectives"][0]), ["id", "status", "title"])
 
     def test_a_non_list_objectives_value_is_dropped_not_published(self):
         self.assertEqual(reports.sanitize_outbound({"objectives": "not a list"}), {})
+
+
+if __name__ == "__main__":
+    unittest.main()

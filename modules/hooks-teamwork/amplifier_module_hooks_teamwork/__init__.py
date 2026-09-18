@@ -493,6 +493,12 @@ class TeamworkHook:
             self.filing.project_id = self.connection["project_id"]
             self.filing.service = self.connection["base_url"]
             self.filing.name = None
+            self.filing.last_status = None
+            self.filing._last_status_binding = None
+            # Objective attribution and topic consent apply to the original
+            # project binding. A new project must not inherit either grant.
+            self.filing.actor = None
+            self.filing.share_topic = False
         self.queue_said = None
         return self.sid
 
@@ -582,7 +588,11 @@ class TeamworkHook:
         """
         if self.agent_status == "unavailable" or not self.entered:
             return
-        data = {"session_id": self.sid}
+        sid, client, connection = self.sid, self.client, self.connection
+        version = self.agent_version
+        def current():
+            return self.sid == sid and self.client is client and self.connection is connection
+        data = {"session_id": sid}
         if self.node_label:
             data["node_label"] = self.node_label
         if self.responsibility:
@@ -595,18 +605,36 @@ class TeamworkHook:
         queue = self.queue_observation()
         if queue:
             data["queue"] = queue
+        if not current():
+            return
+        operation = {"op": "agent.upsert", "id": sid, "expected_version": version, "data": data}
         try:
-            self.client.request("publish", {"operations": [
-                {"op": "agent.upsert", "id": self.sid, "expected_version": self.agent_version,
-                 "data": data}]}, uid())
+            try:
+                client.request("publish", {"operations": [operation]}, uid())
+            except SyncError as error:
+                # Older released servers reject this optional extension before
+                # committing. Retry only that exact definite refusal, once,
+                # without objectives; never retry ambiguous transport outcomes.
+                detail = error.body.get("error") if isinstance(error.body, dict) else None
+                unsupported = (error.status == 422 and isinstance(detail, dict)
+                               and detail.get("code") == "invalid_request"
+                               and detail.get("message") == "Unknown queue observation field")
+                if not unsupported or "objectives" not in data.get("queue", {}) or not current():
+                    raise
+                logger.info("Teamwork service does not support objective observations; registering the ordinary card")
+                data["queue"] = {k: v for k, v in data["queue"].items() if k != "objectives"}
+                client.request("publish", {"operations": [operation]}, uid())
         except SyncError as error:
+            if not current():
+                return
             # Never fatal: sharing does not depend on being addressable.
             self.agent_status = "unavailable"
             logger.info("Teamwork agent registration unavailable (HTTP %s; 0 means transport failure); "
                         "sharing is unaffected", error.status)
             return
-        self.agent_version += 1
-        self.agent_status = "registered"
+        if current():
+            self.agent_version = version + 1
+            self.agent_status = "registered"
 
     def report_presence(self, state, summary=""):
         """Say what this session is doing. Best effort, never queued.
@@ -2220,6 +2248,8 @@ async def mount(coordinator, config=None):
     decision_detection = decision_detection_enabled(config)
     lesson_detection = lesson_detection_enabled(config)
     detection_model = detection_model_setting(config)
+    share_objective_topic = reports.topic_sharing(config.get("share_objective_topic", False))
+    work_tracker_actor = reports.objective_actor(config.get("work_tracker_actor"))
     try:
         connection, home = resolve_connection(config)
     except ValueError as error:
@@ -2252,9 +2282,7 @@ async def mount(coordinator, config=None):
             Path(config.get("queue_registry_path") or home / "queue-names.json").expanduser(),
             command=config.get("work_tracker_command") or reports.COMMAND,
             root=config.get("work_tracker_root"), service=connection["base_url"],
-            # Opt-in: the card always says busy-or-stuck, and says WHAT only
-            # when this workspace's owner has chosen to. See Queue.objectives().
-            share_topic=config.get("share_objective_topic", False))
+            share_topic=share_objective_topic, actor=work_tracker_actor)
     hook = TeamworkHook(coordinator, connection, Journal(journal_path), level=level, complaint=complaint,
                         node_label=config.get("node_label"),
                         responsibility=config.get("responsibility"),
