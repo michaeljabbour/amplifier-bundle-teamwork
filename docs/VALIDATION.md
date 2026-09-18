@@ -3,7 +3,7 @@
 ## Hard cutover to the Azure web origin + Entra SSO + auto-bind (2026-09-10)
 
 This PR changes the default `base_url` to the Amplifier Online web origin
-(`https://amplifier-teamwork-web.livelysea-7d934004.westus2.azurecontainerapps.io`),
+(`https://teamwork.amplifier.ms`),
 adds Entra (`az login`) enrollment alongside the member-code path, adds local
 git-remote auto-bind for `teamwork_bind`, and retires `team.amplifier.run`.
 

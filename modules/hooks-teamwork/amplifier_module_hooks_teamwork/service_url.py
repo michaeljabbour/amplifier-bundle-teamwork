@@ -4,9 +4,18 @@ from urllib.parse import urlsplit, urlunsplit
 
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
-# The Amplifier Online web origin (Azure Container Apps). One named constant
-# so every caller shares the same default instead of repeating the literal.
-DEFAULT_BASE_URL = "https://amplifier-teamwork-web.livelysea-7d934004.westus2.azurecontainerapps.io"
+# This deployment's own domain, and the value it publishes at /api/config as
+# `share_url` -- which is the same value its member plane gates the Origin on.
+# One named constant so every caller shares the default instead of repeating it.
+#
+# It replaced a platform-generated Azure Container Apps host, which was a fact
+# about where the containers ran rather than about where the project lives. When
+# the deployment moved, that default did not, and every new joiner was refused
+# 403 before their credential was read. A domain the project controls can follow
+# the project; and enrollment now ASKS the service for its origin as well
+# (setup_teamwork.discover_origin), so this is a starting point, not a guess
+# anything depends on being current.
+DEFAULT_BASE_URL = "https://teamwork.amplifier.ms"
 
 
 def validate_service_url(value):
