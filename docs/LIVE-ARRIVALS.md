@@ -124,7 +124,7 @@ One orchestrator swap; the bundle needs no change:
 session:
   orchestrator:
     module: loop-live
-    source: git+https://github.com/bkrabach/amplifier-module-loop-live@main
+    source: git+https://github.com/bkrabach/amplifier-module-loop-live@bb9f596
 ```
 
 The host then owns exactly one `session.execute()` task and registers the
@@ -137,6 +137,11 @@ await session.initialize()
 session.coordinator.register_capability("live.runtime", runtime)
 task = asyncio.create_task(session.execute(prompt))
 ```
+
+**Pin the revision; do not track `@main`.** Its author shares it with the team and
+says plainly he cannot guarantee he will not break it, so a host should name the
+commit it verified. `bb9f596` is the revision the evidence below was produced
+against.
 
 > `amplifier-module-loop-live` is **private during development**. This bundle does
 > not depend on it and does not import it; it is named here because it is the
