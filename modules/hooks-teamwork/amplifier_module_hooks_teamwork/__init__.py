@@ -430,6 +430,7 @@ class TeamworkHook:
         self.skills = [v for v in (skills or []) if isinstance(v, str)]
         self._card_lock = threading.RLock()
         self._card_versions = {}
+        self._card_inflight = set()
         self.agent_version = 0
         self.agent_status = "unregistered"
         self.presence_version = 0
@@ -484,7 +485,8 @@ class TeamworkHook:
         next_sid = str(uuid.uuid5(uuid.NAMESPACE_URL, next_connection["base_url"] + "/" + next_connection["project_id"] + "/" + sha(next_connection["token"]) + "/" + self.native))
         if next_sid == self.sid:
             return self.sid
-        self._card_versions[self.sid] = (self.agent_version, self.presence_version)
+        prior = self._card_versions.get(self.sid, (0, 0))
+        self._card_versions[self.sid] = (max(prior[0], self.agent_version), max(prior[1], self.presence_version))
         # A project change ends consent for this detector's old window. The
         # async done callback/host cleanup owns completion of cancellation.
         for task in tuple(self._decision_tasks | self._lesson_tasks):
@@ -600,7 +602,18 @@ class TeamworkHook:
             if self.agent_status == "unavailable" or not self.entered:
                 return
             sid, client, connection = self.sid, self.client, self.connection
-            version = self.agent_version
+            key = (sid, "agent")
+            if key in self._card_inflight:
+                return
+            self._card_inflight.add(key)
+            version = max(self.agent_version, self._card_versions.get(sid, (0, 0))[0])
+        try:
+            self._register_agent_for_binding(sid, client, connection, version)
+        finally:
+            with self._card_lock:
+                self._card_inflight.discard(key)
+
+    def _register_agent_for_binding(self, sid, client, connection, version):
         def current():
             return self.sid == sid and self.client is client and self.connection is connection
         data = {"session_id": sid}
@@ -647,8 +660,11 @@ class TeamworkHook:
         with self._card_lock:
             versions = self._card_versions.get(sid, (0, 0))
             self._card_versions[sid] = (max(versions[0], version + 1), versions[1])
+            # A→B→A may replace the client before A's reply returns. Its
+            # monotonic server version still belongs to A; old status does not.
+            if self.sid == sid:
+                self.agent_version = max(self.agent_version, self._card_versions[sid][0])
             if current():
-                self.agent_version = self._card_versions[sid][0]
                 self.agent_status = "registered"
 
     def report_presence(self, state, summary=""):
@@ -668,7 +684,10 @@ class TeamworkHook:
             if self.presence_status == "unavailable" or not self.entered:
                 return
             sid, client, connection = self.sid, self.client, self.connection
-            version = self.presence_version
+            key = (sid, "presence")
+            if key in self._card_inflight:
+                return
+            version = max(self.presence_version, self._card_versions.get(sid, (0, 0))[1])
             # A request-bound wait ends on its answer; an unbound wait may end
             # when execution resumes. Project rebind always clears both.
             if state != "waiting" and not self.waiting_on:
@@ -678,6 +697,14 @@ class TeamworkHook:
             data = {"session_id": sid, "state": state, "summary": self.presence_summary}
             if state == "waiting" and self.waiting_reason:
                 data["reason"] = self.waiting_reason
+            self._card_inflight.add(key)
+        try:
+            self._report_presence_for_binding(sid, client, connection, version, state, data)
+        finally:
+            with self._card_lock:
+                self._card_inflight.discard(key)
+
+    def _report_presence_for_binding(self, sid, client, connection, version, state, data):
         def current():
             return self.sid == sid and self.client is client and self.connection is connection
         try:
@@ -695,8 +722,9 @@ class TeamworkHook:
         with self._card_lock:
             versions = self._card_versions.get(sid, (0, 0))
             self._card_versions[sid] = (versions[0], max(versions[1], version + 1))
+            if self.sid == sid:
+                self.presence_version = max(self.presence_version, self._card_versions[sid][1])
             if current():
-                self.presence_version = self._card_versions[sid][1]
                 self.presence_status = state
 
     async def sense(self, state, summary=""):

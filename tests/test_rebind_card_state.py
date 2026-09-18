@@ -89,3 +89,57 @@ class RebindCardState(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(task,3)
         self.move('first','first-fixture-token');self.hook.register_agent()
         self.assertEqual(self.hook.client.requests[-1][1]['operations'][0]['expected_version'],1)
+
+    async def _late_reply_after_aba(self, kind):
+        entered,release=threading.Event(),threading.Event()
+        def request(*args):
+            entered.set()
+            if not release.wait(3):raise RuntimeError('fixture barrier timed out')
+            return {'stored':True}
+        publish=self.hook.register_agent if kind=='agent' else lambda:self.hook.report_presence('running','FIRST_ONLY_SUBJECT')
+        with patch.object(self.client,'request',side_effect=request):
+            task=asyncio.create_task(asyncio.to_thread(publish))
+            try:
+                self.assertTrue(await asyncio.to_thread(entered.wait,2))
+                self.move('second','second-fixture-token');self.move('first','first-fixture-token')
+            finally:release.set()
+            await asyncio.wait_for(task,3)
+        self.assertEqual(getattr(self.hook,kind+'_version'),1)
+        self.assertEqual(getattr(self.hook,kind+'_status'),'unregistered' if kind=='agent' else 'unreported')
+        self.assertEqual(self.hook.presence_summary,'')
+        if kind=='agent':self.hook.register_agent()
+        else:self.hook.report_presence('idle')
+        self.assertEqual(self.hook.client.requests[-1][1]['operations'][0]['expected_version'],1)
+
+    async def test_late_agent_reply_after_aba_updates_only_the_matching_version(self):
+        await self._late_reply_after_aba('agent')
+
+    async def test_late_presence_reply_after_aba_updates_only_the_matching_version(self):
+        await self._late_reply_after_aba('presence')
+
+    async def _same_record_not_republished_while_pending(self, kind):
+        entered,release=threading.Event(),threading.Event()
+        def request(*args):
+            entered.set()
+            if not release.wait(3):raise RuntimeError('fixture barrier timed out')
+            return {'stored':True}
+        publish=self.hook.register_agent if kind=='agent' else lambda:self.hook.report_presence('running','FIRST_ONLY_SUBJECT')
+        with patch.object(self.client,'request',side_effect=request):
+            task=asyncio.create_task(asyncio.to_thread(publish))
+            try:
+                self.assertTrue(await asyncio.to_thread(entered.wait,2))
+                self.move('second','second-fixture-token');self.move('first','first-fixture-token')
+                if kind=='agent':self.hook.register_agent()
+                else:self.hook.report_presence('idle')
+                self.assertEqual(self.hook.client.requests,[])
+            finally:release.set()
+            await asyncio.wait_for(task,3)
+        if kind=='agent':self.hook.register_agent()
+        else:self.hook.report_presence('idle')
+        self.assertEqual(self.hook.client.requests[-1][1]['operations'][0]['expected_version'],1)
+
+    async def test_same_agent_record_is_not_republished_while_old_response_pending(self):
+        await self._same_record_not_republished_while_pending('agent')
+
+    async def test_same_presence_record_is_not_republished_while_old_response_pending(self):
+        await self._same_record_not_republished_while_pending('presence')
