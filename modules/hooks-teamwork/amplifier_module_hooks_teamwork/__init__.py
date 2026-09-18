@@ -588,6 +588,27 @@ class TeamworkHook:
             return {}
         return reports.sanitize_outbound(self.clean_json(observation))
 
+    def _publish_card(self, client, operation, current, allow_rebase=True):
+        """Rebase once after a definite conflict for this one bound card.
+
+        A fresh process has no in-memory heartbeat version. The server's exact
+        single-operation conflict response supplies it without replaying an
+        ambiguous transport failure or following a project rebind.
+        """
+        try:
+            client.request("publish", {"operations": [operation]}, uid())
+        except SyncError as error:
+            detail = error.body.get("error") if isinstance(error.body, dict) else None
+            actual = detail.get("current_version") if isinstance(detail, dict) else None
+            if not (allow_rebase and error.status == 409 and isinstance(detail, dict)
+                    and detail.get("code") == "version_conflict"
+                    and type(detail.get("operation_index")) is int and detail["operation_index"] == 0
+                    and type(actual) is int and actual > operation["expected_version"] and current()):
+                raise
+            operation["expected_version"] = actual
+            client.request("publish", {"operations": [operation]}, uid())
+        return operation["expected_version"]
+
     def register_agent(self):
         """Announce this session as an addressable agent. Best effort, never queued.
 
@@ -634,7 +655,7 @@ class TeamworkHook:
         operation = {"op": "agent.upsert", "id": sid, "expected_version": version, "data": data}
         try:
             try:
-                client.request("publish", {"operations": [operation]}, uid())
+                version = self._publish_card(client, operation, current)
             except SyncError as error:
                 # Older released servers reject this optional extension before
                 # committing. Retry only that exact definite refusal, once,
@@ -647,7 +668,10 @@ class TeamworkHook:
                     raise
                 logger.info("Teamwork service does not support objective observations; registering the ordinary card")
                 data["queue"] = {k: v for k, v in data["queue"].items() if k != "objectives"}
-                client.request("publish", {"operations": [operation]}, uid())
+                # A prior conflict may already have advanced the operation
+                # before this 422. The compatibility retry gets no second rebase.
+                version = self._publish_card(client, operation, current,
+                                             allow_rebase=operation["expected_version"] == version)
         except SyncError as error:
             with self._card_lock:
                 if not current():
@@ -708,9 +732,8 @@ class TeamworkHook:
         def current():
             return self.sid == sid and self.client is client and self.connection is connection
         try:
-            client.request("publish", {"operations": [
-                {"op": "presence.upsert", "id": sid, "expected_version": version,
-                 "data": data}]}, uid())
+            operation = {"op": "presence.upsert", "id": sid, "expected_version": version, "data": data}
+            version = self._publish_card(client, operation, current)
         except SyncError as error:
             with self._card_lock:
                 if not current():
@@ -761,7 +784,7 @@ class TeamworkHook:
     def ensure_session(self):
         if self.entered: return
         version = self.state["version"]; self.state["version"] += 1; self.entered = True
-        data = {"status": "active"}
+        data = {"status": "active", "ended_at": None}
         if version == 0: data.update(title="Amplifier shared session", external_session_id=self.native, started_at=now())
         self.queue([{"op": "session.upsert", "id": self.sid, "expected_version": version, "data": data}])
 
@@ -2335,7 +2358,7 @@ async def mount(coordinator, config=None):
                         decision_detection=decision_detection,
                         lesson_detection=lesson_detection,
                         detection_model=detection_model)
-    for name, handler in (("session:start", hook.on_start), ("prompt:submit", hook.on_submit), ("prompt:complete", hook.on_complete), ("session:end", hook.on_end), ("tool:pre", hook.on_tool_pre)):
+    for name, handler in (("session:start", hook.on_start), ("session:resume", hook.on_start), ("prompt:submit", hook.on_submit), ("prompt:complete", hook.on_complete), ("session:end", hook.on_end), ("tool:pre", hook.on_tool_pre)):
         coordinator.hooks.register(name, handler, priority=50, name="teamwork-" + name.replace(":", "-"))
     send = SendTool(hook)
     await coordinator.mount("tools", send, name=send.name)
