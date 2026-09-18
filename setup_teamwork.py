@@ -184,6 +184,45 @@ def discover_project(base):
     return "teamwork"
 
 
+def discover_origin(base):
+    """Return the web origin the service publishes at /api/config, or None.
+
+    The member plane is gated on the deployment's own public origin, and 403s
+    before a credential is ever examined. Deriving that origin from --base-url is
+    a guess: it is right only while the web app and the API share a host. When it
+    stops being right -- a custom domain attached, the API kept where it was --
+    every NEW joiner is refused, and the message they get, "check login and
+    project membership", names the two things that were fine.
+
+    MEASURED against the live project, 2026-09-18: enrollment at the shipped
+    default answered 403 invalid_origin, while the same credentials at the
+    published origin answered 200. One variable, both directions.
+
+    The deployment already publishes the answer. `/api/config` carries
+    `share_url`, and that field IS the value the check compares against, so this
+    asks rather than guesses.
+
+    Same never-fatal contract as discover_project, and a separate read on
+    purpose: an optional convenience must not be able to stop an enrollment that
+    would otherwise succeed, and the caller keeps its derived fallback for every
+    case this cannot answer. --origin always wins and skips this entirely.
+    """
+    try:
+        request = urllib.request.Request(base + "/api/config", headers={"Accept": "application/json"})
+        opener = urllib.request.build_opener(NoRedirect()).open
+        with opener(request, timeout=COLD_START_SECONDS) as response:
+            published = json.loads(response.read().decode("utf-8"))
+        value = published.get("share_url") if isinstance(published, dict) else None
+        if isinstance(value, str) and value.strip():
+            # Held to the same rule as any other address here: an unambiguous
+            # HTTP(S) origin. A service that publishes nonsense is not trusted
+            # just because it published it.
+            return service_origin(value.strip())
+    except Exception:
+        pass
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
@@ -199,13 +238,18 @@ def main():
     # exercised against and is not the one that matters; against a split
     # deployment it is refused 403 before a credential is ever examined. Defaults
     # to the derived value, so a same-origin deployment is unaffected.
-    parser.add_argument("--origin", help="Public web origin, when it differs from --base-url")
+    parser.add_argument("--origin", help="Public web origin, when it differs from --base-url; "
+                        "omit to use the one the service publishes at /api/config")
     args = parser.parse_args()
     try:
         base = validate_service_url(args.base_url)
         # Validated by the same rule as the base URL: an unambiguous HTTP(S)
-        # origin, HTTPS unless it is a literal loopback host.
-        origin = service_origin(args.origin) if args.origin else service_origin(base)
+        # origin, HTTPS unless it is a literal loopback host. Typed first, then
+        # what the deployment says about itself, then the derived guess -- which
+        # stays as the last resort so a service that cannot be read still enrolls
+        # exactly as it did before.
+        origin = (service_origin(args.origin) if args.origin
+                  else discover_origin(base) or service_origin(base))
     except ValueError as error:
         raise SystemExit(str(error)) from None
     project = args.project or discover_project(base)
