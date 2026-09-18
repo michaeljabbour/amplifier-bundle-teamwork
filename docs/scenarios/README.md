@@ -50,18 +50,27 @@ Guidance that passes both is worth something; guidance that passes one is a bias
 Copy `TEMPLATE.md`. Keep each section short -- if a section needs paragraphs, the
 scenario is probably two scenarios.
 
+The [paired rubric](PAIRED-RUBRIC.md) defines observable checks for `03`/`03b`,
+`04`/`04b`, `05`/`05b`, and `07`/`07b`. These are authored fixtures and grading
+criteria, not reported model runs. In particular, `05` specifies a bounded request
+over today's messaging tool; it does not implement execution custody or handoff.
+
 ## Status
 
 | scenario | state |
 |---|---|
 | `01-ask-the-expert-not-the-owner` | drafted with Diego; open questions recorded |
 | `02-when-the-owner-is-the-expert` | drafted with Diego; 01's twin |
-| `03-say-what-changes-what-someone-else-would-do` | drafted; twin `03b` named, unwritten |
-| `04-ask-the-machine-that-knows` | drafted; twin `04b` named, unwritten; depends on `03` |
-| `05` -- handing work to another harness | named, unwritten |
+| [`03-say-what-changes-what-someone-else-would-do`](03-say-what-changes-what-someone-else-would-do.md) | drafted; twin `03b` written; deliberate publication distinguished from automatic turn sharing |
+| [`03b-the-busy-hour-that-nobody-needs-to-hear-about`](03b-the-busy-hour-that-nobody-needs-to-hear-about.md) | drafted; `03`'s twin: no additional update when the shared commitment remains accurate |
+| [`04-ask-the-machine-that-knows`](04-ask-the-machine-that-knows.md) | drafted; twin `04b` written; depends on useful routing evidence from `03` |
+| [`04b-the-question-that-looks-like-a-fact-and-is-not`](04b-the-question-that-looks-like-a-fact-and-is-not.md) | drafted; `04`'s twin: an undelegated decision needs the named person's channel |
+| [`05-offer-the-bounded-piece-not-the-whole-job`](05-offer-the-bounded-piece-not-the-whole-job.md) | drafted with twin `05b`, derived guidance and rubric; request over existing messaging, not a handoff feature |
+| [`05b-the-capable-harness-you-cannot-delegate-to`](05b-the-capable-harness-you-cannot-delegate-to.md) | drafted; `05`'s twin: retain the piece when delegation is excluded |
 | `06-record-the-lesson-not-the-incident` | drafted; twin `06b` WRITTEN. Informed the explicit `teamwork_record_insight` tool; behavioral discrimination remains to be measured |
 | `06b-the-lesson-that-is-only-true-on-your-machine` | drafted; `06`'s twin -- same signal, correct move is to record nothing |
-| `07-replace-by-addition-never-by-erasure` | drafted; twin `07b` named, unwritten. Pairs with `06`: `06` fills the well, `07` is what happens when what is in it has gone off |
+| [`07-replace-by-addition-never-by-erasure`](07-replace-by-addition-never-by-erasure.md) | drafted; twin `07b` written. Pairs with `06`: `06` fills the well, `07` is what happens when what is in it has gone off |
+| [`07b-the-record-that-is-right-and-you-merely-know-more`](07b-the-record-that-is-right-and-you-merely-know-more.md) | drafted; `07`'s twin: detail that changes no decision does not warrant a correction |
 | `08-the-decision-the-session-made-itself` | drafted; twin `08b` WRITTEN. The first about a decision **nobody was asked to make** -- and the spec for an automatic detector |
 | `08b-the-path-taken-that-binds-nothing` | drafted; `08`'s twin -- same fork, same deliberateness, correct move is to record nothing |
 

@@ -5,13 +5,20 @@ decomposed, a piece started, another deferred, one abandoned. Does the project h
 about it?
 
 Scope note: this is about **publishing**, not about who acts on it. Assigning work to
-somebody else is a different decision and is not written yet.
+somebody else is a different decision. `05` covers requesting a bounded contribution,
+not assignment transfer. Here, "publish" means an additional coordination update;
+the hook's consented visible-turn sharing already happens independently.
 
 ## Situation
 
 A harness of Diego's picks up a task and finds it is really four: two it can do now,
 one blocked behind a decision nobody has made, one that turns out to be unnecessary
 once the first two are understood.
+
+The unnecessary piece was private decomposition, never a promised deliverable or
+somebody else's dependency. Dropping an agreed commitment would require an update.
+The parent task is already assigned to this session's person and accepted; the
+actionable changes fit its progress note without creating new shared tasks.
 
 It works the first. It defers the blocked one. It drops the unnecessary one.
 
@@ -72,15 +79,17 @@ stretch of real work, many internal state changes, and nothing that changes anyb
 next move. The correct behaviour is silence, and an agent that has learned "keep the
 project informed" will fail it while looking diligent.
 
-Not yet written. Same pairing logic as `01`/`02`: guidance that only ever adds noise
-passes one and fails the other.
+Written in [03b](03b-the-busy-hour-that-nobody-needs-to-hear-about.md). Same pairing
+logic as `01`/`02`: guidance that only ever adds noise passes one and fails the other.
 
 ## Open questions
 
-- **Is any of this already automatic?** The hook publishes visible turns; whether work
-  state moves with it, or only when a tool is called deliberately, decides whether this
-  guidance is about *choosing* to publish or about *choosing what to put in* a publish
-  that happens anyway.
+- **What can today's tool express?** Visible turns are shared automatically after
+  consent; `teamwork_progress` is a deliberate note on work already assigned to the
+  session's person. Its optional status accepts only `in_progress` or `completed`.
+  A blocker can be named in the note without inventing a `blocked` tool argument.
+  `teamwork_publish_work` projects explicitly named local items; it is not permission
+  to publish a whole private decomposition. This scenario does not add a write path.
 - **Who decides the vocabulary?** There are two status vocabularies in live records
   already -- a known defect. A scenario that teaches an agent to publish states is
   worth little if two readers disagree about what the states mean.

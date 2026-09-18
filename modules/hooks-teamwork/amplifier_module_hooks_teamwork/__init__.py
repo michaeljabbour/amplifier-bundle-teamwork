@@ -701,6 +701,10 @@ class TeamworkHook:
         return hook_result()
 
     async def retrieve(self):
+        # An omitted knowledge update invalidates its old cached body. Retry a
+        # baseline on the next turn; a delta cursor alone will never resend it.
+        if self.state.pop("knowledge_refetch", False):
+            self.state["cursor"] = None
         for _ in range(5):
             body = {"session_id": self.sid, "cursor": self.state["cursor"], "selection": {"include": ["direction", "plans", "work", "ideas", "insights", "people", "presence", "messages", "agents"]}, "page_size": 100, "max_text_bytes": 262144}
             try: page = await asyncio.to_thread(self.client.request, "context", body)
@@ -714,9 +718,16 @@ class TeamworkHook:
                 if record["change"] in ("delete", "evict"): self.state["cache"].pop(key, None)
                 elif "content" in record:
                     self.state["cache"][key] = {"record": record, "delivery_id": page["delivery_id"]}
+                elif (record.get("content_omitted")
+                      and record["record_type"] in ("idea", "insight")):
+                    # Do not retain a once-active claim after an unseen correction
+                    # or review. Metadata is not the missing hashed body and must
+                    # not be fabricated into an acknowledgeable delivery.
+                    self.state["cache"].pop(key, None)
+                    self.state["knowledge_refetch"] = True
                 self.note_answer(record)
             self.state["cursor"] = page["next_cursor"]
-            self.state["partial"] = page["has_more"] or page["truncated"]
+            self.state["partial"] = page["has_more"] or page["truncated"] or self.state.get("knowledge_refetch", False)
             # Delivery status for this session's own outbound mail -- server-bounded,
             # never part of the cache, and never acknowledged (it isn't a delivery).
             self.state["outbound"] = page.get("message_status", [])
@@ -731,10 +742,25 @@ class TeamworkHook:
             content = {key: content[key] for key in PERSON_FIELDS if key in content}
         else:
             content = without_audit_trail(content)
+        # Status precedes potentially long prose: truncation must never turn a
+        # retired claim or a proposed correction into apparent current guidance.
+        status = ""
+        if record["record_type"] in ("idea", "insight"):
+            state = content.get("knowledge_state")
+            if state in ("proposed", "superseded", "rejected"):
+                status = "Knowledge status: " + state + "; not current accepted guidance.\n"
+            elif content.get("review_state") == "accepted":
+                status = "Knowledge status: accepted by a project reviewer; not independent verification.\n"
+            for field in ("supersedes", "superseded_by"):
+                if isinstance(content.get(field), dict):
+                    ref = content[field]
+                    status += self.clean("%s: %s:%s at version %s\n" % (
+                        field, str(ref.get("record_type", ""))[:20],
+                        str(ref.get("record_id", ""))[:200], str(ref.get("version", ""))[:20]))
         fragment = self.clean(json.dumps(content, ensure_ascii=False, sort_keys=True))
         if len(fragment) > 1600:
             fragment = fragment[:1600] + " [excerpt truncated; " + self.clean(describe(record, people=self.people())) + "]"
-        return record["key"] + "\n" + fragment + "\n"
+        return record["key"] + "\n" + status + fragment + "\n"
 
     def render(self):
         """Bounded excerpt that seats every kind before seating any kind twice.
@@ -753,7 +779,9 @@ class TeamworkHook:
             if self.state.get("partial"): text += "The synchronized baseline is partial.\n"
             return text
         ranked = sorted(self.state["cache"].values(),
-                        key=lambda s: RENDER_ORDER.get(s["record"]["record_type"], 9))
+                        key=lambda s: (RENDER_ORDER.get(s["record"]["record_type"], 9),
+                                       s["record"].get("content", {}).get("knowledge_state")
+                                       in ("superseded", "rejected", "proposed")))
         first, rest, seen = [], [], set()
         for source in ranked:
             kind = source["record"]["record_type"]
@@ -1874,7 +1902,9 @@ class RecordInsightTool:
             "when this task is forgotten, for teammates who were never in this session. Write what "
             "generalises, not what happened. Evidence is required -- a claim with no evidence "
             "reference is refused before anything is sent, because an insight with no evidence is "
-            "an opinion. This is deliberate: nothing here records anything on your behalf."
+            "an opinion. To correct a standing idea or insight, supply its exact version in "
+            "supersedes and explain the changed decision in correction_reason. This creates a "
+            "separate proposal for human review; it never silently replaces the original."
         )
 
     @property
@@ -1898,6 +1928,18 @@ class RecordInsightTool:
                 },
                 "title": {"type": "string",
                           "description": "Optional short label; defaults to the first 100 characters of claim."},
+                "supersedes": {
+                    "type": "object", "additionalProperties": False,
+                    "properties": {
+                        "record_type": {"type": "string", "enum": ["idea", "insight"]},
+                        "record_id": {"type": "string", "minLength": 1},
+                        "version": {"type": "integer", "minimum": 1},
+                    },
+                    "required": ["record_type", "record_id", "version"],
+                    "description": "Optional exact source version to correct; requires correction_reason and human review.",
+                },
+                "correction_reason": {"type": "string", "minLength": 1, "maxLength": 2000,
+                                      "description": "Required with supersedes: what decision changes and why the new evidence changes it."},
             },
             "required": ["claim", "basis", "confidence", "limitations", "evidence"],
         }
@@ -1985,6 +2027,29 @@ class RecordInsightTool:
         evidence_refs, refusal = self._evidence_refs(input.get("evidence"))
         if refusal:
             return ToolResult(success=False, error={"message": "Not recorded: " + refusal})
+        supersedes = input.get("supersedes")
+        correction_reason = input.get("correction_reason")
+        if "supersedes" in input or "correction_reason" in input:
+            if self.automatic:
+                return ToolResult(success=False, error={"message":
+                    "Not recorded: corrections require a deliberate call, not automatic detection."})
+            if (not isinstance(supersedes, dict)
+                    or set(supersedes) != {"record_type", "record_id", "version"}
+                    or supersedes.get("record_type") not in ("idea", "insight")
+                    or not isinstance(supersedes.get("record_id"), str)
+                    or not supersedes["record_id"].strip()
+                    or len(supersedes["record_id"]) > 200
+                    or type(supersedes.get("version")) is not int
+                    or supersedes["version"] < 1):
+                return ToolResult(success=False, error={"message":
+                    "Not recorded: supersedes needs an idea/insight record_id and a positive integer version."})
+            if (not isinstance(correction_reason, str) or not correction_reason.strip()
+                    or len(correction_reason) > 2000):
+                return ToolResult(success=False, error={"message":
+                    "Not recorded: correction_reason must explain the changed decision in 1–2000 characters."})
+            source_ref = {"kind": "record", **supersedes}
+            if source_ref not in evidence_refs:
+                evidence_refs.append(source_ref)
         claim = self.hook.clean(claim)[:INSIGHT_CLAIM]
         limitations = self.hook.clean(limitations.strip())[:INSIGHT_LIMITATIONS]
         evidence_refs = self.hook.clean_json(evidence_refs)
@@ -2000,6 +2065,10 @@ class RecordInsightTool:
         }
         if title:
             data["title"] = title
+        if supersedes is not None:
+            data.update(supersedes=self.hook.clean_json(supersedes),
+                        correction_reason=self.hook.clean(correction_reason.strip()),
+                        review_state="review_requested")
         record_id = uid()
         submitted = False
         manual_snapshot = None
@@ -2077,6 +2146,8 @@ class RecordInsightTool:
                     server_message = None
                 reason = ("the project service rejected the record: " + self.hook.clean(server_message) if server_message
                           else "the project service rejected the record")
+            elif error.status == 409 and supersedes is not None:
+                reason = "the source version changed; retrieve the current record and reassess the correction before retrying"
             elif error.status == 409:
                 reason = "a record with that id already exists; this is a bug in the tool, not something you did"
             elif error.status:
@@ -2092,7 +2163,9 @@ class RecordInsightTool:
             return unknown_outcome()
         return ToolResult(success=True, output={
             "recorded": record_id, "title": title or claim[:100],
-            "note": "Visible to the project as a new insight. This tool does not edit earlier records."})
+            "note": ("Correction proposed for human review. The original remains current until the review accepts it."
+                     if supersedes is not None else
+                     "Visible to the project as a new insight. This tool does not edit earlier records.")})
 
 
 def decision_detection_enabled(config):
