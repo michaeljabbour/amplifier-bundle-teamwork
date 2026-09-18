@@ -147,6 +147,83 @@ against.
 > not depend on it and does not import it; it is named here because it is the
 > capability's current provider, and any host offering `live.runtime` works.
 
+## Setup after installing the bundle — project scope only
+
+Everything below belongs in **`<workspace>/.amplifier/settings.yaml`**, and stays
+there. Nothing goes in `~/.amplifier/settings.yaml`.
+
+That is scoped by construction, not by convention
+(`amplifier_app_cli/lib/settings.py:76-77`):
+
+```python
+project_settings = Path.cwd() / ".amplifier" / "settings.yaml"
+local_settings   = Path.cwd() / ".amplifier" / "settings.local.yaml"
+```
+
+Both resolve from the **current working directory**, so they apply only to
+sessions started in that workspace. A harness bound this way does not follow you
+into unrelated projects on the same machine, and a session run elsewhere is
+untouched.
+
+### The binding
+
+This is the whole of it. Verified working — the harness that produced this
+document is bound exactly this way:
+
+```yaml
+bundle:
+  active: amplifier-dev          # or whatever this workspace already uses
+
+overrides:
+  hooks-teamwork:
+    config:
+      base_url: https://<your-teamwork-web-host>
+      project_id: <project>
+      connection_file: <workspace>/.amplifier/teamwork-connection.json
+      share_visible_turns: true
+  tool-teamwork:
+    config:
+      base_url: https://<your-teamwork-web-host>
+      project_id: <project>
+      connection_file: <workspace>/.amplifier/teamwork-connection.json
+      share_visible_turns: true
+```
+
+Both modules need it: the hook publishes and reads, the tools act. Note
+`share_visible_turns: true` — sharing is **off** unless explicitly opted in, and
+the hook mounts nothing without it.
+
+`connection_file` is written by the attach step and is mode `0600`. **Never commit
+it.** Add `.amplifier/teamwork-connection.json` to `.gitignore`.
+
+### Overriding the orchestrator's own config
+
+`session.orchestrator` is a single module entry rather than a list, so it was
+long missed by the settings walk — overriding it from `settings.yaml` did nothing
+and said nothing. That is fixed, and the comment at
+`amplifier_app_cli/runtime/config.py:225-231` says so in the maintainers' words:
+
+> *"Until this, no context-manager or orchestrator setting could be overridden
+> from settings.yaml at all: `overrides.context-simple.config` was silently
+> ignored."*
+
+So an orchestrator's config is settable at project scope, keyed by module
+identity:
+
+```yaml
+overrides:
+  loop-live:
+    config:
+      min_delay_between_calls_ms: 0
+```
+
+**Not verified:** whether `overrides` can *swap which module mounts* as the
+orchestrator, as opposed to configuring the one a bundle already names. The
+mechanism above applies a config override to the entry that is already there.
+Selecting `loop-live` in the first place comes from the bundle's
+`session.orchestrator.module`, so a workspace that wants it names it in a
+project-local app-layer bundle. Check that before relying on it.
+
 ## Evidence
 
 Measured 2026-09-18 against a real session on the deployed provider:
