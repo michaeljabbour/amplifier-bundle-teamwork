@@ -276,7 +276,8 @@ def projection_operation(item, queue_name, requested_person_id, existing_version
 class Queue:
     """The local work queue for one bound teamwork project, if there is one."""
 
-    def __init__(self, project_id, registry_path, command=COMMAND, root=None, service=None):
+    def __init__(self, project_id, registry_path, command=COMMAND, root=None, service=None,
+                 share_topic=False):
         self.project_id = project_id
         self.registry_path = registry_path
         # A project id is unique only within a service, so the queue's owner is the
@@ -290,6 +291,8 @@ class Queue:
         # now reports a dated truth ("last readable at T") instead of either a
         # confident "connected" or a flat "gone", neither of which is what we know.
         self.last_status = None
+        # Whether an objective may carry its TITLE. See objectives().
+        self.share_topic = bool(share_topic)
 
     def run(self, verb, args, timeout):
         command = [self.command, verb]
@@ -370,6 +373,21 @@ class Queue:
         machine is FOR right now. An agent deciding whom to ask needs the
         second thing.
 
+        THE TITLE IS OPT-IN, AND THE ROADMAP IS WHY. It names an open question:
+        "How much should a session say about what it is working on? Presence and
+        summaries exist today but deliberately withhold routing-useful topic ...
+        Saying more helps routing, costs privacy -- the roadmap does not decide
+        it." The withholding is deliberate, so this does not overturn it by
+        shipping.
+
+        The split is where the cost actually sits. An id and a status say THIS
+        MACHINE IS BUSY or THIS MACHINE IS STUCK -- near-zero disclosure, and
+        already most of the routing value, since the common question is whom to
+        interrupt. The title is the topic, and the topic is the disclosure. So
+        the card always carries the first and carries the second only when the
+        person whose workspace it is has said so, the same way sharing visible
+        turns is an explicit flag rather than a consequence of attaching.
+
         `holder` ALONE IS NOT THE ANSWER, and the difference is not subtle.
         Measured on a real project: 28 of 62 items carried a holder and 27 of
         those were already `resolved` -- the field records who worked an item,
@@ -390,10 +408,14 @@ class Queue:
         live = [i for i in items
                 if (i.get("holder") or "").strip()
                 and (i.get("status") or "open") not in ("resolved", "deferred")]
-        return [{"id": str(i.get("id") or "")[:64],
-                 "title": str(i.get("title") or "")[:160],
-                 "status": str(i.get("status") or "open")[:24]}
-                for i in live[:OBJECTIVE_LIMIT]]
+        published = []
+        for item in live[:OBJECTIVE_LIMIT]:
+            entry = {"id": str(item.get("id") or "")[:64],
+                     "status": str(item.get("status") or "open")[:24]}
+            if self.share_topic:
+                entry["title"] = str(item.get("title") or "")[:160]
+            published.append(entry)
+        return published
 
     def find(self, message_id):
         """Has this message already been filed? Used only to resolve an ambiguous write.

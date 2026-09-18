@@ -483,8 +483,13 @@ class ObjectivesAreWhatIsActuallyInHand(unittest.TestCase):
     machine is FOR right now, which is what an agent deciding whom to ask needs.
     """
 
-    def queue(self):
-        return reports.Queue.__new__(reports.Queue)
+    def queue(self, share_topic=True):
+        # __new__ bypasses __init__, so the control is set explicitly here --
+        # which also keeps every assertion below honest about which mode it is
+        # asserting. Default True so the pre-existing cases still see titles.
+        q = reports.Queue.__new__(reports.Queue)
+        q.share_topic = share_topic
+        return q
 
     def test_a_resolved_item_is_never_an_objective_even_though_it_has_a_holder(self):
         """The trap this whole function exists to avoid.
@@ -516,6 +521,24 @@ class ObjectivesAreWhatIsActuallyInHand(unittest.TestCase):
     def test_the_list_is_bounded(self):
         items = [{"id": str(n), "title": "t", "status": "open", "holder": "h"} for n in range(50)]
         self.assertEqual(len(self.queue().objectives(items)), reports.OBJECTIVE_LIMIT)
+
+    def test_the_title_is_withheld_unless_this_workspace_opted_in(self):
+        """The roadmap names this an OPEN question and says the withholding is
+        deliberate: "Presence and summaries exist today but deliberately
+        withhold routing-useful topic ... Saying more helps routing, costs
+        privacy -- the roadmap does not decide it."
+
+        So the card always says busy-or-stuck, and says WHAT only on request.
+        An id and a status carry most of the routing value -- the usual question
+        is whom to interrupt -- and none of the disclosure.
+        """
+        items = [{"id": "c", "title": "migrate the billing ledger",
+                  "status": "open", "holder": "agent-h-1"}]
+        closed = self.queue(share_topic=False).objectives(items)
+        self.assertEqual(closed, [{"id": "c", "status": "open"}])
+        self.assertNotIn("billing", json.dumps(closed))
+        opted_in = self.queue(share_topic=True).objectives(items)
+        self.assertEqual(opted_in[0]["title"], "migrate the billing ledger")
 
     def test_the_holder_never_travels(self):
         # An actor id names a host and a process. No teammate needs that to

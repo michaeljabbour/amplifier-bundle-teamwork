@@ -2251,7 +2251,10 @@ async def mount(coordinator, config=None):
             connection["project_id"],
             Path(config.get("queue_registry_path") or home / "queue-names.json").expanduser(),
             command=config.get("work_tracker_command") or reports.COMMAND,
-            root=config.get("work_tracker_root"), service=connection["base_url"])
+            root=config.get("work_tracker_root"), service=connection["base_url"],
+            # Opt-in: the card always says busy-or-stuck, and says WHAT only
+            # when this workspace's owner has chosen to. See Queue.objectives().
+            share_topic=config.get("share_objective_topic", False))
     hook = TeamworkHook(coordinator, connection, Journal(journal_path), level=level, complaint=complaint,
                         node_label=config.get("node_label"),
                         responsibility=config.get("responsibility"),
