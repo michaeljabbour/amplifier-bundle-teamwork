@@ -24,29 +24,13 @@ def _cli_present():
 
 
 def available():
-    """Whether Microsoft sign-in can actually be attempted on this host.
+    """Check the SDK and executable needed to attempt Microsoft sign-in.
 
-    IT IS NOT ENOUGH THAT azure.identity IMPORTS, and the difference is not
-    academic. Measured in a cold container: the library imported, this function
-    returned True, the enrollment form offered Microsoft sign-in, and the
-    attempt then failed with `AzureCliCredential.get_token failed: Azure CLI not
-    found on path`. Every container, CI runner and headless harness is in that
-    state -- library present, no way to sign in.
-
-    An import succeeding is a PROXY for a credential existing, not the thing
-    itself. So this also requires the `az` binary that AzureCliCredential shells
-    out to, which is the check that decisively separates a laptop from a
-    container.
-
-    A host with `az` installed but nobody signed in still returns True here and
-    fails at access_token(). That is deliberate: distinguishing those two costs
-    a subprocess and a network round trip on a path that runs before a form is
-    drawn, and both states are ACTIONABLE BY THE SAME PERSON AT THAT KEYBOARD --
-    unlike the container case, where no remedy exists on that machine at all.
-    access_token() names which of the two it is.
+    This form-time probe makes no subprocess or token request. It does not
+    establish that an account is signed in or a token can be obtained.
     """
     try:
-        import azure.identity  # noqa: F401
+        from azure.identity import AzureCliCredential  # noqa: F401
     except Exception:
         return False
     return _cli_present()
@@ -59,23 +43,26 @@ def access_token(scope):
         return cached[0]
     try:
         from azure.identity import AzureCliCredential
-
+    except Exception:
+        raise EntraUnavailable(
+            "Microsoft sign-in is unavailable because the optional Azure identity support "
+            "is not installed or could not load. Install Teamwork's SSO dependencies, "
+            "or attach a project agent credential created in Teamwork."
+        ) from None
+    if not _cli_present():
+        raise EntraUnavailable(
+            "Microsoft sign-in is unavailable on this machine: the Azure CLI is not installed. "
+            "Install the Azure CLI to use Microsoft sign-in here, or sign in to Teamwork "
+            "on another machine, create a project agent credential, and supply it to this machine."
+        )
+    try:
         token = AzureCliCredential().get_token(scope)
     except Exception:
-        # Two different machines, two different remedies. Telling someone to run
-        # `az login` on a host with no `az` is advice they cannot take, and it
-        # leaves them no way to learn what would actually help -- which is how a
-        # container user reads "unavailable" as "broken" and stops.
-        if _cli_present():
-            raise EntraUnavailable(
-                "Microsoft sign-in is unavailable on this machine: the Azure CLI is installed "
-                "but no account is signed in. Run `az login`, then try again."
-            ) from None
         raise EntraUnavailable(
-            "Microsoft sign-in is unavailable on this machine: the Azure CLI is not installed, "
-            "so no Microsoft identity can be obtained here. On a machine without a browser -- a "
-            "container, a CI runner, a remote harness -- sign in where you do have one, create a "
-            "credential there, and supply it to this machine instead."
+            "Microsoft sign-in could not obtain a token from the Azure CLI. "
+            "Check `az account show`; if sign-in is needed, run `az login`, then try again. "
+            "If already signed in, check connectivity and access to the requested service. "
+            "You can also attach a project agent credential created in Teamwork."
         ) from None
     _CACHE[scope] = (token.token, token.expires_on)
     return token.token
