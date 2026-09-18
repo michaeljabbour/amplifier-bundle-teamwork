@@ -89,3 +89,57 @@ class EntraTokenTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AvailabilityMeansSignInCanActuallyBeAttempted(unittest.TestCase):
+    """Measured in a cold container 2026-09-18, during a walk of Stage 2's
+    "every teammate connects" row: azure.identity imported, available()
+    returned True, the enrollment form offered Microsoft sign-in, and the
+    attempt failed with `AzureCliCredential.get_token failed: Azure CLI not
+    found on path`.
+
+    Every container, CI runner and headless harness is in that state. An import
+    succeeding is a PROXY for a credential existing, not the thing itself.
+    """
+
+    def test_a_machine_with_the_library_and_no_az_is_not_available(self):
+        with patch.object(entra.shutil, "which", return_value=None):
+            self.assertFalse(entra.available())
+
+    def test_a_machine_with_both_is_available(self):
+        with patch.object(entra.shutil, "which", return_value="/usr/bin/az"):
+            self.assertTrue(entra.available())
+
+    def test_an_unimportable_library_is_still_unavailable(self):
+        with patch.dict(sys.modules, {"azure.identity": None}), \
+             patch.object(entra.shutil, "which", return_value="/usr/bin/az"):
+            # A None entry in sys.modules makes the import raise, which is the
+            # closest faithful stand-in for the package being absent.
+            self.assertFalse(entra.available())
+
+
+class TheRemedyMustBeActionableOnTHATMachine(unittest.TestCase):
+    """Telling someone to run `az login` on a host with no `az` is advice they
+    cannot take, and it leaves them no way to learn what would help -- which is
+    how a container user reads "unavailable" as "broken" and stops.
+    """
+
+    def _failure(self, az_path):
+        entra._CACHE.clear()
+        with patch.object(entra.shutil, "which", return_value=az_path), \
+             patch.dict(sys.modules, {"azure.identity": None}):
+            with self.assertRaises(entra.EntraUnavailable) as caught:
+                entra.access_token("api://x/.default")
+        return str(caught.exception)
+
+    def test_az_installed_but_not_signed_in_is_told_to_sign_in(self):
+        message = self._failure("/usr/bin/az")
+        self.assertIn("az login", message)
+        self.assertIn("no account is signed in", message)
+
+    def test_az_absent_is_never_told_to_run_a_command_it_does_not_have(self):
+        message = self._failure(None)
+        self.assertNotIn("Run `az login`", message)
+        self.assertIn("not installed", message)
+        # It must name the route that DOES exist from a machine with no browser.
+        self.assertIn("supply it to this machine", message)
