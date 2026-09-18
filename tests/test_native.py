@@ -29,11 +29,16 @@ FORM = {"project": "selected", "name": "Fixture", "code": "private-fixture-code"
 
 
 class DefaultsTests(unittest.TestCase):
-    def test_default_base_url_is_the_azure_web_origin(self):
-        self.assertEqual(
-            service_url.DEFAULT_BASE_URL,
-            "https://amplifier-teamwork-web.livelysea-7d934004.westus2.azurecontainerapps.io",
-        )
+    def test_default_base_url_is_the_deployments_own_domain(self):
+        """The project has a domain of its own now: teamwork.amplifier.ms.
+
+        It is what `/api/config` publishes as `share_url`, which IS the value the
+        member plane gates on, and it is the address a person is given. The
+        platform-generated Azure host it replaced is an implementation detail of
+        where the containers happen to run -- pointing every new joiner at it made
+        the default expire the moment the deployment moved, which it did.
+        """
+        self.assertEqual(service_url.DEFAULT_BASE_URL, "https://teamwork.amplifier.ms")
         self.assertEqual(
             service_url.validate_service_url(service_url.DEFAULT_BASE_URL),
             service_url.DEFAULT_BASE_URL,
