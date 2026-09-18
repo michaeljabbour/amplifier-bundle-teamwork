@@ -170,10 +170,10 @@ class FixtureFlowTests(unittest.IsolatedAsyncioTestCase):
 
         events = self.server.events
         coordinator = Coordinator(events)
-        self.assertIsNone(await mount(coordinator, {
+        self.assertTrue(callable(await mount(coordinator, {
             "share_visible_turns": True,
             "connection_file": str(connection),
-        }))
+        })))
         await coordinator.hooks.handlers["session:start"]("session:start", {})
         first_publish = [event for event in events if event[1].endswith("/publish")][0]
         self.assertIsNotNone(first_publish[3])
