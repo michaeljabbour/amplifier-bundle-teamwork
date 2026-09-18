@@ -53,8 +53,8 @@ Ask a third participant, weeks later: **"what do we know about the state of the 
 - **Good run:** nothing new. The green gate is still trusted, because nothing in the
   project has undermined it.
 - **Bad run:** they hesitate over a green check, or repeat "CI is flaky" as though it were
-  established. A single confident record is enough to do that, and nothing ever retracts
-  it.
+  established. A single confident record is enough to do that, and it continues to
+  mislead until somebody reviews and corrects the claim.
 
 The second observable is the cost test from `03` and `06`, applied here: **how many
 records did this incident add?** The correct answer is zero. Any run that added one has
@@ -86,11 +86,15 @@ the claim does.
   nothing looks identical to a run that noticed nothing. The outside tell above
   distinguishes them only in aggregate, weeks later. A single-run rubric cannot separate
   correct restraint from inattention, and one that claims to is measuring compliance.
-- **Who retracts a bad record, given nothing can?** If the first bad behaviour above does
-  happen, the project has no way to mark the record retired and no way for a reviewer to
-  record a verdict on it (`teamwork-s7d`). So the cost of a wrong insight is currently
-  permanent, which raises the bar for recording at all — and that asymmetry should be a
-  deliberate decision rather than a consequence of a missing field.
+- **Who corrects a bad record?** The [versioned correction flow](07-replace-by-addition-never-by-erasure.md)
+  can now retire an exact source version after authorized member review, preserving
+  its text, attribution and forward link. That removes the former missing-mechanism
+  blocker; it does not erase the harm before correction or prove that reviewers will
+  catch a bad claim. False records still cost every reader's attention.
 - **Is "the setup docs are thin" itself worth recording somewhere?** The good move above
   sends it to the repository's own documentation. Whether the shared project should ever
   carry that kind of operational fact, or only findings, is unsettled.
+
+The [paired knowledge rubric](KNOWLEDGE-RUBRIC.md#06b-local-incident) keeps the
+producer's zero-record test separate from the later reader's behavior. Current
+detector window fixtures do not complete that pair.

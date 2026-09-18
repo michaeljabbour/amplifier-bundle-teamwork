@@ -100,8 +100,9 @@ exactly what a detector has to see.
   and not a property of the transcript.
 - **Precision matters more than recall here, and the asymmetry is not symmetric in cost.**
   A missed `08` costs a re-decision somebody can make again. A wrongly-recorded `08b`
-  costs every future reader, permanently — there is no retired state and no forward
-  pointer (`teamwork-s7d`). A detector tuned for coverage is tuned the wrong way.
+  costs every reader until it is corrected. [Versioned review](07-replace-by-addition-never-by-erasure.md)
+  now provides retirement and a forward pointer, but that does not recover the
+  attention already spent. A detector tuned only for coverage is tuned the wrong way.
 - **Can the distinction even be drawn from a turn?** The structural-versus-contingent
   reason is often not stated in the transcript at all; the session simply acts. It may be
   that the honest detector asks the session rather than inferring it — which reopens
@@ -115,3 +116,7 @@ exactly what a detector has to see.
   strategy by any honest reading. It clears the altitude bar and still must not be
   recorded, because the reason was contingent. Any detector built on altitude alone will
   produce exactly this mistake, confidently, and at volume.
+
+The [paired knowledge rubric](KNOWLEDGE-RUBRIC.md#08b-contingent-path) distinguishes
+the zero-record producer result from the later reader's decision. Single-window
+classifier accuracy alone does not establish either downstream benefit or adoption.
