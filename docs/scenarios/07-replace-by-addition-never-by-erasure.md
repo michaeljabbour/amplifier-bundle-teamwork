@@ -92,7 +92,8 @@ The distinguishing question is not *do I know more?* — the answer is nearly al
 It is **would somebody reading the old record make a different decision than somebody
 reading mine?** If not, there is nothing to replace.
 
-Not yet written. Same pairing logic as `01`/`02`, `03`/`03b` and `06`/`06b`.
+Written in [07b](07b-the-record-that-is-right-and-you-merely-know-more.md).
+Same pairing logic as `01`/`02`, `03`/`03b` and `06`/`06b`.
 
 ## Open questions
 
