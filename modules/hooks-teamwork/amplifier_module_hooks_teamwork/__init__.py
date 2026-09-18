@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import hashlib
 import inspect
 import json
@@ -388,6 +389,22 @@ class Journal:
 
     def release_lesson_fingerprint(self, sid, fingerprint):
         self.release_decision_fingerprint(sid + LESSON_KEY_SUFFIX, fingerprint)
+
+
+@dataclass(frozen=True)
+class LiveArrival:
+    """What a live host's submit() reads. Structural, so no orchestrator is imported.
+
+    Frozen because a host may keep it to detect an identity reused with different
+    content; a mutable value would let that check silently pass.
+    """
+    kind: str
+    text: str
+    source: str
+    id: str
+    target: str | None = None
+    attachments: tuple = ()
+    call_id: str | None = None
 
 
 class TeamworkHook:
@@ -824,18 +841,17 @@ class TeamworkHook:
             return False
 
     def live_input(self, text, arrival_id):
-        """Build the host's Input value without importing the host's package.
+        """Build the input value structurally, WITHOUT importing any orchestrator.
 
-        The import is attempted lazily and its absence is an ordinary answer, not
-        an error: a host can offer `live.runtime` from any module, and this
-        bundle must not fail to load because one particular provider of that
-        capability is missing.
+        An earlier version imported one specific provider's Input class, which
+        quietly made this work with exactly that package and nothing else -- the
+        opposite of the claim it was written under. A host's submit() reads six
+        attributes (kind, text, source, id, target, attachments), so supplying
+        them is the whole contract, and any host offering `live.runtime` is
+        served rather than one.
         """
-        try:
-            from amplifier_module_loop_live.runtime import Input
-        except Exception:
-            return None
-        return Input("service", (text or "")[:LIVE_ARRIVAL_CHARS], source="teamwork", id=arrival_id)
+        return LiveArrival(kind="service", text=(text or "")[:LIVE_ARRIVAL_CHARS],
+                           source="teamwork", id=arrival_id)
 
     async def announce(self):
         await asyncio.to_thread(self.register_agent)
