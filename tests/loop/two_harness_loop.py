@@ -4,6 +4,13 @@ does A resume WITHOUT anyone typing?
 Drives two independent TeamworkHook instances against a stub of the service.
 A calls teamwork_wait(request_id=...) which BLOCKS. While A is blocked, B
 records the answer. A must return "answered" on its own.
+
+WHAT THIS ONE CANNOT PROVE. Its `retrieve()` reads a Python list, so it proves
+the CLOCK -- that await_answer keeps looking with nobody typing -- and nothing
+about the round trip. It would pass unchanged if the service rejected the
+answer, if the delta page never carried the edit, or if the request were never
+created. `live_two_harness.py` beside it runs the same shape against two real
+credentials and the real endpoints; that is where the round trip is evidenced.
 """
 import asyncio, sys, time
 sys.path.insert(0, "modules/hooks-teamwork")
