@@ -616,11 +616,19 @@ class BrowserTests(unittest.TestCase):
             for secret in ('service-detail-leak', 'session=cookievalue', FORM['code']):
                 self.assertNotIn(secret, body)
             self.assertIn('type="password"', body)
-        def enroll(form, base, home, repository=None, origin=None, attempt=None):
-            raise RuntimeError('service-detail-leak session=cookievalue')
-        with patch('amplifier_module_tool_teamwork.connect', side_effect=enroll):
-            result = self.drive(act, timeout=1)
-        self.assertIsInstance(result, ConsentAborted)
+            self.assertIn('service availability', body)
+            self.assertIn('configured URL and network connection', body)
+            self.assertNotIn('Check your project membership and member code', body)
+            self.assertIn('If an earlier attempt was interrupted', body)
+            self.assertIn('harness controls first', body)
+        for error in (RuntimeError('service-detail-leak session=cookievalue'),
+                      TimeoutError('service-detail-leak session=cookievalue'),
+                      urllib.error.HTTPError(BASE, 503, 'service-detail-leak', {},
+                                             io.BytesIO(b'session=cookievalue'))):
+            with self.subTest(failure=type(error).__name__), \
+                 patch('amplifier_module_tool_teamwork.connect', side_effect=error):
+                result = self.drive(act, timeout=1)
+            self.assertIsInstance(result, ConsentAborted)
 
     def test_cancel_button_aborts_without_enrolling(self):
         def act(url, origin):

@@ -729,7 +729,7 @@ def private_browser_connect(base, home, stop, timeout=IDLE_TIMEOUT, notify=annou
             except Exception:
                 # Never echo service errors, submitted values, cookies or credentials.
                 return self.form(502, kept, "The service did not complete the enrollment.",
-                                 hint="Check your project membership and member code, then submit again. "
+                                 hint="Check the Teamwork service availability, configured URL and network connection before retrying. "
                                       "If an earlier attempt was interrupted, review Teamwork's harness controls first.")
             self.done()
 
