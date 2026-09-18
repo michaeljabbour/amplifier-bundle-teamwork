@@ -592,7 +592,7 @@ Ask a short, non-sensitive project prompt and confirm the expected project activ
 
 ## What is shared and retained
 
-The hook responds only to visible lifecycle events: `session:start`, `prompt:submit`, `prompt:complete`, and `session:end`. Child/delegated sessions are excluded.
+The hook responds to visible lifecycle events: `session:start`, `session:resume`, `prompt:submit`, `prompt:complete`, and `session:end`, plus the opted-in decision detector's `tool:pre` boundary. Child/delegated sessions are excluded. An explicitly opted-in resumed session announces its agent card and clears its previous session end timestamp when its first resumed turn starts executing, before the orchestrator processes that prompt. Opening the CLI and waiting at its input prompt does not trigger this registration; the resumed session still needs an explicit sharing overlay or native consent. Existing agent and presence cards may rebase once on the service's exact version-conflict response; ambiguous transport failures are not retried by this recovery path.
 
 Before a visible prompt, it flushes durable pending work, retrieves selected project context, derives a bounded excerpt, and awaits Amplifier context acceptance. Only that successful acceptance can produce a `harness_input_accepted` receipt. A receipt proves the context manager accepted a message; it does not prove provider submission, model attention, comprehension, agreement, or completion.
 
