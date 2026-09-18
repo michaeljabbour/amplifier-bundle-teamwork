@@ -36,7 +36,8 @@ import uuid
 from pathlib import Path
 
 sys.path.insert(0, "modules/hooks-teamwork")
-from amplifier_module_hooks_teamwork import HTTPClient, Journal, SyncError, TeamworkHook, WaitTool
+from amplifier_module_hooks_teamwork import (AnswerTool, Journal, SyncError, TasksTool,
+                                             TeamworkHook, WaitTool)
 
 ANSWER_AFTER = 12
 HOLD_SECONDS = int(os.environ.get("TEAMWORK_LOOP_HOLD") or 120)
@@ -45,6 +46,9 @@ HOLD_SECONDS = int(os.environ.get("TEAMWORK_LOOP_HOLD") or 120)
 # this set, B never answers and A must come back "waiting" -- if it reports
 # "answered" anyway, the run above proved nothing about the answer.
 NO_ANSWER = os.environ.get("TEAMWORK_LOOP_NO_ANSWER") == "1"
+QUESTION_TITLE = "Verification probe: does a waiting harness resume on a real answer?"
+ANSWER_NOTE = ("Yes -- answered from a second session with teamwork_answer, "
+               "nobody typing in either.")
 
 
 class Coordinator:
@@ -99,11 +103,15 @@ async def main():
     t0 = time.monotonic()
     work = Path(tempfile.mkdtemp(prefix="teamwork-live-loop-"))
     hook = TeamworkHook(Coordinator(), connection_a, Journal(work / "a.sqlite3"))
-    client_b = HTTPClient(connection_b)
+    # B is a REAL session too, not a raw client: it has to SEE the question before
+    # it can honestly be said to have answered one.
+    hook_b = TeamworkHook(Coordinator(), connection_b, Journal(work / "b.sqlite3"))
 
     print("%s harness A session %s" % (stamp(t0), hook.sid))
     await hook.on_start("session:start", {})
-    print("%s harness A registered: agent=%s" % (stamp(t0), hook.agent_status))
+    await hook_b.on_start("session:start", {})
+    print("%s harness A registered: agent=%s / harness B session %s"
+          % (stamp(t0), hook.agent_status, hook_b.sid))
 
     # The question. Addressed to the person this project knows A as -- which the
     # service told us at enrollment, and which B shares (see the docstring).
@@ -114,7 +122,7 @@ async def main():
     hook.client.request("publish", {"operations": [{
         "op": "request.upsert", "id": request_id, "expected_version": 0,
         "data": {
-            "title": "Verification probe: does a waiting harness resume on a real answer?",
+            "title": QUESTION_TITLE,
             "description": (
                 "Raised by an automated end-to-end check (tests/loop/live_two_harness.py), "
                 "not by a person, and it needs nothing from anyone: a second harness answers "
@@ -126,39 +134,32 @@ async def main():
             "desired_response": "context"}}]}, str(uuid.uuid4()))
     print("%s harness A asked %s" % (stamp(t0), request_id))
 
-    def answer(client, rid, note, version=1):
-        """Record the answer, rebasing once if the record moved underneath us.
+    async def harness_b_sees_and_answers():
+        """The SECOND session: find the question the way a session actually can, then answer it.
 
-        B reads nothing first, on purpose: /context is scoped to the CALLER'S OWN
-        session (`core.py:own_session`), and B has none -- it never started one,
-        because answering does not need one. A blind read cost a whole live run
-        with a 404 that named the session rather than the mistake. The service
-        already reports the version it has on a conflict, so ask it the only way
-        that cannot be stale: by writing.
+        B looks with teamwork_tasks, which asks the service for the records
+        addressed to this person. It does NOT look in the rendered excerpt: that
+        is a bounded best-effort sample -- measured here at 12 of 221 records,
+        with a request addressed to that very session not among them -- so a
+        question found there is luck, and a question missing from there is not
+        evidence of anything. The pull is deterministic; the excerpt is ambient.
         """
-        data = {"response": "context", "progress_note": note}
-        try:
-            client.request("publish", {"operations": [{
-                "op": "request.upsert", "id": rid,
-                "expected_version": version, "data": data}]}, str(uuid.uuid4()))
-            return version
-        except SyncError as error:
-            actual = ((error.body or {}).get("error") or {}).get("current_version")
-            if error.status != 409 or not isinstance(actual, int):
-                raise
-            client.request("publish", {"operations": [{
-                "op": "request.upsert", "id": rid,
-                "expected_version": actual, "data": data}]}, str(uuid.uuid4()))
-            return actual
-
-    async def harness_b_answers():
-        """The SECOND, INDEPENDENT credential. Nobody types in A's session."""
         await asyncio.sleep(ANSWER_AFTER)
-        version = await asyncio.to_thread(
-            answer, client_b, request_id, "Answered by the second harness, to close the loop.")
-        print("%s harness B answered (version %s)" % (stamp(t0), version))
+        listed = await TasksTool(hook_b).execute({})
+        assigned = (listed.output or {}).get("assigned", [])
+        mine = next((w for w in assigned if w.get("id") == request_id), None)
+        print("%s harness B listed %d records addressed to it; the question is among them: %s"
+              % (stamp(t0), len(assigned), bool(mine)))
+        if not mine:
+            print("   B was never handed the question -- answering it would prove nothing")
+            return False
+        result = await AnswerTool(hook_b).execute({
+            "request_id": request_id, "response": "context", "note": ANSWER_NOTE})
+        print("%s harness B answered with teamwork_answer: success=%s %s"
+              % (stamp(t0), result.success, result.output or result.error))
+        return bool(result.success)
 
-    answering = asyncio.create_task(asyncio.sleep(0) if NO_ANSWER else harness_b_answers())
+    answering = asyncio.create_task(asyncio.sleep(0) if NO_ANSWER else harness_b_sees_and_answers())
     print("%s harness A: teamwork_wait(request_id=..., seconds=%d), holding...%s"
           % (stamp(t0), HOLD_SECONDS, " (NEGATIVE CONTROL: nobody will answer)" if NO_ANSWER else ""))
     started = time.monotonic()
@@ -183,12 +184,26 @@ async def main():
             "CONTROL FAILED -- A reported state=%s after %.1fs with nobody answering; "
             "the positive run proves nothing" % (state, elapsed)))
         return 0 if held else 1
+    # RESUMING IS NOT THE SAME AS BEING TOLD, and only one of the two is what a
+    # caller needs. `state=answered` says the wait ended. The ANSWER has to come
+    # back on the same channel the caller was already awaiting -- the tool result
+    # -- because the shared excerpt is allowed to drop it and was measured doing
+    # exactly that.
+    answer = (result.output or {}).get("answer") or {}
+    told = answer.get("note") == ANSWER_NOTE and answer.get("response") == "context"
+    print("%s the answer came back IN THE TOOL RESULT: %s" % (stamp(t0), bool(told)))
+    if answer:
+        print("   %s (%s) -- %s" % (answer.get("response"), answer.get("means"), answer.get("note")))
+
     print("\nRESULT: %s" % (
-        "LOOP CLOSED -- A resumed on B's answer, through the live service, nobody typed"
-        if resumed and ontime else
-        "LOOP OPEN -- A did not resume on the answer (state=%s, %.1fs)" % (state, elapsed)))
-    print("EVIDENCE: request %s, session %s" % (request_id, hook.sid))
-    return 0 if resumed and ontime else 1
+        "LOOP CLOSED -- B was handed the question, answered it with teamwork_answer, A resumed on "
+        "its own and the answer's own words came back in A's tool result. Nobody typed."
+        if resumed and ontime and told else
+        "LOOP INCOMPLETE -- resumed=%s ontime=%s answer-reached-the-caller=%s"
+        % (resumed, ontime, told)))
+    print("EVIDENCE: request %s, A session %s, B session %s"
+          % (request_id, hook.sid, hook_b.sid))
+    return 0 if resumed and ontime and told else 1
 
 
 if __name__ == "__main__":

@@ -449,6 +449,10 @@ class TeamworkHook:
         # record or only a person; naming a record is what makes its END
         # observable rather than assumed.
         self.waiting_on = None
+        # The answer itself, once one has been observed -- see note_answer. None
+        # until then, and never an empty shape: "answered with nothing" is a
+        # claim nobody made, and it must not be possible to read one.
+        self.answer = None
         # Said once, on the first notice, so a misconfiguration is not silent.
         self.complaint = complaint
         self.client = client or HTTPClient(connection)
@@ -754,10 +758,25 @@ class TeamworkHook:
             return
         content = record.get("content") if isinstance(record.get("content"), dict) else {}
         if content.get("response") in ANSWER_LABELS:
+            # KEEP THE ANSWER, not just the fact of one. The excerpt this record
+            # also lands in is a BOUNDED, BEST-EFFORT sample -- measured live, a
+            # session rendered 12 of 221 records and a request addressed to that
+            # very session was not among them. Ambient context may drop things;
+            # that is what makes it cheap. The answer to a question this session
+            # is BLOCKED on is the one thing that must not be dropped, so it
+            # leaves by the channel the caller is already awaiting: the return
+            # value of the call that is waiting for it.
+            self.answer = {"request_id": self.waiting_on,
+                           "response": content["response"],
+                           "means": ANSWER_LABELS[content["response"]],
+                           "note": " ".join(str(content.get("progress_note") or "").split()) or None,
+                           "answered_by": content.get("responded_by"),
+                           "asked": content.get("title")}
             self.waiting_reason = self.waiting_on = None
 
     async def declare_wait(self, reason, request_id=None):
-        self.waiting_reason, self.waiting_on = reason, request_id
+        # A stale answer from an earlier wait must not be returned as this one's.
+        self.waiting_reason, self.waiting_on, self.answer = reason, request_id, None
         await asyncio.to_thread(self.report_presence, "waiting")
 
     async def await_answer(self, seconds):
@@ -1617,6 +1636,9 @@ def resolve_connection(config):
 # from before the portal mapped them on write. Reading must tolerate both. Writing
 # must emit canonical only -- a third dialect is exactly what this table exists to
 # prevent, and the server refuses anything outside the canonical set anyway.
+# A paging read must be bounded, and the bound must be visible when it bites:
+# a short list that looks complete is worse than a long one that says it is not.
+PAGE_LIMIT = 20
 LEGACY_STATUS = {"Proposed": "requested", "Ready": "requested", "In progress": "in_progress",
                  "Needs review": "in_progress", "Done": "completed"}
 
@@ -1640,43 +1662,73 @@ class WorkTools:
         self.hook = hook
 
     def project(self):
-        """Records this session may see, with each work item's status normalised."""
-        body = {"session_id": self.hook.sid, "selection": {"include": ["work", "agents"]},
-                "page_size": 100, "max_text_bytes": 262144}
-        page = self.hook.client.request("context", body)
-        work, mine = [], None
-        for entry in page.get("items", []):
-            content = entry.get("content") or {}
-            if entry.get("record_type") == "agent" and content.get("id") == self.hook.sid:
-                mine = content.get("owner_person_id")
-            elif entry.get("record_type") in ("work", "request"):
-                raw = content.get("status")
-                work.append(dict(content, status=LEGACY_STATUS.get(raw, raw), record_type=entry["record_type"]))
-        return work, mine
+        """Records this session may see, with each work item's status normalised.
+
+        READ TO THE END OF THE PAGES. This asked for one page of a hundred and
+        stopped, ignoring the `has_more` and `next_cursor` the service returns.
+        Measured on a project of 221 records: this session's own agent record was
+        on a later page, so the person could not be resolved and every tool built
+        on this reported "not registered as an agent yet" -- which was false, and
+        which a session has no way to tell apart from the truth. A question
+        addressed to you was unfindable by the one tool that finds questions.
+
+        Bounded, because a loop against a paging service must be: PAGE_LIMIT
+        pages, and the caller is TOLD when that bound was hit rather than handed
+        a short list that looks complete.
+        """
+        work, mine, cursor, truncated = [], None, None, False
+        for page_number in range(PAGE_LIMIT):
+            body = {"session_id": self.hook.sid, "cursor": cursor,
+                    "selection": {"include": ["work", "agents"]},
+                    "page_size": 100, "max_text_bytes": 262144}
+            page = self.hook.client.request("context", body)
+            for entry in page.get("items", []):
+                content = entry.get("content") or {}
+                if entry.get("record_type") == "agent" and content.get("id") == self.hook.sid:
+                    mine = content.get("owner_person_id")
+                elif entry.get("record_type") in ("work", "request"):
+                    raw = content.get("status")
+                    work.append(dict(content, status=LEGACY_STATUS.get(raw, raw), record_type=entry["record_type"]))
+            cursor = page.get("next_cursor")
+            if not page.get("has_more") or not cursor:
+                break
+            truncated = page_number + 1 == PAGE_LIMIT
+        return work, mine, truncated
 
     def assigned(self):
-        work, mine = self.project()
+        work, mine, truncated = self.project()
         if not mine:
-            return [], None
-        return [w for w in work if mine in (w.get("requested_person_id"), w.get("owner_person_id"))], mine
+            return [], None, truncated
+        return ([w for w in work if mine in (w.get("requested_person_id"), w.get("owner_person_id"))],
+                mine, truncated)
 
-    def write(self, work_id, data):
-        """One narrow write, addressed by person id and never by display name."""
+    def write(self, work_id, data, missing=None, refused=None):
+        """One narrow write, addressed by person id and never by display name.
+
+        The op follows the RECORD'S OWN KIND. `assigned()` has always returned
+        requests as well as tasks -- they are the same shape and both belong to a
+        person -- but every write here said `work.upsert` regardless, and the
+        service keeps the two in different tables. So a write aimed at a question
+        was addressed to a task with the same id: not a refusal, a write to the
+        wrong place, which is worse.
+        """
         current = next((w for w in self.assigned()[0] if w.get("id") == work_id), None)
+        missing = missing or "that task is not assigned to you, or does not exist"
         if current is None:
             # The server would refuse this anyway, and without disclosing whether
             # the task exists. Saying the same thing here keeps the two consistent.
-            return None, "that task is not assigned to you, or does not exist"
+            return None, missing
+        kind = "request" if current.get("record_type") == "request" else "work"
         try:
             self.hook.client.request("publish", {"operations": [
-                {"op": "work.upsert", "id": work_id, "expected_version": current.get("version", 0),
+                {"op": kind + ".upsert", "id": work_id, "expected_version": current.get("version", 0),
                  "data": data}]}, uid())
         except SyncError as error:
             if error.status == 403:
-                return None, ("this project's service does not yet allow a session to update work "
-                              "(it needs the narrow work-update permission)")
+                return None, refused or ("this project's service does not yet allow a session to update work "
+                                         "(it needs the narrow work-update permission)")
             if error.status == 404:
-                return None, "that task is not assigned to you, or does not exist"
+                return None, missing
             if error.status == 409:
                 return None, "that task changed while you were reading it; look again and retry"
             return None, ("the project service refused the update (HTTP %s)" % error.status
@@ -1702,7 +1754,7 @@ class TasksTool(WorkTools):
     async def execute(self, input):
         from amplifier_core.models import ToolResult
         try:
-            work, mine = await asyncio.to_thread(self.assigned)
+            work, mine, truncated = await asyncio.to_thread(self.assigned)
         except SyncError as error:
             return ToolResult(success=False, error={"message":
                 "Could not read the project (HTTP %s)" % error.status if error.status
@@ -1710,10 +1762,17 @@ class TasksTool(WorkTools):
         if not mine:
             return ToolResult(success=True, output={
                 "assigned": [],
-                "note": "This session is not registered as an agent yet, so nothing could be matched to a person."})
-        return ToolResult(success=True, output={"assigned": [
+                "note": ("This session is not registered as an agent yet, so nothing could be matched "
+                         "to a person." if not truncated else
+                         "This project has more records than this read covers, and the record naming "
+                         "this session was not among them. This is a short read, not an empty queue.")})
+        output = {"assigned": [
             {"id": w.get("id"), "title": w.get("title"), "status": w.get("status"),
-             "kind": w.get("record_type"), "version": w.get("version")} for w in work]})
+             "kind": w.get("record_type"), "version": w.get("version")} for w in work]}
+        if truncated:
+            output["note"] = ("Read stopped at the page bound, so this list may be incomplete. "
+                              "Absence from it is not evidence that nothing is assigned.")
+        return ToolResult(success=True, output=output)
 
 
 class ClaimTool(WorkTools):
@@ -1780,6 +1839,80 @@ class ProgressTool(WorkTools):
                                                 "status": data.get("status", current.get("status"))})
 
 
+class AnswerTool(WorkTools):
+    """Answer a question a teammate addressed to this session's person.
+
+    THE MISSING HALF. A request addressed to this person arrives in the session's
+    context and renders as a question with the asker's name on it. Until this
+    tool, nothing in the bundle could reply to one: a session could be asked and
+    could not answer, which makes the harness a reader of the conversation rather
+    than a participant in it. The end-to-end run that first showed a waiting
+    session resuming had to hand-write the publish in a test script -- a path no
+    real session has, and therefore not evidence about one.
+
+    Three answers, and no free text for the verdict, because the service accepts
+    exactly these three (`act`, `defer`, `context`) and a fourth invented here
+    would be refused after the model had already committed to it. The note is
+    where everything else goes.
+
+    It ANSWERS; it does not do. `act` records that this session will act on the
+    request -- it is a commitment a person reading the board can see, not the
+    work itself, and nothing here executes anything.
+
+    Only the recipient may answer: the service enforces it, and this refuses
+    first, for the same reason and in the same words it uses for work that is not
+    yours -- without confirming whether a record you cannot answer exists.
+    """
+
+    @property
+    def name(self):
+        return "teamwork_answer"
+
+    @property
+    def description(self):
+        return ("Answer a question addressed to the person running this session -- one of act (I will "
+                "act on it), defer (not now) or context (here is what you asked for), plus a note "
+                "carrying the actual answer. The question id comes from teamwork_tasks or from the "
+                "shared context excerpt. Only questions addressed to this person can be answered, and "
+                "answering commits to nothing beyond what the note says.")
+
+    @property
+    def input_schema(self):
+        return {"type": "object",
+                "properties": {"request_id": {"type": "string",
+                                              "description": "The question's id, from teamwork_tasks or the shared excerpt."},
+                               "response": {"type": "string", "enum": list(ANSWER_LABELS),
+                                            "description": "act: I will act on it. defer: not now. context: here is what you asked for."},
+                               "note": {"type": "string",
+                                        "description": "The answer itself, in the asker's terms. A verdict with no note tells them almost nothing."}},
+                "required": ["request_id", "response"]}
+
+    async def execute(self, input):
+        from amplifier_core.models import ToolResult
+        request_id, response = input.get("request_id"), input.get("response")
+        if not request_id:
+            return ToolResult(success=False, error={"message": "request_id is required"})
+        if response not in ANSWER_LABELS:
+            return ToolResult(success=False, error={"message":
+                "response must be one of act, defer or context -- the three this project's service "
+                "accepts. Anything else is refused after the fact, so it is refused here."})
+        data = {"response": response}
+        if input.get("note"):
+            data["progress_note"] = str(input["note"])[:4000]
+        missing = "that question is not addressed to you, or does not exist"
+        refused = ("this project's service allows only a question's recipient to answer it, and it "
+                   "refused this session. Nothing was recorded.")
+        current, refusal = await asyncio.to_thread(
+            self.write, request_id, data, missing, refused)
+        if refusal:
+            return ToolResult(success=False, error={"message": "Not answered: " + refusal})
+        return ToolResult(success=True, output={
+            "answered": request_id, "response": response, "means": ANSWER_LABELS[response],
+            "asked": current.get("title"),
+            "note": ("Recorded on the shared project. A session waiting on this question sees the "
+                     "answer without anyone typing; a person sees it on the board.")})
+
+
 class PublishWorkTool(WorkTools):
     """Publish NAMED local work items as shared commitments. Never automatic.
 
@@ -1821,7 +1954,7 @@ class PublishWorkTool(WorkTools):
         # confidently at the wrong half of the system, about a publish that had not
         # happened yet. Name the call that actually failed.
         try:
-            work, mine = self.project()
+            work, mine, _ = self.project()
         except SyncError as error:
             return None, ("could not read the shared project first (HTTP %s); nothing was published"
                           % error.status if error.status else
@@ -2004,10 +2137,16 @@ class WaitTool:
         seconds = WAIT_MAX_SECONDS if not isinstance(seconds, int) or seconds <= 0 else min(seconds, WAIT_MAX_SECONDS)
         outcome, status = await self.hook.await_answer(seconds)
         if outcome == "answered":
-            return ToolResult(success=True, output={
-                "state": "answered", "request_id": request_id, "observed": True,
-                "note": ("The answer landed and this session saw it without anyone typing. It is in the shared "
-                         "context from here on.")})
+            output = {"state": "answered", "request_id": request_id, "observed": True,
+                      "note": ("The answer landed and this session saw it without anyone typing. The answer "
+                               "itself is below -- read it here rather than waiting for it to appear in the "
+                               "shared excerpt, which is a bounded sample and may not carry it.")}
+            # Present only when there is one to present. A wait that ended any
+            # other way carries no `answer` key at all, so absence cannot be
+            # mistaken for an answer that said nothing.
+            if self.hook.answer:
+                output["answer"] = self.hook.answer
+            return ToolResult(success=True, output=output)
         if outcome == "unreachable":
             return ToolResult(success=False, error={"message":
                 ("Stopped watching: the shared project could not be read (HTTP %s; 0 means transport failure). "
@@ -2412,8 +2551,8 @@ async def mount(coordinator, config=None):
         coordinator.hooks.register(name, handler, priority=50, name="teamwork-" + name.replace(":", "-"))
     send = SendTool(hook)
     await coordinator.mount("tools", send, name=send.name)
-    for tool in (TasksTool(hook), ClaimTool(hook), ProgressTool(hook), WaitTool(hook), PublishWorkTool(hook),
-                RecordInsightTool(hook)):
+    for tool in (TasksTool(hook), ClaimTool(hook), ProgressTool(hook), AnswerTool(hook), WaitTool(hook),
+                PublishWorkTool(hook), RecordInsightTool(hook)):
         await coordinator.mount("tools", tool, name=tool.name)
     coordinator.register_capability("teamwork.session_id", hook.sid)
     coordinator.register_capability("teamwork.rebind", hook.rebind)

@@ -5,6 +5,15 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+
+# BEFORE the first import of the module under test, and that is the whole point.
+# This line used to sit ten lines lower, under the import below it. Running the
+# whole suite hid that: an alphabetically earlier test file inserted this same
+# path first, so the checkout won. Running THIS FILE ALONE did not -- the import
+# bound the INSTALLED copy in ~/.amplifier/cache, and a green run said nothing
+# about the working tree. `test_the_module_under_test_is_this_checkout` below
+# fails loudly if that ever comes back.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "modules/hooks-teamwork"))
 import amplifier_module_hooks_teamwork as teamwork_module
 
 
@@ -15,10 +24,9 @@ import urllib.request
 import urllib.error
 import subprocess
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "modules/hooks-teamwork"))
 from amplifier_module_hooks_teamwork import (HTTPClient, Journal, TeamworkHook, SyncError, sha, NoRedirect,
                                              mount, resolve_connection, describe, PERSON_FIELDS, verbosity,
-                                             PRESENCE_SUMMARY, TasksTool, ClaimTool, ProgressTool,
+                                             PRESENCE_SUMMARY, TasksTool, ClaimTool, ProgressTool, AnswerTool,
                                              RETIRED_MESSAGE, SendTool, WaitTool, PublishWorkTool,
                                              RecordInsightTool)
 
@@ -572,6 +580,54 @@ class HookTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.output["state"], "answered")
         self.assertIs(result.output["observed"], True)
         self.assertGreaterEqual(answered["n"], 2)
+
+    async def test_the_answer_comes_back_in_the_tool_result_not_through_the_excerpt(self):
+        """MEASURED LIVE, 2026-09-18: resuming is not the same as being told.
+
+        The wait returned `state=answered` and a note promising the answer was
+        "in the shared context from here on". The shared context is a BOUNDED,
+        BEST-EFFORT excerpt: a live run showed a session rendering 12 of 221
+        records, with a request addressed to that very session not among them. So
+        the one thing a caller blocked on a question actually needs -- the answer
+        -- was delivered on a channel that is allowed to drop it.
+
+        The answer travels back on the channel the caller is already awaiting:
+        the tool result. Deterministic, bounded, and nothing to crowd it out.
+        """
+        await self.hook.on_start("session:start", {})
+
+        async def answers_on_the_second_look():
+            self.hook.note_answer({
+                "record_type": "request", "id": "req-1", "change": "upsert",
+                "content": {"id": "req-1", "title": "Ship or hold?", "response": "act",
+                            "progress_note": "Ship it -- the rollback is verified.",
+                            "responded_by": "person-alex"}})
+
+        self.hook.retrieve = answers_on_the_second_look
+        self.hook.flush = _noop
+        with patch.object(teamwork_module, "WAIT_POLL_SECONDS", 0):
+            result = await WaitTool(self.hook).execute(
+                {"reason": "Waiting on Alex", "request_id": "req-1", "seconds": 5})
+        self.assertTrue(result.success)
+        self.assertEqual(result.output["state"], "answered")
+        answer = result.output["answer"]
+        self.assertEqual(answer["response"], "act")
+        self.assertEqual(answer["means"], "will act on it")
+        self.assertEqual(answer["note"], "Ship it -- the rollback is verified.")
+        self.assertEqual(answer["answered_by"], "person-alex")
+        self.assertEqual(answer["asked"], "Ship or hold?")
+
+    async def test_a_wait_that_times_out_carries_no_answer_field_at_all(self):
+        """FAIL and ABSENCE must not look alike: an empty answer beside a real
+        one reads as "answered with nothing", which is a claim nobody made."""
+        await self.hook.on_start("session:start", {})
+        self.hook.retrieve = _noop
+        self.hook.flush = _noop
+        with patch.object(teamwork_module, "WAIT_POLL_SECONDS", 0):
+            result = await WaitTool(self.hook).execute(
+                {"reason": "Waiting on Alex", "request_id": "req-1", "seconds": 1})
+        self.assertEqual(result.output["state"], "waiting")
+        self.assertNotIn("answer", result.output)
 
     async def test_an_unanswered_wait_ends_on_its_own_and_reports_a_real_absence(self):
         """A blocked session is a person's time. It must end, and must not
@@ -1357,6 +1413,23 @@ class StandaloneRecoveryTests(unittest.TestCase):
 
 
 
+class TheSuiteTestsTheCheckout(unittest.TestCase):
+    """A green test against the last published copy of the code is not evidence.
+
+    Measured: with the path insert below the import, `python -m unittest discover
+    -s tests -p test_hook.py` imported the module from ~/.amplifier/cache -- the
+    INSTALLED bundle -- while the full-suite run imported the checkout, because
+    an alphabetically earlier file happened to insert the path first. Same file,
+    same assertions, two different programs under test depending on how it was
+    invoked, and nothing said so.
+    """
+
+    def test_the_module_under_test_is_this_checkout(self):
+        here = Path(__file__).resolve().parents[1]
+        self.assertTrue(Path(teamwork_module.__file__).resolve().is_relative_to(here),
+                        "testing %s, not this checkout" % teamwork_module.__file__)
+
+
 class WorkToolTests(unittest.IsolatedAsyncioTestCase):
     """The tools a session uses to see and move work its own person holds."""
 
@@ -1370,7 +1443,12 @@ class WorkToolTests(unittest.IsolatedAsyncioTestCase):
             if endpoint == "context":
                 records = [{"record_type": "agent", "content": {"id": self.sid,
                                                                 "owner_person_id": WorkToolTests.OWNER}}]
-                records += [{"record_type": "work", "content": item} for item in self.items]
+                # The kind travels on the ENTRY, exactly as the service sends it:
+                # `project()` reads it from there and overwrites anything the
+                # content claims. A fixture that only ever produced work entries
+                # could not have shown a request being written to the wrong table.
+                records += [{"record_type": item.get("record_type", "work"), "content": item}
+                            for item in self.items]
                 return {"items": records, "next_cursor": None, "has_more": False}
             if self.fail:
                 raise SyncError(self.fail)
@@ -1384,6 +1462,64 @@ class WorkToolTests(unittest.IsolatedAsyncioTestCase):
                             self.Work("placeholder", items, fail))
         hook.client.sid = hook.sid
         return hook
+
+    class Paged:
+        """A project bigger than one page -- which every real one becomes."""
+        def __init__(self, sid, pages):
+            self.sid, self.pages, self.reads, self.writes = sid, pages, [], []
+
+        def request(self, endpoint, body, key=None):
+            if endpoint == "context":
+                index = int(body.get("cursor") or 0)
+                self.reads.append(body.get("cursor"))
+                page = self.pages[index]
+                return {"items": page, "has_more": index + 1 < len(self.pages),
+                        "next_cursor": str(index + 1) if index + 1 < len(self.pages) else None}
+            self.writes.append(body)
+            return {"results": [{"id": body["operations"][0]["id"], "version": 2}]}
+
+    def paged(self, pages):
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        connection = {"base_url": "https://team.example.invalid", "project_id": "teamwork", "token": "t"}
+        hook = TeamworkHook(Coordinator(Context([])), connection, Journal(Path(tmp.name) / "q.db"),
+                            self.Paged("placeholder", pages))
+        hook.client.sid = hook.sid
+        return hook
+
+    async def test_work_is_read_past_the_first_page(self):
+        """MEASURED LIVE, 2026-09-18, on a project of 221 records.
+
+        `project()` asked for one page of 100 and stopped, ignoring `has_more`
+        and `next_cursor`. This session's own agent record sat on a later page,
+        so the person could not be resolved, and teamwork_tasks answered:
+
+            "This session is not registered as an agent yet, so nothing could be
+             matched to a person."
+
+        The session WAS registered. The true sentence was "I only looked at the
+        first hundred records". Every tool built on this read the same way, so a
+        question addressed to you -- the one deterministic way to find one --
+        reported that you had nothing, on any project past its first page.
+        """
+        hook = self.paged([
+            [{"record_type": "work", "content": {"id": "w%d" % i, "title": "Task %d" % i,
+                                                 "status": "requested", "version": 1,
+                                                 "requested_person_id": self.OWNER}} for i in range(100)],
+            [{"record_type": "request", "content": {"id": "asked-of-me", "title": "Can you confirm?",
+                                                    "status": "requested", "version": 1,
+                                                    "requested_person_id": self.OWNER}},
+             {"record_type": "agent", "content": {"id": "SID", "owner_person_id": self.OWNER}}],
+        ])
+        for page in hook.client.pages:
+            for entry in page:
+                if entry["record_type"] == "agent":
+                    entry["content"]["id"] = hook.sid
+        result = await TasksTool(hook).execute({})
+        self.assertTrue(result.success)
+        ids = [w["id"] for w in result.output["assigned"]]
+        self.assertIn("asked-of-me", ids, "a question on the second page was never seen")
+        self.assertEqual(len(ids), 101)
+        self.assertNotIn("note", result.output)
 
     async def test_it_lists_my_work_and_reads_the_older_status_spelling(self):
         # Stored records still carry UI labels from before the portal normalised
@@ -1427,6 +1563,62 @@ class WorkToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.success)
         self.assertIn("does not yet allow", result.error["message"])
 
+    async def test_a_question_addressed_to_me_can_be_answered_from_the_session(self):
+        """The half of the loop that had no tool at all.
+
+        A request addressed to this session's person arrives in its context and
+        renders as a question. Until now nothing in the bundle could answer one:
+        the live run that "closed the loop" hand-wrote the publish in a test
+        script, which is a path no real session has. A harness that can be asked
+        and cannot reply is not a participant in a conversation.
+        """
+        hook = self.build([{"id": "r1", "title": "May I ship?", "status": "requested", "version": 4,
+                            "record_type": "request", "requested_person_id": self.OWNER}])
+        result = await AnswerTool(hook).execute({"request_id": "r1", "response": "act",
+                                                 "note": "Yes -- the rollback is verified."})
+        self.assertTrue(result.success, getattr(result, "error", None))
+        operation = hook.client.writes[0]["operations"][0]
+        self.assertEqual(operation["op"], "request.upsert")
+        self.assertEqual(operation["expected_version"], 4)
+        self.assertEqual(operation["data"], {"response": "act",
+                                             "progress_note": "Yes -- the rollback is verified."})
+
+    async def test_an_answer_names_a_question_of_mine_or_is_refused(self):
+        hook = self.build([{"id": "r1", "title": "Not yours", "status": "requested", "version": 1,
+                            "record_type": "request", "requested_person_id": "person-blair"}])
+        result = await AnswerTool(hook).execute({"request_id": "r1", "response": "act"})
+        self.assertFalse(result.success)
+        self.assertIn("not addressed to you, or does not exist", result.error["message"])
+        self.assertEqual(hook.client.writes, [])
+
+    async def test_only_the_three_answers_the_service_accepts_are_offered(self):
+        hook = self.build([{"id": "r1", "title": "May I ship?", "status": "requested", "version": 1,
+                            "record_type": "request", "requested_person_id": self.OWNER}])
+        result = await AnswerTool(hook).execute({"request_id": "r1", "response": "maybe"})
+        self.assertFalse(result.success)
+        self.assertIn("act", result.error["message"])
+        self.assertEqual(hook.client.writes, [])
+
+    async def test_the_recipient_refusal_is_reported_as_what_it_is(self):
+        # The server polices who may answer, and says 403. A session told only
+        # "refused" would reasonably retry; one told why will not.
+        hook = self.build([{"id": "r1", "title": "May I ship?", "status": "requested", "version": 1,
+                            "record_type": "request", "requested_person_id": self.OWNER}], fail=403)
+        result = await AnswerTool(hook).execute({"request_id": "r1", "response": "defer"})
+        self.assertFalse(result.success)
+        self.assertIn("recipient", result.error["message"])
+
+    async def test_progress_on_a_request_writes_to_the_requests_table_not_tasks(self):
+        """Latent before the answer tool existed: `assigned()` returns requests
+        as well as tasks, and every write said `work.upsert` regardless. The op
+        now follows the record's own kind."""
+        hook = self.build([{"id": "r1", "title": "May I ship?", "status": "requested", "version": 2,
+                            "record_type": "request", "requested_person_id": self.OWNER}])
+        result = await ProgressTool(hook).execute({"request_id": "r1", "task_id": "r1",
+                                                   "note": "Looking at it now."})
+        self.assertTrue(result.success)
+        self.assertEqual(hook.client.writes[0]["operations"][0]["op"], "request.upsert")
+
     async def test_the_mounted_tools_can_move_work_but_never_create_it(self):
         # A session must not invent tasks for anyone, including its own owner:
         # that is a person's decision, made in the portal.
@@ -1438,9 +1630,10 @@ class WorkToolTests(unittest.IsolatedAsyncioTestCase):
             def register_capability(self, name, value): self.capabilities[name] = value
             async def mount(self, point, value, name): mounted.add(name)
 
-        for tool in (TasksTool(hook), ClaimTool(hook), ProgressTool(hook)):
+        for tool in (TasksTool(hook), ClaimTool(hook), ProgressTool(hook), AnswerTool(hook)):
             mounted.add(tool.name)
-        self.assertEqual(mounted, {"teamwork_tasks", "teamwork_claim", "teamwork_progress"})
+        self.assertEqual(mounted, {"teamwork_tasks", "teamwork_claim", "teamwork_progress",
+                                   "teamwork_answer"})
         self.assertFalse(any("add" in n or "create" in n or "new" in n for n in mounted))
 
 
