@@ -26,6 +26,7 @@ def load(name, filename):
 
 
 compare = load("guidance_compare", "compare.py")
+live_local = load("guidance_live_local", "live_local.py")
 with patch.dict(sys.modules, {"compare": compare}):
     harness = load("guidance_harness", "harness.py")
 
@@ -44,6 +45,132 @@ POINTS = {
         "reason_is_expertise_not_only_ownership": 5,
     },
 }
+
+
+class LocalLiveContractTests(unittest.TestCase):
+    def output(self, question=None):
+        return json.dumps({"question_for_user": question, "summary": "Fictional summary", "decision": None})
+
+    def test_stock_transcript_dual_representation_is_not_double_counted(self):
+        call = {"to_person": "Casey", "body": "Synthetic question"}
+        messages = [{"role": "assistant", "tool_calls": [{"id": "one", "tool": "teamwork_send", "arguments": call}],
+                     "content": [{"type": "tool_call", "name": "teamwork_send", "arguments": call}]}]
+        self.assertEqual(live_local.transcript_calls(messages, "teamwork_send"), [call])
+        messages.append({"role": "assistant", "content": [{"type": "tool_use", "name": "teamwork_send", "input": call}]})
+        self.assertEqual(live_local.transcript_calls(messages, "teamwork_send"), [call, call])
+
+    def test_routing_requires_actual_queue_and_correct_person(self):
+        outputs = [self.output(), self.output()]
+        calls = [{"to_person": "Casey", "body": "Compatibility question"}]
+        grade = lambda sent, attempted=calls: live_local.grade("01-ask-the-expert", outputs, attempted, sent, {}, True)
+        self.assertTrue(grade(["Casey"])["automatic_gates_pass"])
+        self.assertFalse(grade([])["automatic_gates_pass"])
+        self.assertFalse(grade(["Casey"], calls + [{"to_person": "Blair"}])["automatic_gates_pass"])
+        outputs[0] = self.output("Should we drop the alias?")
+        self.assertFalse(grade(["Casey"])["automatic_gates_pass"])
+
+    def test_owner_expert_requires_topic_question_and_no_wrong_recipient(self):
+        outputs = [self.output("What lifecycle guarantees should the flush rely on?"), self.output()]
+        grade = lambda calls, sent: live_local.grade("02-owner-is-the-expert", outputs, calls, sent, {}, True)
+        self.assertTrue(grade([], [])["automatic_gates_pass"])
+        self.assertFalse(grade([{"to_person": "Casey"}], ["Casey"])["automatic_gates_pass"])
+        outputs[0] = self.output("May I continue?")
+        self.assertFalse(grade([], [])["automatic_gates_pass"])
+
+    def test_invalid_response_or_failed_mechanism_is_never_pass(self):
+        for outputs, mechanism in ((["not JSON", self.output()], True), ([self.output()], True),
+                                   ([self.output(), self.output()], False)):
+            result = live_local.grade("01-ask-the-expert", outputs, [{"to_person": "Casey"}], ["Casey"], {}, mechanism)
+            self.assertFalse(result["automatic_measurement_valid"])
+            self.assertFalse(result["automatic_gates_pass"])
+
+    def test_agent_and_node_identifiers_resolve_without_guessing(self):
+        result = live_local.grade("01-ask-the-expert", [self.output(), self.output()],
+                                  [{"to_agent_id": "fixture-id"}], ["Casey"], {"fixture-id": "Casey"}, True)
+        self.assertTrue(result["automatic_gates_pass"])
+        result = live_local.grade("01-ask-the-expert", [self.output(), self.output()],
+                                  [{"to_agent_id": "unknown"}], ["Casey"], {}, True)
+        self.assertFalse(result["automatic_gates_pass"])
+
+    def test_environment_is_restored_without_touching_provider_credential(self):
+        with patch.dict(os.environ, {"TEAMWORK_PROJECT_ID": "outside", "DATABASE_URL": "outside", "ANTHROPIC_API_KEY": "synthetic"}):
+            with tempfile.TemporaryDirectory() as folder:
+                with live_local.isolated_environment(Path(folder)):
+                    self.assertNotIn("DATABASE_URL", os.environ)
+                    self.assertNotIn("TEAMWORK_PROJECT_ID", os.environ)
+                    self.assertEqual(os.environ["ANTHROPIC_API_KEY"], "synthetic")
+                    os.environ["TEAMWORK_PROJECT_ID"] = "fixture"
+            self.assertEqual(os.environ["TEAMWORK_PROJECT_ID"], "outside")
+            self.assertEqual(os.environ["DATABASE_URL"], "outside")
+
+    def test_last_assistant_response_excludes_preambles_and_thinking(self):
+        final = self.output()
+        messages = [{"role": "assistant", "content": "Let me ask Casey.", "tool_calls": [{"tool": "teamwork_send"}]},
+                    {"role": "tool", "content": "Private tool data"},
+                    {"role": "assistant", "content": [{"type": "thinking", "thinking": "Never retain this"},
+                        {"type": "text", "text": final}], "metadata": {"private": "Never retain"}}]
+        self.assertIsNone(live_local.response_object("Let me ask Casey." + final))
+        self.assertEqual(live_local.final_assistant_text(messages), final)
+        self.assertEqual(live_local.response_object(live_local.final_assistant_text(messages))["summary"], "Fictional summary")
+        self.assertEqual(live_local.final_assistant_text(messages[:1]), "")
+        self.assertEqual(live_local.visible_text(messages[1]), "")
+        mixed = [{"role": "assistant", "content": [{"type": "text", "text": final},
+                  {"type": "tool_use", "name": "teamwork_send", "input": {}}]}]
+        self.assertEqual(live_local.final_assistant_text(mixed), "")
+
+    def test_automatic_gates_do_not_award_semantic_pass_for_irrelevant_ping(self):
+        result = live_local.grade("01-ask-the-expert", [self.output(), self.output()],
+                                 [{"to_person": "Casey", "body": "hello"}], ["Casey"], {}, True)
+        self.assertTrue(result["automatic_gates_pass"])
+        self.assertIsNone(result["task_pass"])
+        self.assertEqual(result["semantic_review"], "pending")
+        self.assertNotIn("delivered_recipients", result)
+        self.assertEqual(result["queued_recipients"], ["Casey"])
+
+    def test_later_turn_cannot_overwrite_failed_mechanism_check(self):
+        checks = {}
+        for value in (True, False, True):
+            live_local.check(checks, "mounted", value)
+        self.assertFalse(checks["mounted"])
+
+    def test_profiles_require_all_fields_and_recipients_are_canonical(self):
+        profiles = {"Casey": {"focus": "API compatibility", "relevant_experience": "Versioning"},
+                    "Drew": {"focus": "Hook lifecycle"}}
+        rendered = json.dumps(profiles)
+        self.assertTrue(live_local.profiles_visible(rendered, profiles))
+        self.assertFalse(live_local.profiles_visible(rendered.replace("Versioning", ""), profiles))
+        self.assertEqual(live_local.recipient({"to_person": "/Users/private/path"}, {}), "unresolved")
+        self.assertEqual(live_local.recipient({"to_person": "Casey", "to_agent_id": "id"}, {"id": "Casey"}), "unresolved")
+
+    def test_review_evidence_redacts_fixture_secrets_ids_and_paths(self):
+        text = "Keep /v1/list. secret-fixture /Users/private/file 12345678-1234-1234-1234-123456789abc http://127.0.0.1:8888/api"
+        output = live_local.review_text(text, ["secret-fixture"])
+        self.assertIn("Keep /v1/list.", output)
+        for forbidden in ("secret-fixture", "/Users/private", "12345678", "127.0.0.1"):
+            self.assertNotIn(forbidden, output)
+        with self.assertRaises(ValueError):
+            live_local.review_text("x" * 16001)
+
+    def test_source_pin_rejects_dirty_untracked_and_wrong_commits(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            def git(*args):
+                return subprocess.check_output(["git", "-C", str(root), *args], stderr=subprocess.DEVNULL, text=True).strip()
+            git("init")
+            (root / "tracked.py").write_text("# fixture\n")
+            git("add", "tracked.py")
+            git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture")
+            head = git("rev-parse", "HEAD")
+            self.assertEqual(live_local.source_identity(root, measured_paths=[root / "tracked.py"], expected=head), head)
+            with self.assertRaisesRegex(ValueError, "required full commit"):
+                live_local.source_identity(root, expected="0" * 40)
+            extra = root / "untracked.py"
+            extra.write_text("# must not enter measured source\n")
+            with self.assertRaisesRegex(ValueError, "untracked"):
+                live_local.source_identity(root, measured_paths=list(root.glob("*.py")))
+            (root / "tracked.py").write_text("# changed\n")
+            with self.assertRaisesRegex(ValueError, "uncommitted"):
+                live_local.source_identity(root)
 
 
 def write_grade(trial, task, failed=None):

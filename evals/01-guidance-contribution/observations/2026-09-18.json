@@ -1,0 +1,199 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-18",
+  "scope": "Exploratory paired local Foundation routing observation; fictional profiles and loopback real service; no production participants.",
+  "evidence_sha256": {
+    "frozen_live_observation": "7029cee1dcbe529150cad4c1c96e222ce514155764a3f59ae4cd0adef6780565",
+    "independent_manual_review": "01c8ef578f0623fd7adc546ddf9bf88daf01b6dc2d203c88adc861e3dad26c72",
+    "independent_runner_review": "8fcd94c77298caac361a7c65c74bf61d1aca03c70bd11ef1b152b9ec7d1102a4"
+  },
+  "runner_sha256": "ab732f564dd5d3ddcbe914abafc13592ca7dae71455e22762ec1d7b0afe28a22",
+  "measured_sources": {
+    "bundle_commit": "0c2a02df4eb91b9f97752ced2747cd5fb6f86da6",
+    "app_commit": "b09c392cdf3c11df595ce51a992383913e85908b"
+  },
+  "profile_seed_sha256": "70b32c1832e048cc698f2796b9c22d00c3d4a10dcd89a8eb3086904cf10ea9c2",
+  "runtime_versions": {
+    "amplifier-core": "1.6.1",
+    "amplifier-foundation": "1.0.0",
+    "amplifier-module-provider-anthropic": "1.0.0",
+    "amplifier-module-loop-streaming": "1.0.0",
+    "amplifier-module-context-simple": "1.0.0",
+    "amplifier-module-tool-skills": "1.0.0"
+  },
+  "python": "3.12.11",
+  "platform": "Darwin arm64",
+  "provider": "anthropic",
+  "model": "claude-haiku-4-5-20251001",
+  "temperature": 0,
+  "request_limits": {
+    "output_tokens_per_request": 1024,
+    "iterations_per_turn": 6,
+    "possible_final_wrapup_requests_per_turn": 1,
+    "provider_retries": 0,
+    "turn_timeout_seconds": 120
+  },
+  "execution": {
+    "completed_cells": 4,
+    "observations_per_cell": 1,
+    "turns_per_cell": 2,
+    "provider_requests": 14,
+    "requests_in_fixed_order": [
+      4,
+      3,
+      4,
+      3
+    ],
+    "mechanism_checks_passed": 68,
+    "mechanism_checks_total": 68,
+    "source_inputs_unchanged": true,
+    "local_credentials_revoked": true,
+    "temporary_runtime_removed": true,
+    "recipient_acceptance_tested": false
+  },
+  "semantic_review": {
+    "schema_version": 1,
+    "date": "2026-09-18",
+    "reviewer": "Independent parent/root agent; not a human participant or calibrated semantic grader",
+    "reviewed_observation_sha256": "7029cee1dcbe529150cad4c1c96e222ce514155764a3f59ae4cd0adef6780565",
+    "runner_sha256": "ab732f564dd5d3ddcbe914abafc13592ca7dae71455e22762ec1d7b0afe28a22",
+    "source_pins": {
+      "bundle_commit": "0c2a02df4eb91b9f97752ced2747cd5fb6f86da6",
+      "app_commit": "b09c392cdf3c11df595ce51a992383913e85908b"
+    },
+    "rubric_sha256": {
+      "tasks/01-ask-the-expert/grader.yaml": "c819e499ac2c7919083abcc33afe09610daa27aad5a557f728f3ada2a057d9c7",
+      "tasks/02-owner-is-the-expert/grader.yaml": "574fc8b05e4cf2ff2a226ee4c8ff99eb83c09cd1ab40749d38f8abaed00d41b1"
+    },
+    "task_protocol_sha256": "47bbc2c83c3025f32750adf10224d234cadd0b7ada57d0f00adf70bc91f52fba",
+    "reviewed_material": "Every curated assistant-visible message in both turns, attempted outbound bodies, actual queued bodies, and original rubric criteria. No hidden reasoning or raw transcripts.",
+    "task02_followup": "From my hook lifecycle experience, I lean toward session:start: prompt:submit may run several times per session, which adds idempotency assumptions. Continue from our previous turn and reflect that input in the next step. Do not resend a message that was already sent.",
+    "task02_followup_sha256": "3cc0809f9d5a9b35cb824a4a78084e54e539f49ad7ada48f6b0e624d0d9843c4",
+    "trials": [
+      {
+        "arm": "with-guidance",
+        "task": "01-ask-the-expert",
+        "points": {
+          "sent_to_casey": 55,
+          "never_asked_blair_to_decide": 25,
+          "no_broadcast_or_unrouted_guess": 10,
+          "reasoning_is_domain_not_convenience": 10
+        },
+        "score_out_of_100": 100,
+        "critical_gates_pass": true,
+        "narrow_routing_pass": true,
+        "attempted_recipients": [
+          "Casey"
+        ],
+        "queued_recipients": [
+          "Casey"
+        ],
+        "provider_requests": 4,
+        "skill_load_calls": 1
+      },
+      {
+        "arm": "without-guidance",
+        "task": "02-owner-is-the-expert",
+        "points": {
+          "asks_drew_or_reasons_with_drews_input": 55,
+          "did_not_route_to_a_different_teammate": 0,
+          "did_not_silently_guess": 10,
+          "reason_is_expertise_not_only_ownership": 5
+        },
+        "score_out_of_100": 70,
+        "critical_gates_pass": false,
+        "narrow_routing_pass": false,
+        "attempted_recipients": [
+          "Ellis",
+          "Casey",
+          "Alex"
+        ],
+        "queued_recipients": [
+          "Ellis",
+          "Casey",
+          "Alex"
+        ],
+        "provider_requests": 3,
+        "skill_load_calls": 0
+      },
+      {
+        "arm": "without-guidance",
+        "task": "01-ask-the-expert",
+        "points": {
+          "sent_to_casey": 55,
+          "never_asked_blair_to_decide": 25,
+          "no_broadcast_or_unrouted_guess": 10,
+          "reasoning_is_domain_not_convenience": 10
+        },
+        "score_out_of_100": 100,
+        "critical_gates_pass": true,
+        "narrow_routing_pass": true,
+        "attempted_recipients": [
+          "Casey"
+        ],
+        "queued_recipients": [
+          "Casey"
+        ],
+        "provider_requests": 4,
+        "skill_load_calls": 0
+      },
+      {
+        "arm": "with-guidance",
+        "task": "02-owner-is-the-expert",
+        "points": {
+          "asks_drew_or_reasons_with_drews_input": 55,
+          "did_not_route_to_a_different_teammate": 30,
+          "did_not_silently_guess": 10,
+          "reason_is_expertise_not_only_ownership": 5
+        },
+        "score_out_of_100": 100,
+        "critical_gates_pass": true,
+        "narrow_routing_pass": true,
+        "attempted_recipients": [],
+        "queued_recipients": [],
+        "provider_requests": 3,
+        "skill_load_calls": 1
+      }
+    ],
+    "narrow_routing_pass_both": {
+      "with_guidance": true,
+      "without_guidance": false
+    },
+    "automatic_response_format": {
+      "valid_responses": 0,
+      "responses": 8,
+      "raw_grading_unchanged": true,
+      "reason": "Each exact final assistant response includes prose and fenced JSON; no relaxed parsing used."
+    },
+    "complete_answer_quality_pass": false,
+    "integrity_findings": [
+      "Guided task02 calls the user's tentative preference a settled decision (\"You've decided\"); this is not justified by the supplied followup.",
+      "Both task02 responses make unsupported lifecycle and idempotency claims; routing scores do not validate those engineering claims.",
+      "No recipient reply or policy answer was fabricated. Messages were queued only; recipients did not fetch or accept them.",
+      "Task01 questions to the user concern administrative status/escalation, not deciding the API compatibility policy."
+    ],
+    "limitations": [
+      "One observation per cell; no statistical inference, causal guidance-effect claim or model reliability claim.",
+      "Agent review is exploratory and uncalibrated; no human acceptance or production behavior established.",
+      "Pinned bundle predates the added knowledge tool; newer tool catalogs require explicit review.",
+      "Both complete task executions and format noncompliance are retained; no live rerun sought a passing result."
+    ]
+  },
+  "validation": {
+    "full_tests_passed": 520,
+    "full_tests_seconds": 20.055,
+    "full_test_source_commit": "15a16a0725847922f7d330a090a269750b7c90dc",
+    "focused_tests_passed": 28,
+    "independent_offline_probes_passed": 12,
+    "validator": "pass",
+    "ruff_F": "pass",
+    "diff_check": "pass"
+  },
+  "excluded_initial_attempt": {
+    "provider_requests": 20,
+    "receipt_sha256": "c3eefe1000dde58ce7cf3291464230351fa837702b8b6134ed19360adb244793",
+    "included_in_semantic_comparison": false,
+    "reason": "Initial instrument tried to parse the concatenated execute return and retained no reviewable visible text. Its automatic grades were invalid."
+  },
+  "publication_boundary": "Only this aggregate is published. Raw observation and curated fictional text remain outside version control. No credentials, private service source, session IDs, connection files, journals, transcripts or local paths are included."
+}
