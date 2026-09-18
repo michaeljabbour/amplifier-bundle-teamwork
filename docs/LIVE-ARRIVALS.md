@@ -36,7 +36,7 @@ on_start
   └── start_live_watch()        no live runtime -> returns, nothing scheduled
         └── live_watch()        poll, then deliver what is new
               └── deliver_live()
-                    └── runtime.submit(Input("service", ..., source="teamwork"))
+                    └── runtime.submit(LiveArrival(kind="service", ..., source="teamwork"))
 ```
 
 Nothing new to install, no daemon, no extra onboarding step, no new credential.
@@ -54,8 +54,9 @@ gets live delivery; a host that does not is untouched. That keeps this bundle
 installable regardless of which package provides the capability — including when
 that package is private.
 
-`Input` is imported lazily, inside a `try`, and its absence is an ordinary answer
-rather than an error.
+The bundle supplies a structural `LiveArrival` value (kind, text, source, id,
+target, attachments and call_id); it imports no host-specific input class.
+A host must accept that contract and preserve service-data attribution.
 
 ## Arrivals are observations, never instructions
 
@@ -247,3 +248,28 @@ It does not wake a session that has **ended**, and it does not make an idle
 harness reachable when no host is running it. Delivery requires a host actively
 running the session. Reaching a harness that nobody is running is a separate
 problem and is tracked separately.
+
+## Delivery and lifecycle limits
+
+The watcher compares record versions and content, so an answer on an already
+cached request is a new arrival. At most five records are submitted per poll;
+remaining versions stay pending in the shared cache. A failed submission stays
+eligible for retry with the same arrival id. A host should deduplicate that id
+when acceptance succeeded but its response was lost. Newer edits supersede older
+pending versions of the same record; this is a current-state feed, not a durable
+event log. Deleted or evicted records are never submitted from a stale snapshot.
+
+Each submission has a five-second budget. At most one is in flight. A host that
+suppresses cancellation can delay further arrivals until it returns, but cannot
+cause unbounded submission tasks. Shutdown disables new submissions and waits
+at most one second for watcher/submission cancellation. Cleanup is registered
+also when both optional detectors are off. Already accepted host input cannot be
+withdrawn; the arrival identifies its original project and session.
+
+Project changes discard old pending observations. Threaded context replies are
+applied only while their original binding is still current. Exception text and
+tracebacks are omitted from live-delivery logs.
+
+These guarantees cover bundle delivery to the capability. They do not prove a
+model read or acted on an arrival. The standard CLI without `live.runtime`
+continues to receive context at its next turn; no orchestrator is replaced.

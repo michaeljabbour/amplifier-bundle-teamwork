@@ -138,3 +138,17 @@ class WaitSafety(unittest.IsolatedAsyncioTestCase):
         result = await self.wait()
         self.assertTrue(result.success)
         self.assertEqual(result.output["request_id"], result.output["answer"]["request_id"])
+
+    async def test_answer_write_cannot_follow_a_project_change_during_lookup(self):
+        hook = self.hook
+        calls = []
+        class RebindingClient:
+            def request(self, endpoint, body, key=None):
+                calls.append(endpoint)
+                hook.rebind("b", {"token": "other-fixture"})
+                return {"items": [], "has_more": False}
+        hook.client = RebindingClient()
+        result = await tw.AnswerTool(hook).execute({"request_id": "req-1", "response": "context"})
+        self.assertFalse(result.success)
+        self.assertEqual(calls, ["context"])
+        self.assertIn("project changed", result.error["message"])

@@ -1326,7 +1326,7 @@ class MountTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, 'explicit'):
             await mount(object(), {'share_visible_turns': 'true'})
 
-    async def test_enabled_mount_returns_no_cleanup_metadata(self):
+    async def test_enabled_mount_returns_owned_cleanup(self):
         class Hooks:
             def __init__(self): self.handlers = []
             def register(self, *args, **kwargs): self.handlers.append((args, kwargs))
@@ -1347,7 +1347,7 @@ class MountTests(unittest.IsolatedAsyncioTestCase):
             connection.chmod(0o600)
             root = Root()
             result = await mount(root, {"share_visible_turns": True, "connection_file": str(connection)})
-        self.assertIsNone(result)
+        self.assertTrue(callable(result))
         self.assertEqual(len(root.hooks.handlers), 6)
         self.assertIn("teamwork.session_id", root.capabilities)
 
@@ -1372,7 +1372,7 @@ class MountTests(unittest.IsolatedAsyncioTestCase):
                 "token": "[REDACTED:SECRET]",
                 "journal_path": str(Path(directory) / "queue.sqlite3"),
             })
-        self.assertIsNone(result)
+        self.assertTrue(callable(result))
         self.assertEqual(len(root.hooks.handlers), 6)
         self.assertIn("teamwork.session_id", root.capabilities)
 
