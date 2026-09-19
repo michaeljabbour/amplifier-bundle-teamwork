@@ -16,8 +16,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "modules/hooks-team
 from amplifier_module_hooks_teamwork import Journal, TeamworkHook, mount
 from amplifier_module_hooks_teamwork import events as detection_events
 
-MODULE = (Path(__file__).resolve().parents[1]
-          / "modules/hooks-teamwork/amplifier_module_hooks_teamwork/__init__.py")
+# BOTH modules, because the outcomes are reached from both now: the detector
+# reports what it could not judge, and the recorder reports what it could not
+# write. A guard that walked only one of them would pass while half the call
+# sites went unchecked -- and it caught exactly that when the recorder moved out.
+PACKAGE = (Path(__file__).resolve().parents[1]
+           / "modules/hooks-teamwork/amplifier_module_hooks_teamwork")
+MODULES = [PACKAGE / "__init__.py", PACKAGE / "recording.py"]
 
 
 class Hooks:
@@ -118,20 +123,29 @@ class EveryOutcomeIsAnnounced(unittest.IsolatedAsyncioTestCase):
         the first time it ran. An approximate guard that cries wolf gets
         loosened until it guards nothing.
         """
-        tree = ast.parse(MODULE.read_text())
-        reached = set()
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
-            if name not in ("detection_outcome", "record_detection_outcome"):
-                continue
-            # (sid, kind, outcome, ...) -- the third positional, when literal.
-            if len(node.args) >= 3 and isinstance(node.args[2], ast.Constant) \
-                    and isinstance(node.args[2].value, str):
-                reached.add(node.args[2].value)
-        self.assertGreaterEqual(len(reached), 10, "call sites not found; the guard would pass vacuously")
+        def reached_in(module):
+            found = set()
+            for node in ast.walk(ast.parse(module.read_text())):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+                if name not in ("detection_outcome", "record_detection_outcome", "_reported"):
+                    continue
+                for argument in node.args:
+                    if isinstance(argument, ast.Constant) and isinstance(argument.value, str) \
+                            and argument.value not in ("decision", "lesson"):
+                        found.add(argument.value)
+            return found
+
+        per_module = {module.name: reached_in(module) for module in MODULES}
+        # ANTI-VACUITY, and it is not a magic number: EVERY module that reports
+        # outcomes must have contributed call sites. A count would have passed
+        # while one whole module went unread -- which is exactly what happened
+        # when the recorder moved out of the hook and this test found it.
+        for name, found in per_module.items():
+            self.assertTrue(found, "no outcome call sites found in %s; the guard is not reading it" % name)
+        reached = set().union(*per_module.values())
         unmapped = reached - set(detection_events.OUTCOMES)
         self.assertEqual(unmapped, set(),
                          "outcomes reached by the code but not announced: %s" % sorted(unmapped))

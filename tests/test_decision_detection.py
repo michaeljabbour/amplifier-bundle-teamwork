@@ -38,12 +38,27 @@ class Context:
         pass
 
 
+class Hooks:
+    """Dispatching, because the recorder is a real subscriber now."""
+
+    def __init__(self):
+        self.handlers = {}
+
+    def register(self, event, handler, **kwargs):
+        self.handlers.setdefault(event, []).append(handler)
+
+    async def emit(self, event, payload):
+        for handler in list(self.handlers.get(event, [])):
+            await handler(event, payload)
+
+
 class Coordinator:
     session_id = "root-session-decision-detect"
     parent_id = None
 
     def __init__(self):
         self.context = Context()
+        self.hooks = Hooks()
 
     def get(self, name):
         return self.context if name == "context" else None
@@ -106,7 +121,12 @@ def build(test, decision_detection=True):
                   "token": "fixture-token-value"}
     client = Client()
     journal = Journal(Path(tmp.name) / "q.db")
-    hook = TeamworkHook(Coordinator(), connection, journal, client, decision_detection=decision_detection)
+    coordinator = Coordinator()
+    hook = TeamworkHook(coordinator, connection, journal, client, decision_detection=decision_detection)
+    # The SAME assembly mount() uses. Wiring is where a fixture most easily
+    # drifts from how the bundle really runs, so there is one of it.
+    from amplifier_module_hooks_teamwork import recording, events as detection_events, RecordInsightTool
+    recording.subscribe(coordinator, hook, RecordInsightTool, detection_events)
     return hook, client, journal
 
 
@@ -207,8 +227,13 @@ class OptInOffMeansZeroCost(unittest.IsolatedAsyncioTestCase):
                 "token": "fixture-token-value",
                 "journal_path": str(Path(directory) / "queue.sqlite3"),
             })
-        hook = root.hooks.handlers[0][0][1].__self__
-        self.assertFalse(hook.decision_detection)
+        # Found by TYPE, not by registration order: the recorder subscribes too,
+        # and asserting on handlers[0] made this test a statement about the order
+        # mount happens to register in rather than about detection being off.
+        hooks = [args[1].__self__ for args, _ in root.hooks.handlers
+                 if hasattr(args[1], "__self__") and isinstance(args[1].__self__, TeamworkHook)]
+        self.assertTrue(hooks, "mount registered no TeamworkHook handler")
+        self.assertFalse(hooks[0].decision_detection)
 
     async def test_mount_with_an_ambiguous_value_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "explicit"):

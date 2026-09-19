@@ -21,6 +21,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from . import decision_judge
+from . import recording
 from . import events as detection_events, reports
 from .service_url import validate_service_url
 
@@ -103,6 +104,15 @@ LIVE_STOP_SECONDS = 1
 # the session is blocked while this runs, so it must end on its own.
 WAIT_POLL_SECONDS = 5
 WAIT_MAX_SECONDS = 120
+# How many past decisions a recall serves, and the ceiling a caller cannot raise
+# past. A local store that grows without limit becomes a per-turn tax the moment
+# anything injects from it, so the bound lives at the read.
+DECISION_RECALL = 5
+DECISION_RECALL_MAX = 50
+# How much of one decision's claim a recall returns. The shared excerpt is capped
+# at 10KB for the same reason; a local store needs its own discipline or it
+# quietly becomes the larger cost.
+DECISION_RECALL_CLAIM = 1000
 # An insight is a durable claim, not a transcript -- bounded so it stays a
 # transferable statement rather than growing into a report.
 INSIGHT_CLAIM = 2000
@@ -301,6 +311,22 @@ class Journal:
             # tables here rather than opening a second store.
             conn.execute("CREATE TABLE IF NOT EXISTS decision_watermark (session TEXT PRIMARY KEY, turn_index INTEGER NOT NULL)")
             conn.execute("CREATE TABLE IF NOT EXISTS decision_fingerprint (session TEXT NOT NULL, fingerprint TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (session, fingerprint))")
+            # The decision's own WORDS, not only its hash.
+            #
+            # `decision_fingerprint` above answers "have we said this already?"
+            # and nothing else -- a hash cannot be read back. So a decision this
+            # machine reached existed in exactly two places, the service and the
+            # transcript, and neither is reachable as local context. A session
+            # could not be reminded of what it had already decided.
+            #
+            # Keyed by session, like every other table here: one file per
+            # credential, rows scoped to the shared session that wrote them, so
+            # a rebind reads the new binding's rows rather than the old one's.
+            conn.execute("CREATE TABLE IF NOT EXISTS decision_body ("
+                         "session TEXT NOT NULL, fingerprint TEXT NOT NULL, kind TEXT NOT NULL, "
+                         "claim TEXT NOT NULL, basis TEXT, confidence TEXT, limitations TEXT, "
+                         "record_id TEXT, created_at TEXT NOT NULL, "
+                         "PRIMARY KEY (session, fingerprint))")
             # Private diagnostic metadata only; never claim text or provider output.
             conn.execute("CREATE TABLE IF NOT EXISTS detection_outcome ("
                          "session TEXT NOT NULL, kind TEXT NOT NULL, outcome TEXT NOT NULL, "
@@ -365,6 +391,44 @@ class Journal:
                 "INSERT OR IGNORE INTO decision_fingerprint(session, fingerprint, created_at) VALUES (?,?,?)",
                 (sid, fingerprint, now()))
             return cursor.rowcount == 1
+
+    def record_decision_body(self, sid, fingerprint, kind, claim, basis=None,
+                             confidence=None, limitations=None, record_id=None):
+        """Keep what was decided, beside the hash that says it was.
+
+        Best-effort, exactly like `record_detection_outcome`: a local copy is a
+        convenience for later context, and failing to keep one must never turn a
+        recorded decision into a failed one.
+        """
+        try:
+            with self.connect() as conn, conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO decision_body"
+                    "(session, fingerprint, kind, claim, basis, confidence, limitations, record_id, created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                    (sid, fingerprint, kind, claim, basis, confidence, limitations, record_id, now()))
+        except Exception:
+            logger.debug("Teamwork decision body not kept locally", exc_info=True)
+
+    def decisions(self, sid, limit=DECISION_RECALL):
+        """The most recent decisions this shared session recorded, newest first.
+
+        BOUNDED AT THE READ, not at the caller. An unbounded local store grows
+        forever and would be injected into every turn, so the bound lives here
+        where it cannot be forgotten by a consumer.
+        """
+        limit = max(1, min(int(limit or DECISION_RECALL), DECISION_RECALL_MAX))
+        try:
+            with self.connect() as conn:
+                rows = conn.execute(
+                    "SELECT kind, claim, basis, confidence, limitations, record_id, created_at "
+                    "FROM decision_body WHERE session=? ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                    (sid, limit)).fetchall()
+        except Exception:
+            logger.debug("Teamwork local decisions unreadable", exc_info=True)
+            return []
+        return [{"kind": r[0], "claim": r[1], "basis": r[2], "confidence": r[3],
+                 "limitations": r[4], "record_id": r[5], "recorded_at": r[6]} for r in rows]
 
     def release_decision_fingerprint(self, sid, fingerprint):
         """Release only after a definite refusal; unknown writes stay reserved."""
@@ -1683,6 +1747,27 @@ class TeamworkHook:
             window, upto, binding = captured
             await self._judge_and_record_lesson(window, upto, binding)
 
+    def recall_decisions(self, limit=None):
+        """This session's own recent decisions, read from the local journal.
+
+        BINDING-RESOLVED AT CALL TIME, and that is the whole reason this exists
+        rather than handing the Journal out through the capability. One journal
+        file serves every binding this credential has had, with rows keyed by
+        shared session id -- so a consumer that captured `hook.sid` once and read
+        with it would serve the PREVIOUS project's decisions after a rebind. The
+        id is read from the hook on every call; nothing caches it.
+
+        Bounded at the journal, and the claim bounded here: a local store is only
+        cheap while something stops it being injected whole.
+        """
+        found = self.journal.decisions(self.sid, limit)
+        for entry in found:
+            claim = entry.get("claim") or ""
+            if len(claim) > DECISION_RECALL_CLAIM:
+                entry["claim"] = claim[:DECISION_RECALL_CLAIM - 1].rstrip() + "\u2026"
+                entry["truncated"] = True
+        return found
+
     async def detection_outcome(self, sid, kind, outcome, tally_size=None, link_count=None):
         """Record one detection outcome locally AND announce it on the hook bus.
 
@@ -1700,13 +1785,22 @@ class TeamworkHook:
         """
         self.journal.record_detection_outcome(sid, kind, outcome, tally_size, link_count)
         name = detection_events.event_for(kind, outcome)
-        hooks = getattr(self.coordinator, "hooks", None)
-        if not name or hooks is None or not hasattr(hooks, "emit"):
-            return
-        try:
-            await hooks.emit(name, {
+        if name:
+            await self.emit_detection(name, {
                 "session_id": sid, "kind": kind, "outcome": outcome,
                 "tally_size": tally_size, "link_count": link_count})
+
+    async def emit_detection(self, name, payload):
+        """Announce on the hook bus, never at the cost of the thing announced.
+
+        A host whose coordinator offers no bus, and a subscriber that raises,
+        both change nothing about what was detected or journalled.
+        """
+        hooks = getattr(self.coordinator, "hooks", None)
+        if hooks is None or not hasattr(hooks, "emit"):
+            return
+        try:
+            await hooks.emit(name, payload)
         except Exception:
             logger.debug("Teamwork detection event %s not delivered", name, exc_info=True)
 
@@ -1823,37 +1917,26 @@ class TeamworkHook:
         # identities captured before its await, never the current mutable cache.
         links = decision_judge.validated_tally_links(verdict.get("links"), allowed_links)
         evidence.extend({"kind": "record", **link} for link in links)
-        # The reservation is atomic before any await. Unknown outcomes and
-        # cancellation retain it; only definite refusals release it.
-        if not reserve(fingerprint):
-            logger.info("Teamwork %s duplicate skipped (reserved or recorded)", log_label)
-            await self.detection_outcome(binding[0], log_label, "duplicate_fingerprint", tally_size, len(links))
-            return
-        try:
-            result = await RecordInsightTool(self, binding=binding, automatic=True).execute({
-                "claim": claim, "basis": basis, "confidence": confidence,
-                "limitations": limitations, "evidence": evidence,
-                "title": verdict.get("kind") if isinstance(verdict.get("kind"), str) else None,
-            })
-        except asyncio.CancelledError:
-            logger.warning("Teamwork %s write cancelled; reservation retained", log_label)
-            await self.detection_outcome(binding[0], log_label, "write_cancelled", tally_size, len(links))
-            raise
-        except Exception as error:
-            logger.warning("Teamwork %s write failed (%s); reservation retained", log_label, type(error).__name__)
-            await self.detection_outcome(binding[0], log_label, "write_raised", tally_size, len(links))
-            return
-        error = result.error or {}
-        if not result.success and error.get("outcome") != "unknown":
-            release(fingerprint)
-            logger.warning("Teamwork %s automatic record refused", log_label)
-            await self.detection_outcome(binding[0], log_label, "refused", tally_size, len(links))
-            return
-        if not result.success:
-            logger.warning("Teamwork %s recording outcome unknown for attempted insight %s; not retrying",
-                           log_label, error.get("attempted_record_id"))
-        await self.detection_outcome(binding[0], log_label,
-            "recorded" if result.success else "acceptance_unknown", tally_size, len(links))
+        # AND HERE THE DETECTOR STOPS. It judged a window and it says so; it does
+        # not reserve, does not write, does not publish. Whether this becomes team
+        # knowledge is a decision, and a decision does not belong inside the thing
+        # that merely noticed something -- it belongs where the journal is kept,
+        # which is what subscribes to this.
+        #
+        # Nothing here is on a turn's critical path: the whole detection body
+        # already runs in a background task, so the subscriber runs there too and
+        # blocks nobody.
+        await self.emit_detection(detection_events.DECISION_DETECTED if log_label == "decision"
+                                  else detection_events.LESSON_DETECTED, {
+            "session_id": binding[0], "kind": log_label, "fingerprint": fingerprint,
+            "claim": claim, "basis": basis, "confidence": confidence, "limitations": limitations,
+            "evidence": evidence, "link_count": len(links), "tally_size": tally_size,
+            # The captured deliberate-record generation. The binding itself holds
+            # live state/client/connection objects and must never go on a bus a
+            # consumer might serialise; this number carries the part that has to.
+            "generation": binding[4] if len(binding) > 4 else 0,
+            "title": verdict.get("kind") if isinstance(verdict.get("kind"), str) else None})
+
 
 
 CONNECTION_FIELDS = ("base_url", "project_id", "token", "harness_id")
@@ -2826,6 +2909,17 @@ async def mount(coordinator, config=None):
                         detection_model=detection_model)
     for name, handler in (("session:start", hook.on_start), ("session:resume", hook.on_start), ("prompt:submit", hook.on_submit), ("prompt:complete", hook.on_complete), ("session:end", hook.on_end), ("tool:pre", hook.on_tool_pre)):
         coordinator.hooks.register(name, handler, priority=50, name="teamwork-" + name.replace(":", "-"))
+    # THE RECORDER SUBSCRIBES. A separate component, assembled from four
+    # collaborators rather than handed the hook -- so it is testable without one,
+    # and removable without taking detection with it. Registered AFTER the
+    # session-lifecycle handlers on purpose: those are this module's primary
+    # registration, and a subscriber should not insert itself ahead of them.
+    #
+    # Only when a detector can actually fire. "Off means zero cost" is this
+    # module's existing contract for detection, and registering a subscriber for
+    # an event nothing will ever emit would quietly weaken it.
+    if decision_detection or lesson_detection:
+        recording.subscribe(coordinator, hook, RecordInsightTool, detection_events)
     send = SendTool(hook)
     await coordinator.mount("tools", send, name=send.name)
     for tool in (TasksTool(hook), ClaimTool(hook), ProgressTool(hook), AnswerTool(hook), WaitTool(hook),
@@ -2839,6 +2933,10 @@ async def mount(coordinator, config=None):
         coordinator.register_contributor(
             "observability.events", "bundle-teamwork:hooks-teamwork",
             lambda: list(detection_events.ALL_EVENTS))
+    # The accessor, never the store. Handing out the Journal would hand out a
+    # file that outlives the binding it was opened for; this resolves the current
+    # session id on every call (see recall_decisions).
+    coordinator.register_capability("teamwork.decisions", hook.recall_decisions)
     coordinator.register_capability("teamwork.session_id", hook.sid)
     coordinator.register_capability("teamwork.rebind", hook.rebind)
     # Core/Foundation register a returned callable as module-owned cleanup.

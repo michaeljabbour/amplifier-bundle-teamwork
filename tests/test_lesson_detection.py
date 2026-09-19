@@ -47,12 +47,27 @@ class Context:
         pass
 
 
+class Hooks:
+    """Dispatching, because the recorder is a real subscriber now."""
+
+    def __init__(self):
+        self.handlers = {}
+
+    def register(self, event, handler, **kwargs):
+        self.handlers.setdefault(event, []).append(handler)
+
+    async def emit(self, event, payload):
+        for handler in list(self.handlers.get(event, [])):
+            await handler(event, payload)
+
+
 class Coordinator:
     session_id = "root-session-lesson-detect"
     parent_id = None
 
     def __init__(self):
         self.context = Context()
+        self.hooks = Hooks()
 
     def get(self, name):
         return self.context if name == "context" else None
@@ -115,8 +130,11 @@ def build(test, lesson_detection=True, decision_detection=False):
                   "token": "[REDACTED:SECRET]"}
     client = Client()
     journal = Journal(Path(tmp.name) / "q.db")
-    hook = TeamworkHook(Coordinator(), connection, journal, client,
+    coordinator = Coordinator()
+    hook = TeamworkHook(coordinator, connection, journal, client,
                         decision_detection=decision_detection, lesson_detection=lesson_detection)
+    from amplifier_module_hooks_teamwork import recording, events as detection_events, RecordInsightTool
+    recording.subscribe(coordinator, hook, RecordInsightTool, detection_events)
     return hook, client, journal
 
 

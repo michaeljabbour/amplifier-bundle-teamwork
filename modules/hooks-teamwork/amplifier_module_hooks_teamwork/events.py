@@ -26,6 +26,14 @@ discovered name. So a consumer needs no change to receive these, and this module
 stays the single source of truth for what it emits.
 """
 
+# THE CARRIER. The detector's whole output: it judged a window and this is the
+# verdict. It is NOT a statement that anything was written -- deciding whether to
+# publish, and doing it, belongs to whatever subscribes to this.
+DECISION_DETECTED = "teamwork:decision_detected"
+LESSON_DETECTED = "teamwork:lesson_detected"
+
+# THE OUTCOMES. Emitted by the recorder that subscribes to the carrier above,
+# never by the detector.
 DECISION_RECORDED = "teamwork:decision_recorded"
 DECISION_SKIPPED = "teamwork:decision_skipped"
 DECISION_FAILED = "teamwork:decision_failed"
@@ -34,6 +42,8 @@ LESSON_SKIPPED = "teamwork:lesson_skipped"
 LESSON_FAILED = "teamwork:lesson_failed"
 
 ALL_EVENTS = [
+    DECISION_DETECTED,
+    LESSON_DETECTED,
     DECISION_RECORDED,
     DECISION_SKIPPED,
     DECISION_FAILED,
