@@ -21,6 +21,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from . import decision_judge
+from . import recording
 from . import events as detection_events, reports
 from .service_url import validate_service_url
 
@@ -1784,13 +1785,22 @@ class TeamworkHook:
         """
         self.journal.record_detection_outcome(sid, kind, outcome, tally_size, link_count)
         name = detection_events.event_for(kind, outcome)
-        hooks = getattr(self.coordinator, "hooks", None)
-        if not name or hooks is None or not hasattr(hooks, "emit"):
-            return
-        try:
-            await hooks.emit(name, {
+        if name:
+            await self.emit_detection(name, {
                 "session_id": sid, "kind": kind, "outcome": outcome,
                 "tally_size": tally_size, "link_count": link_count})
+
+    async def emit_detection(self, name, payload):
+        """Announce on the hook bus, never at the cost of the thing announced.
+
+        A host whose coordinator offers no bus, and a subscriber that raises,
+        both change nothing about what was detected or journalled.
+        """
+        hooks = getattr(self.coordinator, "hooks", None)
+        if hooks is None or not hasattr(hooks, "emit"):
+            return
+        try:
+            await hooks.emit(name, payload)
         except Exception:
             logger.debug("Teamwork detection event %s not delivered", name, exc_info=True)
 
@@ -1907,50 +1917,26 @@ class TeamworkHook:
         # identities captured before its await, never the current mutable cache.
         links = decision_judge.validated_tally_links(verdict.get("links"), allowed_links)
         evidence.extend({"kind": "record", **link} for link in links)
-        # The reservation is atomic before any await. Unknown outcomes and
-        # cancellation retain it; only definite refusals release it.
-        if not reserve(fingerprint):
-            logger.info("Teamwork %s duplicate skipped (reserved or recorded)", log_label)
-            await self.detection_outcome(binding[0], log_label, "duplicate_fingerprint", tally_size, len(links))
-            return
-        try:
-            result = await RecordInsightTool(self, binding=binding, automatic=True).execute({
-                "claim": claim, "basis": basis, "confidence": confidence,
-                "limitations": limitations, "evidence": evidence,
-                "title": verdict.get("kind") if isinstance(verdict.get("kind"), str) else None,
-            })
-        except asyncio.CancelledError:
-            logger.warning("Teamwork %s write cancelled; reservation retained", log_label)
-            await self.detection_outcome(binding[0], log_label, "write_cancelled", tally_size, len(links))
-            raise
-        except Exception as error:
-            logger.warning("Teamwork %s write failed (%s); reservation retained", log_label, type(error).__name__)
-            await self.detection_outcome(binding[0], log_label, "write_raised", tally_size, len(links))
-            return
-        error = result.error or {}
-        if not result.success and error.get("outcome") != "unknown":
-            release(fingerprint)
-            logger.warning("Teamwork %s automatic record refused", log_label)
-            await self.detection_outcome(binding[0], log_label, "refused", tally_size, len(links))
-            return
-        if not result.success:
-            logger.warning("Teamwork %s recording outcome unknown for attempted insight %s; not retrying",
-                           log_label, error.get("attempted_record_id"))
-        # KEEP WHAT WAS DECIDED, not only that something was. The fingerprint
-        # above answers "have we said this already?" and cannot be read back, so
-        # until now a decision this machine reached was legible only on the
-        # service or in the transcript -- neither reachable as local context.
+        # AND HERE THE DETECTOR STOPS. It judged a window and it says so; it does
+        # not reserve, does not write, does not publish. Whether this becomes team
+        # knowledge is a decision, and a decision does not belong inside the thing
+        # that merely noticed something -- it belongs where the journal is kept,
+        # which is what subscribes to this.
         #
-        # Written on an unknown acceptance too, and deliberately: the claim was
-        # judged and sent, and a local copy of what we tried to say is exactly
-        # what a later turn needs in order to tell whether it landed.
-        if result.success or error.get("outcome") == "unknown":
-            self.journal.record_decision_body(
-                binding[0], fingerprint, log_label, claim, basis, confidence, limitations,
-                (result.output or {}).get("recorded") if result.success
-                else error.get("attempted_record_id"))
-        await self.detection_outcome(binding[0], log_label,
-            "recorded" if result.success else "acceptance_unknown", tally_size, len(links))
+        # Nothing here is on a turn's critical path: the whole detection body
+        # already runs in a background task, so the subscriber runs there too and
+        # blocks nobody.
+        await self.emit_detection(detection_events.DECISION_DETECTED if log_label == "decision"
+                                  else detection_events.LESSON_DETECTED, {
+            "session_id": binding[0], "kind": log_label, "fingerprint": fingerprint,
+            "claim": claim, "basis": basis, "confidence": confidence, "limitations": limitations,
+            "evidence": evidence, "link_count": len(links), "tally_size": tally_size,
+            # The captured deliberate-record generation. The binding itself holds
+            # live state/client/connection objects and must never go on a bus a
+            # consumer might serialise; this number carries the part that has to.
+            "generation": binding[4] if len(binding) > 4 else 0,
+            "title": verdict.get("kind") if isinstance(verdict.get("kind"), str) else None})
+
 
 
 CONNECTION_FIELDS = ("base_url", "project_id", "token", "harness_id")
@@ -2923,6 +2909,17 @@ async def mount(coordinator, config=None):
                         detection_model=detection_model)
     for name, handler in (("session:start", hook.on_start), ("session:resume", hook.on_start), ("prompt:submit", hook.on_submit), ("prompt:complete", hook.on_complete), ("session:end", hook.on_end), ("tool:pre", hook.on_tool_pre)):
         coordinator.hooks.register(name, handler, priority=50, name="teamwork-" + name.replace(":", "-"))
+    # THE RECORDER SUBSCRIBES. A separate component, assembled from four
+    # collaborators rather than handed the hook -- so it is testable without one,
+    # and removable without taking detection with it. Registered AFTER the
+    # session-lifecycle handlers on purpose: those are this module's primary
+    # registration, and a subscriber should not insert itself ahead of them.
+    #
+    # Only when a detector can actually fire. "Off means zero cost" is this
+    # module's existing contract for detection, and registering a subscriber for
+    # an event nothing will ever emit would quietly weaken it.
+    if decision_detection or lesson_detection:
+        recording.subscribe(coordinator, hook, RecordInsightTool, detection_events)
     send = SendTool(hook)
     await coordinator.mount("tools", send, name=send.name)
     for tool in (TasksTool(hook), ClaimTool(hook), ProgressTool(hook), AnswerTool(hook), WaitTool(hook),
