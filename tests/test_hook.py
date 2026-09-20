@@ -26,7 +26,7 @@ import subprocess
 
 from amplifier_module_hooks_teamwork import (HTTPClient, Journal, TeamworkHook, SyncError, sha, NoRedirect,
                                              mount, resolve_connection, describe, PERSON_FIELDS, verbosity,
-                                             PRESENCE_SUMMARY, TasksTool, ClaimTool, ProgressTool, AnswerTool,
+                                             PRESENCE_SUMMARY, TasksTool, ClaimTool, ProgressTool, AnswerTool, AskTool,
                                              RETIRED_MESSAGE, SendTool, WaitTool, PublishWorkTool,
                                              RecordInsightTool)
 
@@ -1699,6 +1699,175 @@ class WorkToolTests(unittest.IsolatedAsyncioTestCase):
                                                    "note": "Looking at it now."})
         self.assertTrue(result.success)
         self.assertEqual(hook.client.writes[0]["operations"][0]["op"], "request.upsert")
+
+    class Asking:
+        """People, agents and work in one page, plus whatever gets written."""
+        def __init__(self, sid, people, fail=None):
+            self.sid, self.people, self.fail, self.writes = sid, people, fail, []
+
+        def request(self, endpoint, body, key=None):
+            if endpoint == "context":
+                records = [{"record_type": "agent",
+                            "content": {"id": self.sid, "owner_person_id": WorkToolTests.OWNER}}]
+                records += [{"record_type": "person", "content": p} for p in self.people]
+                return {"items": records, "next_cursor": None, "has_more": False}
+            if self.fail:
+                raise SyncError(self.fail)
+            self.writes.append(body)
+            return {"results": [{"id": body["operations"][0]["id"], "version": 1}]}
+
+    def asking(self, people=None, fail=None):
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        connection = {"base_url": "https://team.example.invalid", "project_id": "teamwork",
+                      "token": "fixture-harness-credential-0123456789"}
+        people = people if people is not None else [
+            {"id": "person-molly", "name": "Molly"}, {"id": self.OWNER, "name": "Alex"}]
+        hook = TeamworkHook(Coordinator(Context([])), connection, Journal(Path(tmp.name) / "q.db"),
+                            self.Asking("placeholder", people, fail))
+        hook.client.sid = hook.sid
+        return hook
+
+    async def test_a_session_can_ask_a_teammate_a_question(self):
+        """The missing first half of the loop.
+
+        A session could be handed a question and answer one, and could hold a turn
+        open waiting for an answer -- but nothing in the bundle could ASK. So
+        `teamwork_wait` took a `request_id` that no session could produce: the only
+        way to get one was a person typing the question into the portal, which is
+        the very thing the wait exists to avoid. Our own live check had to raise
+        its question with a raw publish, a path no real session has.
+        """
+        hook = self.asking()
+        result = await AskTool(hook).execute({
+            "question": "Can you confirm the rollback landed?", "to_person": "Molly",
+            "urgency": "normal", "desired_response": "context"})
+        self.assertTrue(result.success, getattr(result, "error", None))
+        operation = hook.client.writes[0]["operations"][0]
+        self.assertEqual(operation["op"], "request.upsert")
+        self.assertEqual(operation["expected_version"], 0)
+        self.assertEqual(operation["data"]["requested_person_id"], "person-molly")
+        self.assertEqual(operation["data"]["title"], "Can you confirm the rollback landed?")
+        self.assertEqual(result.output["request_id"], operation["id"])
+
+    async def test_asking_does_not_block_and_says_how_to_wait(self):
+        """DECIDED, 2026-09-18: asking and waiting are two calls, not one.
+
+        Folding the wait into the ask would make a fire-and-forget question
+        impossible, and "I need this answered before I continue" is a different
+        decision from "someone should answer this" -- one the caller is entitled
+        to make. So this returns the id and names the tool that blocks on it.
+        """
+        hook = self.asking()
+        result = await AskTool(hook).execute({
+            "question": "Ship or hold?", "to_person": "Molly"})
+        self.assertTrue(result.success)
+        self.assertNotIn("state", result.output)
+        self.assertIn("teamwork_wait", result.output["note"])
+
+    async def test_a_recipient_is_named_by_person_not_by_an_id_nobody_knows(self):
+        hook = self.asking()
+        self.assertIn("to_person", AskTool(hook).input_schema["properties"])
+        result = await AskTool(hook).execute({"question": "Ship?", "to_person": "Molly"})
+        self.assertEqual(hook.client.writes[0]["operations"][0]["data"]["requested_person_id"],
+                         "person-molly")
+
+    async def test_an_unknown_recipient_is_refused_before_anything_is_written(self):
+        hook = self.asking()
+        result = await AskTool(hook).execute({"question": "Ship?", "to_person": "Nobody"})
+        self.assertFalse(result.success)
+        self.assertIn("Nobody", result.error["message"])
+        self.assertEqual(hook.client.writes, [])
+
+    async def test_an_ambiguous_recipient_names_the_candidates_rather_than_guessing(self):
+        hook = self.asking(people=[{"id": "person-1", "name": "Molly"},
+                                   {"id": "person-2", "name": "Molly"}])
+        result = await AskTool(hook).execute({"question": "Ship?", "to_person": "Molly"})
+        self.assertFalse(result.success)
+        self.assertIn("person-1", result.error["message"])
+        self.assertIn("person-2", result.error["message"])
+        self.assertEqual(hook.client.writes, [])
+
+    async def test_a_question_addressed_to_nobody_is_refused(self):
+        """An unaddressed request is a shared record by another name: with nobody
+        able to decline it, the gate that makes asking safe is not there."""
+        hook = self.asking()
+        result = await AskTool(hook).execute({"question": "Ship?"})
+        self.assertFalse(result.success)
+        self.assertEqual(hook.client.writes, [])
+
+    async def test_the_enums_the_service_polices_are_refused_here_first(self):
+        hook = self.asking()
+        for field, bad in (("urgency", "urgent"), ("desired_response", "answer")):
+            result = await AskTool(hook).execute(
+                {"question": "Ship?", "to_person": "Molly", field: bad})
+            self.assertFalse(result.success, field)
+            self.assertEqual(hook.client.writes, [])
+
+    async def test_ask_cannot_publish_after_rebind_during_people_lookup(self):
+        hook = self.asking()
+        original = hook.client
+        request = original.request
+        def rebind(endpoint, body, key=None):
+            page = request(endpoint, body, key)
+            hook.rebind("another-project")
+            return page
+        original.request = rebind
+        result = await AskTool(hook).execute({"question": "Ship?", "to_person": "Molly"})
+        self.assertFalse(result.success)
+        self.assertIn("project changed", result.error["message"])
+        self.assertEqual(original.writes, [])
+
+    async def test_ask_refuses_incomplete_people_even_when_one_name_matches(self):
+        for mode in ("missing-cursor", "omitted", "page-cap", "truncated"):
+            hook = self.asking()
+            original = hook.client.request
+            def partial(endpoint, body, key=None):
+                page = original(endpoint, body, key)
+                if mode == "omitted":
+                    page["items"].append({"record_type": "person", "content_omitted": True})
+                elif mode == "truncated":
+                    page["truncated"] = True
+                else:
+                    page["has_more"] = True
+                    page["next_cursor"] = (str(body.get("cursor")) + "next") if mode == "page-cap" else None
+                return page
+            hook.client.request = partial
+            result = await AskTool(hook).execute({"question": "Ship?", "to_person": "Molly"})
+            self.assertFalse(result.success, mode)
+            self.assertEqual(hook.client.writes, [])
+
+    async def test_ask_redacts_credentials_from_all_free_text_before_publish(self):
+        hook = self.asking()
+        credential = hook.connection["token"]
+        result = await AskTool(hook).execute({"question": "Check " + credential, "to_person": "Molly",
+            "context": credential, "waiting_consequence": credential})
+        self.assertTrue(result.success)
+        self.assertNotIn(credential, json.dumps(hook.client.writes))
+        self.assertNotIn(credential, json.dumps(result.output))
+
+    async def test_ask_transport_failure_preserves_attempted_id_and_uncertain_outcome(self):
+        hook = self.asking()
+        original = hook.client.request
+        def timeout_after_commit(endpoint, body, key=None):
+            value = original(endpoint, body, key)
+            if endpoint == "publish":
+                raise SyncError(0)
+            return value
+        hook.client.request = timeout_after_commit
+        result = await AskTool(hook).execute({"question": "Ship?", "to_person": "Molly"})
+        self.assertFalse(result.success)
+        self.assertEqual(result.error["outcome"], "unknown")
+        self.assertEqual(result.error["attempted_request_id"], hook.client.writes[0]["operations"][0]["id"])
+        self.assertEqual(len(hook.client.writes), 1)
+
+    async def test_ask_invalid_types_and_empty_enums_refuse_without_requests(self):
+        hook = self.asking()
+        for value in (None, [], {"question": 3, "to_person": "Molly"},
+                      {"question": "Ship?", "to_person": "Molly", "context": {}},
+                      {"question": "Ship?", "to_person": "Molly", "urgency": ""}):
+            result = await AskTool(hook).execute(value)
+            self.assertFalse(result.success)
+        self.assertEqual(hook.client.writes, [])
 
     async def test_the_mounted_tools_can_move_work_but_never_create_it(self):
         # A session must not invent tasks for anyone, including its own owner:

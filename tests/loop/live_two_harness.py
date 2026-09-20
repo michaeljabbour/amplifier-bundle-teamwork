@@ -36,7 +36,7 @@ import uuid
 from pathlib import Path
 
 sys.path.insert(0, "modules/hooks-teamwork")
-from amplifier_module_hooks_teamwork import (AnswerTool, Journal, SyncError, TasksTool,
+from amplifier_module_hooks_teamwork import (AnswerTool, AskTool, Journal, SyncError, TasksTool,
                                              TeamworkHook, WaitTool)
 
 ANSWER_AFTER = 12
@@ -96,6 +96,9 @@ def stamp(t0):
 
 
 async def run(connection_a, connection_b, work, owned, tasks):
+    recipient = (os.environ.get("TEAMWORK_PERSON_NAME") or "").strip()
+    if not recipient:
+        raise SystemExit("TEAMWORK_PERSON_NAME is required; this live test never guesses a recipient")
     if connection_a["token"] == connection_b["token"]:
         raise SystemExit("A and B are the same credential; that proves nothing about two harnesses")
 
@@ -112,26 +115,22 @@ async def run(connection_a, connection_b, work, owned, tasks):
     print("%s harness A registered: agent=%s / harness B session %s"
           % (stamp(t0), hook.agent_status, hook_b.sid))
 
-    # The question. Addressed to the person this project knows A as -- which the
-    # service told us at enrollment, and which B shares (see the docstring).
-    person = connection_a.get("person_id") or os.environ.get("TEAMWORK_PERSON_ID")
-    if not person:
-        raise SystemExit("TEAMWORK_PERSON_ID is required: the request must name its recipient")
-    request_id = str(uuid.uuid4())
-    await asyncio.to_thread(hook.client.request, "publish", {"operations": [{
-        "op": "request.upsert", "id": request_id, "expected_version": 0,
-        "data": {
-            "title": QUESTION_TITLE,
-            "description": (
-                "Raised by an automated end-to-end check (tests/loop/live_two_harness.py), "
-                "not by a person, and it needs nothing from anyone: a second harness answers "
-                "it seconds later. It is here because the claim -- that a session holding "
-                "teamwork_wait resumes when the answer lands on the service -- had only ever "
-                "been checked against a stand-in for the service."),
-            "requested_person_id": person,
-            "urgency": "low",
-            "desired_response": "context"}}]}, str(uuid.uuid4()))
-    print("%s harness A asked %s" % (stamp(t0), request_id))
+    # THE QUESTION, ASKED WITH THE TOOL. This used to be a raw publish written
+    # here in the check -- which meant the one step no session could perform was
+    # the one the check performed for it, and a green run said nothing about
+    # whether asking worked. teamwork_ask is now the only way this gets raised.
+    asked = await AskTool(hook).execute({
+        "question": QUESTION_TITLE,
+        "to_person": recipient,
+        "context": ("Raised by an automated end-to-end check "
+                    "(tests/loop/live_two_harness.py), not by a person, and it needs nothing "
+                    "from anyone: a second harness answers it seconds later."),
+        "urgency": "low", "desired_response": "context"})
+    if not asked.success:
+        raise SystemExit("teamwork_ask refused: %s" % (asked.error or {}).get("message"))
+    request_id = asked.output["request_id"]
+    print("%s harness A asked %s with teamwork_ask -> %s (did NOT block)"
+          % (stamp(t0), asked.output["asked"], request_id))
 
     async def harness_b_sees_and_answers():
         """The SECOND session: find the question the way a session actually can, then answer it.

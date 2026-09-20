@@ -2120,6 +2120,36 @@ class WorkTools:
             truncated = page_number + 1 == PAGE_LIMIT
         return work, mine, truncated
 
+    def people(self, binding=None):
+        """Every person this project knows, by id. Paged, like project().
+
+        A separate read rather than widening `project()`: tasks, claim and
+        progress do not need people, and asking is the only path that does.
+        """
+        sid, client = binding or (self.hook.sid, self.hook.client)
+        found, cursor = {}, None
+        for _ in range(PAGE_LIMIT):
+            if self.hook.sid != sid or self.hook.client is not client:
+                return {}, False
+            page = client.request("context", {"session_id": sid, "cursor": cursor,
+                                              "selection": {"include": ["people"]},
+                                              "page_size": 100, "max_text_bytes": 262144})
+            if self.hook.sid != sid or self.hook.client is not client:
+                return {}, False
+            for entry in page.get("items", []):
+                if entry.get("content_omitted"):
+                    return {}, False
+                content = entry.get("content") or {}
+                if entry.get("record_type") == "person" and content.get("id"):
+                    found[content["id"]] = content.get("name") or content["id"]
+            next_cursor = page.get("next_cursor")
+            if not page.get("has_more"):
+                return found, not page.get("truncated", False)
+            if not next_cursor or next_cursor == cursor:
+                return {}, False
+            cursor = next_cursor
+        return found, False
+
     def assigned(self, binding=None):
         work, mine, truncated = self.project(binding)
         if not mine:
@@ -2266,6 +2296,153 @@ class ProgressTool(WorkTools):
             return ToolResult(success=False, error={"message": "Not recorded: " + refusal})
         return ToolResult(success=True, output={"updated": task_id,
                                                 "status": data.get("status", current.get("status"))})
+
+
+class AskTool(WorkTools):
+    """Ask a named teammate a question, and get back the id that identifies it.
+
+    THE MISSING FIRST HALF. A session could be handed a question and answer one,
+    and could hold a turn open waiting for an answer -- but nothing here could
+    ASK. So `teamwork_wait` took a `request_id` no session could produce: the
+    only way to get one was a person typing the question into the portal, which
+    is the very thing the wait exists to avoid. Even this repo's own live check
+    had to raise its question with a raw publish, a path no real session has.
+
+    IT DOES NOT BLOCK, and that is a decision, not an omission. Asking and
+    waiting are two acts: "someone should answer this" and "I cannot continue
+    until they do" are different, and which one applies is the caller's to
+    decide. Fold the wait in and a session can never ask a question and get on
+    with something else -- which is the normal case, not the exception. So this
+    returns the id and names the tool that blocks on it.
+
+    CREATION ONLY, and addressed or refused. The service permits this exact act
+    without the wide scope, and says why: asking is safe BECAUSE the addressee
+    can decline it, so a request with nobody to decline it is not a question at
+    all -- it is a shared record by another name. An unaddressed ask is refused
+    here rather than written as one.
+
+    A PERSON'S NAME, NOT AN ID. A session should not need to know a UUID to ask
+    Molly something; `teamwork_send` already addresses people by name and this
+    keeps that vocabulary. The resolution happens here rather than on the
+    service because a request names a person id, and an unknown or ambiguous
+    name is refused with the candidates rather than guessed at.
+    """
+
+    @property
+    def name(self):
+        return "teamwork_ask"
+
+    @property
+    def description(self):
+        return ("Ask a named teammate a question on the shared project. Returns the question's id "
+                "and does NOT wait: asking and waiting are separate, so this session can carry on "
+                "with something else and, if and when it needs the answer before continuing, hold "
+                "for it with teamwork_wait. Only a question addressed to someone is created -- the "
+                "person asked is the one who can decline it.")
+
+    @property
+    def input_schema(self):
+        return {"type": "object",
+                "properties": {
+                    "question": {"type": "string",
+                                 "description": "What you are asking, in the recipient's terms."},
+                    "to_person": {"type": "string",
+                                  "description": "Who you are asking, by name, as teamwork_send addresses people."},
+                    "context": {"type": "string",
+                                "description": "What they need in order to answer: what you already checked, and what turns on it."},
+                    "urgency": {"type": "string", "enum": ["low", "normal", "high"]},
+                    "desired_response": {"type": "string", "enum": ["action", "context", "review"],
+                                         "description": "action: do something. context: tell me something. review: check my work."},
+                    "waiting_consequence": {"type": "string",
+                                            "description": "What is held up until they answer, if anything."}},
+                "required": ["question", "to_person"]}
+
+    async def execute(self, input):
+        from amplifier_core.models import ToolResult
+        if not isinstance(input, dict):
+            return ToolResult(success=False, error={"message": "Expected question fields."})
+        for field in self.input_schema["properties"]:
+            if field in input and not isinstance(input[field], str):
+                return ToolResult(success=False, error={"message": field + " must be text."})
+        question = input.get("question", "").strip()
+        to_person = input.get("to_person", "").strip()
+        if not question or not to_person:
+            return ToolResult(success=False, error={"message":
+                "question and to_person are both required: a question addressed to nobody is a "
+                "shared record, not something anyone can answer or decline."})
+        for field, allowed in (("urgency", ("low", "normal", "high")),
+                               ("desired_response", ("action", "context", "review"))):
+            if field in input and input[field] not in allowed:
+                return ToolResult(success=False, error={"message":
+                    "%s must be one of %s -- the values this project's service accepts. Anything "
+                    "else is refused after the fact, so it is refused here." % (field, ", ".join(allowed))})
+        sid, client, connection = self.hook.sid, self.hook.client, self.hook.connection
+        def current():
+            return (self.hook.sid == sid and self.hook.client is client
+                    and self.hook.connection is connection)
+        # Scrub before the first await while the original credential is bound.
+        fields = self.hook.clean_json(input)
+        try:
+            people, complete = await asyncio.to_thread(self.people, (sid, client))
+        except SyncError as error:
+            return ToolResult(success=False, error={"message":
+                ("Could not read the project to find who you mean (HTTP %s)" % error.status
+                 if error.status else "Could not reach the project service")})
+        if not current():
+            return ToolResult(success=False, error={"message": "The project changed; nothing was asked. Retry in the intended project."})
+        if not complete:
+            return ToolResult(success=False, error={"message": "The project's people list is incomplete; no recipient was guessed and nothing was asked."})
+        matches = [pid for pid, name in people.items()
+                   if isinstance(name, str) and name.strip().casefold() == to_person.casefold()]
+        if not matches:
+            return ToolResult(success=False, error={"message":
+                "Nobody in this project is named %r, so nothing was asked. Names come from the "
+                "people in the shared project context." % fields["to_person"]})
+        if len(matches) > 1:
+            # Never guess which of two people a question was meant for: the wrong
+            # one gets an obligation, and the right one never hears about it.
+            return ToolResult(success=False, error={"message":
+                "More than one person in this project is named %r (%s), so nothing was asked. "
+                "There is no way to tell from here which you meant."
+                % (fields["to_person"], ", ".join(sorted(matches)))})
+        data = {"title": fields["question"].strip()[:1000], "requested_person_id": matches[0]}
+        for field, key in (("context", "description"), ("urgency", "urgency"),
+                           ("desired_response", "desired_response"),
+                           ("waiting_consequence", "waiting_consequence")):
+            if fields.get(field):
+                data[key] = fields[field][:4000]
+        request_id = uid()
+        project_id = connection["project_id"]
+        def publish():
+            if not current():
+                return False
+            client.request("publish",
+                {"operations": [{"op": "request.upsert", "id": request_id,
+                                 "expected_version": 0, "data": data}]}, uid())
+            return True
+        try:
+            published = await asyncio.to_thread(publish)
+            if not published:
+                return ToolResult(success=False, error={"message": "The project changed; nothing was asked. Retry in the intended project."})
+        except SyncError as error:
+            if not error.status or error.status >= 500:
+                return ToolResult(success=False, error={"outcome": "unknown",
+                    "attempted_request_id": request_id, "project_id": project_id,
+                    "message": "The service may have accepted this question. Check the attempted_request_id in the original project before retrying; a new ask would create another question."})
+            if error.status == 403:
+                return ToolResult(success=False, error={"message":
+                    "Not asked: this project's service did not allow this session to raise a "
+                    "question. Nothing was written."})
+            return ToolResult(success=False, error={"message":
+                ("Not asked: the project service refused it (HTTP %s)" % error.status
+                 if error.status else "Not asked: the project service could not be reached")})
+        return ToolResult(success=True, output={
+            "request_id": request_id, "project_id": project_id,
+            "asked": people[matches[0]], "question": data["title"],
+            "note": ("Asked, and nothing is blocked. They see it on the board, and their session "
+                     "finds it with teamwork_tasks. Carry on with other work; if you reach a point "
+                     "where you cannot continue without the answer, hold for it with teamwork_wait "
+                     "using this request_id. A question can also simply go unanswered.")})
 
 
 class AnswerTool(WorkTools):
@@ -2997,7 +3174,7 @@ async def mount(coordinator, config=None):
         recording.subscribe(coordinator, hook, RecordInsightTool, detection_events)
     send = SendTool(hook)
     await coordinator.mount("tools", send, name=send.name)
-    for tool in (TasksTool(hook), ClaimTool(hook), ProgressTool(hook), AnswerTool(hook), WaitTool(hook),
+    for tool in (TasksTool(hook), ClaimTool(hook), ProgressTool(hook), AskTool(hook), AnswerTool(hook), WaitTool(hook),
                 PublishWorkTool(hook), RecordInsightTool(hook)):
         await coordinator.mount("tools", tool, name=tool.name)
     # Discovery, not hard-coded names: the same channel amplifier-bundle-modes
