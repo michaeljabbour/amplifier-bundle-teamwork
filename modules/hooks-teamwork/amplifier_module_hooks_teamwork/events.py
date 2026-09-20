@@ -53,6 +53,8 @@ OUTCOMES = {
     "recorded": "recorded",
     # The detector ran and deliberately produced nothing.
     "skipped_deliberate": "skipped",      # the window was recorded by hand
+    "skip_verdict": "skipped",           # the judge deliberately found nothing to record
+    "unavailable": "failed",             # no usable provider judgment was available
     "no_claim": "skipped",                # the judge found nothing worth saying
     "duplicate_fingerprint": "skipped",   # already recorded or reserved
     "binding_changed": "skipped",         # the session rebound mid-detection

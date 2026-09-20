@@ -57,6 +57,8 @@ count `*_failed`, and an audit can still read exactly which failure it was.
 |---|---|---|
 | `recorded` | recorded | The insight was written to the shared project. |
 | `skipped_deliberate` | skipped | The window was recorded by hand; automatic detection stood aside. |
+| `skip_verdict` | skipped | The judge declined to record this window. |
+| `unavailable` | failed | No provider was available for the judgment. |
 | `no_claim` | skipped | The judge found nothing worth saying. |
 | `duplicate_fingerprint` | skipped | Already recorded, or reserved by a concurrent attempt. |
 | `binding_changed` | skipped | The session rebound to another project mid-detection. |
@@ -107,3 +109,11 @@ the consumer side.
 what the detector did, not whether it was right to do it. At the time of writing,
 decision detection had not been observed running end-to-end against the hosted
 project — which is precisely the gap this surface exists to close.
+
+
+Outcome observation is asynchronous and best effort. The local journal remains
+the durable outcome record. At most 16 observer deliveries are in flight, each
+with a one-second deadline; slow or failing subscribers cannot hold the detector's
+publication lock. Shutdown drains deliveries for at most one second, then cancels
+pending work. Subscriber exception text is never logged. `skip_verdict` is a
+skipped outcome; provider `unavailable` is a failed outcome.

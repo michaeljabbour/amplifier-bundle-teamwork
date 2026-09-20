@@ -103,6 +103,8 @@ LIVE_STOP_SECONDS = 1
 # the session is blocked while this runs, so it must end on its own.
 WAIT_POLL_SECONDS = 5
 WAIT_MAX_SECONDS = 120
+DETECTION_EVENT_SECONDS = 1
+MAX_DETECTION_EVENTS = 16
 # An insight is a durable claim, not a transcript -- bounded so it stays a
 # transferable statement rather than growing into a report.
 INSIGHT_CLAIM = 2000
@@ -437,6 +439,8 @@ class TeamworkHook:
         # that was already paid for. Tasks remove themselves on completion.
         self._decision_tasks = set()
         self._lesson_tasks = set()
+        self._detection_event_tasks = set()
+        self._detection_events_closed = False
         self._detection_closing = False
         self._detection_publish_closed = False
         self._session_ended = False
@@ -1605,6 +1609,7 @@ class TeamworkHook:
         tasks = self._decision_tasks | self._lesson_tasks
         if not tasks:
             self._detection_publish_closed = True
+            await self.drain_detection_events()
             return
         try:
             await asyncio.wait(tasks, timeout=DETECTION_DRAIN_SECONDS)
@@ -1622,6 +1627,7 @@ class TeamworkHook:
                 if task.done():
                     self._decision_done(task)
                     self._lesson_done(task)
+            await self.drain_detection_events()
 
     async def on_tool_pre(self, event, data):
         """The other signal (docs/scenarios/08's open questions): the `pre` of
@@ -1646,6 +1652,7 @@ class TeamworkHook:
                 # the spawned task.
                 self.detect_decision(tool_calls=[call])
         return hook_result()
+
 
     def detect_decision(self, tool_calls=None):
         """Schedule bounded background detection; the hot path reads only memory."""
@@ -1700,15 +1707,42 @@ class TeamworkHook:
         """
         self.journal.record_detection_outcome(sid, kind, outcome, tally_size, link_count)
         name = detection_events.event_for(kind, outcome)
-        hooks = getattr(self.coordinator, "hooks", None)
-        if not name or hooks is None or not hasattr(hooks, "emit"):
-            return
-        try:
-            await hooks.emit(name, {
+        if name:
+            self.queue_detection_event(name, {
                 "session_id": sid, "kind": kind, "outcome": outcome,
                 "tally_size": tally_size, "link_count": link_count})
-        except Exception:
-            logger.debug("Teamwork detection event %s not delivered", name, exc_info=True)
+            # Run ordinary observers promptly, without awaiting them under the
+            # publication lock. A subscriber is allowed to acquire that lock.
+            await asyncio.sleep(0)
+
+    def queue_detection_event(self, name, payload):
+        hooks = getattr(self.coordinator, "hooks", None)
+        if (not callable(getattr(hooks, "emit", None)) or self._detection_events_closed
+                or len(self._detection_event_tasks) >= MAX_DETECTION_EVENTS):
+            return
+
+        async def announce():
+            try:
+                await asyncio.wait_for(hooks.emit(name, payload), DETECTION_EVENT_SECONDS)
+            except Exception:
+                # Subscriber exception messages can include private data.
+                logger.debug("Teamwork detection event not delivered; local outcome retained")
+
+        task = asyncio.create_task(announce())
+        self._detection_event_tasks.add(task)
+        def done(completed):
+            self._detection_event_tasks.discard(completed)
+            if not completed.cancelled():
+                completed.exception()
+        task.add_done_callback(done)
+
+    async def drain_detection_events(self):
+        self._detection_events_closed = True
+        tasks = set(self._detection_event_tasks)
+        if tasks:
+            _, pending = await asyncio.wait(tasks, timeout=DETECTION_EVENT_SECONDS)
+            for task in pending:
+                task.cancel()
 
     async def _capture_detection_window(self, detector, binding, tool_calls=None):
         """Called under self.lock: preserve the binding and manual-write generation."""
@@ -2835,7 +2869,7 @@ async def mount(coordinator, config=None):
     # contributes to and hook-context-intelligence already consumes. Guarded,
     # because a host that offers no contributor registry still gets a working
     # bundle -- it simply cannot discover what this one emits.
-    if hasattr(coordinator, "register_contributor"):
+    if callable(getattr(coordinator, "register_contributor", None)):
         coordinator.register_contributor(
             "observability.events", "bundle-teamwork:hooks-teamwork",
             lambda: list(detection_events.ALL_EVENTS))
