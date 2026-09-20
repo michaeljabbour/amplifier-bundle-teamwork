@@ -58,12 +58,21 @@ async def main():
         local_sources = {
             overlay["includes"][0]["bundle"]: base.as_uri(),
             overlay["includes"][1]["bundle"]: (root / "behaviors/teamwork.yaml").as_uri(),
+            "git+https://github.com/microsoft/amplifier-foundation@main": base.as_uri(),
         }
         registry = BundleRegistry(
             home=directory / "isolated-amplifier-home",
             strict=True,
             include_source_resolver=local_sources.get,
         )
+        # Exercise the root's real self-include with the native behavior already
+        # registered. Checking only root schema misses namespace collisions.
+        await registry.load((root / "behaviors/teamwork.yaml").as_uri())
+        standalone = await registry.load((root / "bundle.md").as_uri())
+        assert standalone.session == {"raw": True, "context": {"max_tokens": 123}}
+        standalone_hooks = [h for h in standalone.hooks if h["module"] == "hooks-teamwork"]
+        assert len(standalone_hooks) == 1
+        assert not standalone_hooks[0].get("config", {}).get("share_visible_turns", False)
         composed = await registry.load(path.as_uri())
         assert composed.session == {"raw": True, "context": {"max_tokens": 123}}
         hooks = [hook for hook in composed.hooks if hook["module"] == "hooks-teamwork"]
@@ -95,7 +104,7 @@ async def main():
         )
         assert replay.returncode == 0, replay.stderr
         assert '"pending_requests": 0' in replay.stdout
-    print("PASS: root schema without includes, behavior schema, isolated local composition preserving "
+    print("PASS: root schema and real self-include with native behavior registered, behavior schema, isolated local composition preserving "
           "nonempty session/context and provider settings, app behavior opt-in composition, both local module sources, bounded local prepare, and standalone "
           "empty replay. No provider call, enrollment, remote Foundation include, or cache reuse.")
 
