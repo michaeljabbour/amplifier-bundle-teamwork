@@ -22,6 +22,7 @@ class Journal:
 
     def __init__(self, reserved=True):
         self.reserved, self.released, self.bodies, self._accept = [], [], [], reserved
+        self.outcomes = []
 
     def record_decision_fingerprint(self, sid, fp):
         self.reserved.append((sid, fp))
@@ -33,8 +34,9 @@ class Journal:
     record_lesson_fingerprint = record_decision_fingerprint
     release_lesson_fingerprint = release_decision_fingerprint
 
-    def record_decision_body(self, *args):
+    def record_decision_body(self, *args, **kwargs):
         self.bodies.append(args)
+        self.outcomes.append(kwargs["outcome"])
 
 
 def result(success=True, output=None, error=None):
@@ -147,6 +149,7 @@ class WhenThePublishDoesNotLand(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome, "acceptance_unknown")
         self.assertEqual(journal.released, [])
         self.assertEqual(journal.bodies[0][-1], "rec-maybe")
+        self.assertEqual(journal.outcomes, ["acceptance_unknown"])
 
     async def test_a_raising_publish_keeps_the_reservation(self):
         async def explode(binding, fields):

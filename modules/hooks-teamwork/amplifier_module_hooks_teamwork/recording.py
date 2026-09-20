@@ -47,7 +47,7 @@ class Recorder:
         """
         data = data if isinstance(data, dict) else {}
         kind = data.get("kind")
-        if kind not in self.KINDS:
+        if kind not in self.KINDS or event != "teamwork:" + kind + "_detected":
             return None
         tally, links = data.get("tally_size"), data.get("link_count")
         binding = self.binding(data)
@@ -68,14 +68,11 @@ class Recorder:
                 "claim": data.get("claim"), "basis": data.get("basis"),
                 "confidence": data.get("confidence"), "limitations": data.get("limitations"),
                 "evidence": data.get("evidence"), "title": data.get("title")})
-        except BaseException as error:
-            # Cancellation must propagate -- the reservation stays, and a retry
-            # would otherwise publish the same claim twice.
-            outcome = "write_cancelled" if isinstance(error, asyncio.CancelledError) else "write_raised"
-            await self._reported(session, kind, outcome, tally, links)
-            if outcome == "write_cancelled":
-                raise
-            return outcome
+        except asyncio.CancelledError:
+            await self._reported(session, kind, "write_cancelled", tally, links)
+            raise
+        except Exception:
+            return await self._reported(session, kind, "write_raised", tally, links)
         error = result.error or {}
         if not result.success and error.get("outcome") != "unknown":
             release(session, data.get("fingerprint"))
@@ -87,7 +84,8 @@ class Recorder:
             session, data.get("fingerprint"), kind, data.get("claim"), data.get("basis"),
             data.get("confidence"), data.get("limitations"),
             (result.output or {}).get("recorded") if result.success
-            else error.get("attempted_record_id"))
+            else error.get("attempted_record_id"),
+            outcome="recorded" if result.success else "acceptance_unknown")
         return await self._reported(session, kind,
                                     "recorded" if result.success else "acceptance_unknown", tally, links)
 
@@ -109,23 +107,29 @@ def subscribe(coordinator, hook, insight_tool, events):
         return await insight_tool(hook, binding=binding, automatic=True).execute(fields)
 
     def current(data):
-        """The binding to publish under, or None if the moment has passed.
-
-        Live object identities come from the hook NOW; the deliberate-record
-        generation comes from what the detector captured. Both matter and they
-        are not the same question: a rebind replaces the objects, while a person
-        recording by hand mid-judgment bumps the generation, and either one means
-        this verdict must not be written.
-        """
-        binding = hook.detection_binding()
-        if not hook.detection_binding_current(binding):
-            return None
-        generation = data.get("generation")
-        return (*binding[:4], generation if generation is not None else binding[4])
+        binding = data.get("_binding")
+        return binding if binding is not None and hook.detection_binding_current(binding) else None
 
     recorder = Recorder(journal=hook.journal, binding=current, publish=publish,
                         report=hook.detection_outcome)
+    async def receive(event, data):
+        from amplifier_core.models import HookResult
+        if not isinstance(data, dict) or not hook.record_detected:
+            return HookResult(action="continue")
+        kind = {events.DECISION_DETECTED: "decision", events.LESSON_DETECTED: "lesson"}.get(event)
+        if kind is None or not getattr(hook, kind + "_detection", False):
+            return HookResult(action="continue")
+        key = data.get("detection_id")
+        if not isinstance(key, str):
+            return HookResult(action="continue")
+        candidate = hook._detected_candidates.get(key)
+        if candidate is None or candidate[1]["kind"] != kind:
+            return HookResult(action="continue")
+        binding, canonical = hook._detected_candidates.pop(key)
+        await recorder.handle(event, dict(canonical, _binding=binding))
+        return HookResult(action="continue")
+
     for name in (events.DECISION_DETECTED, events.LESSON_DETECTED):
-        coordinator.hooks.register(name, recorder.handle, priority=50,
+        coordinator.hooks.register(name, receive, priority=50,
                                    name="teamwork-record-" + name.split(":")[-1])
     return recorder

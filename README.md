@@ -339,6 +339,19 @@ claim suppressed; the detector prefers that possibility over duplicating knowled
 To turn it off, remove the key or set it to `false`, then start a new session; a running
 session keeps the configuration it started with.
 
+### Detecting and recording are separate
+
+The detector emits a validated verdict. A separate Recorder publishes it and keeps
+its words in the local journal. For an explicitly enabled detector, set
+`record_detected: false` to observe without the built-in Recorder publishing.
+The default `true` preserves existing opted-in behavior; both detectors remain
+off by default. This does not enable sharing or detection by itself.
+
+The `teamwork.decisions` capability recalls bounded entries for the current
+binding. Its `outcome` distinguishes confirmed publication, uncertain acceptance,
+and older unverified entries. Recall is explicit and never injected automatically.
+See [events and local recall](docs/EVENTS.md) for payloads, limits, and privacy.
+
 ### Automatic lesson detection (`detect_lessons`) -- off unless you ask
 
 **Same category of setting as `detect_decisions` above: it makes the bundle call a model

@@ -22,6 +22,7 @@ class AcceptedClient:
 class PublicationReferenceBoundary(unittest.IsolatedAsyncioTestCase):
     async def publish(self, detector, shown, returned, mutate=False):
         hook, _, journal = build(self)
+        hook.lesson_detection = detector == "lesson"
         hook.client = client = AcceptedClient()
         add_turn(hook, "Synthetic context", "Synthetic response")
         window = {"turns": [], "tool_calls": [], "tally": shown}

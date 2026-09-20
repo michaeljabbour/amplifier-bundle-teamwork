@@ -304,6 +304,7 @@ class Journal:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.path = str(path)
         with self.connect() as conn, conn:
+            conn.execute("BEGIN")
             conn.execute("CREATE TABLE IF NOT EXISTS state (id TEXT PRIMARY KEY, body TEXT NOT NULL)")
             conn.execute("CREATE TABLE IF NOT EXISTS outbox (seq INTEGER PRIMARY KEY AUTOINCREMENT, session TEXT, endpoint TEXT, body TEXT, key TEXT UNIQUE)")
             # Decision-detection state (docs/scenarios/08 and its twin 08b): a
@@ -327,8 +328,22 @@ class Journal:
             conn.execute("CREATE TABLE IF NOT EXISTS decision_body ("
                          "session TEXT NOT NULL, fingerprint TEXT NOT NULL, kind TEXT NOT NULL, "
                          "claim TEXT NOT NULL, basis TEXT, confidence TEXT, limitations TEXT, "
-                         "record_id TEXT, created_at TEXT NOT NULL, "
-                         "PRIMARY KEY (session, fingerprint))")
+                         "record_id TEXT, created_at TEXT NOT NULL, outcome TEXT NOT NULL DEFAULT 'unverified', "
+                         "PRIMARY KEY (session, kind, fingerprint))")
+            columns = conn.execute("PRAGMA table_info(decision_body)").fetchall()
+            if len([c for c in columns if c[5]]) == 2:
+                # Upgrade the pre-release table atomically, retaining every row.
+                conn.execute("CREATE TABLE decision_body_v2 ("
+                             "session TEXT NOT NULL, fingerprint TEXT NOT NULL, kind TEXT NOT NULL, "
+                             "claim TEXT NOT NULL, basis TEXT, confidence TEXT, limitations TEXT, "
+                             "record_id TEXT, created_at TEXT NOT NULL, outcome TEXT NOT NULL DEFAULT 'unverified', "
+                             "PRIMARY KEY (session, kind, fingerprint))")
+                conn.execute("INSERT INTO decision_body_v2 "
+                             "(session,fingerprint,kind,claim,basis,confidence,limitations,record_id,created_at) "
+                             "SELECT session,fingerprint,kind,claim,basis,confidence,limitations,record_id,created_at "
+                             "FROM decision_body")
+                conn.execute("DROP TABLE decision_body")
+                conn.execute("ALTER TABLE decision_body_v2 RENAME TO decision_body")
             # Private diagnostic metadata only; never claim text or provider output.
             conn.execute("CREATE TABLE IF NOT EXISTS detection_outcome ("
                          "session TEXT NOT NULL, kind TEXT NOT NULL, outcome TEXT NOT NULL, "
@@ -395,7 +410,7 @@ class Journal:
             return cursor.rowcount == 1
 
     def record_decision_body(self, sid, fingerprint, kind, claim, basis=None,
-                             confidence=None, limitations=None, record_id=None):
+                             confidence=None, limitations=None, record_id=None, *, outcome="unverified"):
         """Keep what was decided, beside the hash that says it was.
 
         Best-effort, exactly like `record_detection_outcome`: a local copy is a
@@ -406,11 +421,11 @@ class Journal:
             with self.connect() as conn, conn:
                 conn.execute(
                     "INSERT OR REPLACE INTO decision_body"
-                    "(session, fingerprint, kind, claim, basis, confidence, limitations, record_id, created_at) "
-                    "VALUES (?,?,?,?,?,?,?,?,?)",
-                    (sid, fingerprint, kind, claim, basis, confidence, limitations, record_id, now()))
+                    "(session, fingerprint, kind, claim, basis, confidence, limitations, record_id, created_at, outcome) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (sid, fingerprint, kind, claim, basis, confidence, limitations, record_id, now(), outcome))
         except Exception:
-            logger.debug("Teamwork decision body not kept locally", exc_info=True)
+            logger.debug("Teamwork decision body not kept locally")
 
     def decisions(self, sid, limit=DECISION_RECALL):
         """The most recent decisions this shared session recorded, newest first.
@@ -419,18 +434,21 @@ class Journal:
         forever and would be injected into every turn, so the bound lives here
         where it cannot be forgotten by a consumer.
         """
-        limit = max(1, min(int(limit or DECISION_RECALL), DECISION_RECALL_MAX))
+        try:
+            limit = max(1, min(int(limit or DECISION_RECALL), DECISION_RECALL_MAX))
+        except (TypeError, ValueError, OverflowError):
+            limit = DECISION_RECALL
         try:
             with self.connect() as conn:
                 rows = conn.execute(
-                    "SELECT kind, claim, basis, confidence, limitations, record_id, created_at "
+                    "SELECT kind, claim, basis, confidence, limitations, record_id, created_at, outcome "
                     "FROM decision_body WHERE session=? ORDER BY created_at DESC, rowid DESC LIMIT ?",
                     (sid, limit)).fetchall()
         except Exception:
-            logger.debug("Teamwork local decisions unreadable", exc_info=True)
+            logger.debug("Teamwork local decisions unreadable")
             return []
         return [{"kind": r[0], "claim": r[1], "basis": r[2], "confidence": r[3],
-                 "limitations": r[4], "record_id": r[5], "recorded_at": r[6]} for r in rows]
+                 "limitations": r[4], "record_id": r[5], "recorded_at": r[6], "outcome": r[7]} for r in rows]
 
     def release_decision_fingerprint(self, sid, fingerprint):
         """Release only after a definite refusal; unknown writes stay reserved."""
@@ -503,6 +521,8 @@ class TeamworkHook:
         # that was already paid for. Tasks remove themselves on completion.
         self._decision_tasks = set()
         self._lesson_tasks = set()
+        self._detected_candidates = {}
+        self.record_detected = True
         self._detection_event_tasks = set()
         self._detection_events_closed = False
         self._detection_closing = False
@@ -1767,12 +1787,16 @@ class TeamworkHook:
         Bounded at the journal, and the claim bounded here: a local store is only
         cheap while something stops it being injected whole.
         """
-        found = self.journal.decisions(self.sid, limit)
+        binding = self.detection_binding()
+        found = self.journal.decisions(binding[0], limit)
+        if not self.detection_binding_current(binding):
+            return []
+        found = self.clean_json(found)
         for entry in found:
-            claim = entry.get("claim") or ""
-            if len(claim) > DECISION_RECALL_CLAIM:
-                entry["claim"] = claim[:DECISION_RECALL_CLAIM - 1].rstrip() + "\u2026"
-                entry["truncated"] = True
+            for field, value in tuple(entry.items()):
+                if isinstance(value, str) and len(value) > DECISION_RECALL_CLAIM:
+                    entry[field] = value[:DECISION_RECALL_CLAIM - 1].rstrip() + "\u2026"
+                    entry["truncated"] = True
         return found
 
     async def detection_outcome(self, sid, kind, outcome, tally_size=None, link_count=None):
@@ -1836,12 +1860,12 @@ class TeamworkHook:
         both change nothing about what was detected or journalled.
         """
         hooks = getattr(self.coordinator, "hooks", None)
-        if hooks is None or not hasattr(hooks, "emit"):
+        if not callable(getattr(hooks, "emit", None)):
             return
         try:
-            await hooks.emit(name, payload)
+            await asyncio.wait_for(hooks.emit(name, payload), DETECTION_JUDGE_SECONDS)
         except Exception:
-            logger.debug("Teamwork detection event %s not delivered", name, exc_info=True)
+            logger.debug("Teamwork detected verdict not delivered")
 
     async def _capture_detection_window(self, detector, binding, tool_calls=None):
         """Called under self.lock: preserve the binding and manual-write generation."""
@@ -1926,7 +1950,7 @@ class TeamworkHook:
 
     async def _record_verdict(self, verdict, considered_upto, *, binding, uri_scheme, reserve, release,
                               log_label, allowed_links=frozenset(), tally_size=None):
-        """Reserve one claim durably, then publish with pinned session ownership."""
+        """Validate and announce a verdict; the optional Recorder owns publication."""
         if not self.detection_binding_current(binding):
             logger.info("Teamwork %s verdict discarded after rebinding or shutdown", log_label)
             await self.detection_outcome(binding[0], log_label, "binding_changed", tally_size)
@@ -1965,16 +1989,24 @@ class TeamworkHook:
         # Nothing here is on a turn's critical path: the whole detection body
         # already runs in a background task, so the subscriber runs there too and
         # blocks nobody.
-        await self.emit_detection(detection_events.DECISION_DETECTED if log_label == "decision"
-                                  else detection_events.LESSON_DETECTED, {
-            "session_id": binding[0], "kind": log_label, "fingerprint": fingerprint,
-            "claim": claim, "basis": basis, "confidence": confidence, "limitations": limitations,
+        name = (detection_events.DECISION_DETECTED if log_label == "decision"
+                else detection_events.LESSON_DETECTED)
+        detection_id = uid()
+        payload = self.clean_json({
+            "detection_id": detection_id, "session_id": binding[0], "kind": log_label,
+            "fingerprint": fingerprint, "claim": claim, "basis": basis,
+            "confidence": confidence, "limitations": self.clean(limitations)[:INSIGHT_LIMITATIONS],
             "evidence": evidence, "link_count": len(links), "tally_size": tally_size,
-            # The captured deliberate-record generation. The binding itself holds
-            # live state/client/connection objects and must never go on a bus a
-            # consumer might serialise; this number carries the part that has to.
-            "generation": binding[4] if len(binding) > 4 else 0,
-            "title": verdict.get("kind") if isinstance(verdict.get("kind"), str) else None})
+            "generation": binding[4],
+            "title": self.clean(verdict["kind"])[:INSIGHT_TITLE] if isinstance(verdict.get("kind"), str) else None})
+        # Keep live objects private. A bus observer can copy or alter its event,
+        # but cannot replace the captured connection or the canonical verdict.
+        self._detected_candidates[detection_id] = (binding, payload)
+        try:
+            await self.emit_detection(name, json.loads(json.dumps(payload)))
+        finally:
+            self._detected_candidates.pop(detection_id, None)
+
 
 
 
@@ -2903,6 +2935,9 @@ async def mount(coordinator, config=None):
         raise ValueError("Teamwork hook requires explicit share_visible_turns: true opt-in")
     decision_detection = decision_detection_enabled(config)
     lesson_detection = lesson_detection_enabled(config)
+    record_detected = config.get("record_detected", True)
+    if not isinstance(record_detected, bool):
+        raise ValueError("Teamwork record_detected must be true or false")
     detection_model = detection_model_setting(config)
     share_objective_topic = reports.topic_sharing(config.get("share_objective_topic", False))
     work_tracker_actor = reports.objective_actor(config.get("work_tracker_actor"))
@@ -2957,7 +2992,8 @@ async def mount(coordinator, config=None):
     # Only when a detector can actually fire. "Off means zero cost" is this
     # module's existing contract for detection, and registering a subscriber for
     # an event nothing will ever emit would quietly weaken it.
-    if decision_detection or lesson_detection:
+    hook.record_detected = record_detected
+    if (decision_detection or lesson_detection) and record_detected:
         recording.subscribe(coordinator, hook, RecordInsightTool, detection_events)
     send = SendTool(hook)
     await coordinator.mount("tools", send, name=send.name)
