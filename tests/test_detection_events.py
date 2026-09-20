@@ -83,9 +83,13 @@ def hook():
 
 
 class EveryOutcomeIsAnnounced(unittest.IsolatedAsyncioTestCase):
+    async def announce(self, h, *args):
+        await h.detection_outcome(*args)
+        await asyncio.gather(*tuple(h._detection_event_tasks))
+
     async def test_a_recorded_decision_is_announced(self):
         h = hook()
-        await h.detection_outcome("s1", "decision", "recorded", 4, 2)
+        await self.announce(h, "s1", "decision", "recorded", 4, 2)
         self.assertEqual(h.coordinator.hooks.emitted, [(
             "teamwork:decision_recorded",
             {"session_id": "s1", "kind": "decision", "outcome": "recorded",
@@ -95,20 +99,20 @@ class EveryOutcomeIsAnnounced(unittest.IsolatedAsyncioTestCase):
         """The category is what a consumer acts on; the raw outcome is what an
         audit needs. Losing either would make the surface useless to one of them."""
         h = hook()
-        await h.detection_outcome("s1", "decision", "judge_failed", 3)
+        await self.announce(h, "s1", "decision", "judge_failed", 3)
         name, payload = h.coordinator.hooks.emitted[0]
         self.assertEqual(name, "teamwork:decision_failed")
         self.assertEqual(payload["outcome"], "judge_failed")
 
     async def test_a_deliberate_skip_is_not_reported_as_a_failure(self):
         h = hook()
-        await h.detection_outcome("s1", "lesson", "no_claim", 3)
+        await self.announce(h, "s1", "lesson", "no_claim", 3)
         self.assertEqual(h.coordinator.hooks.emitted[0][0], "teamwork:lesson_skipped")
 
     async def test_the_outcome_is_still_journalled(self):
         """Announcing must ADD a channel, never replace the durable one."""
         h = hook()
-        await h.detection_outcome("s1", "decision", "recorded", 1, 0)
+        await self.announce(h, "s1", "decision", "recorded", 1, 0)
         with h.journal.connect() as conn:
             rows = conn.execute("SELECT kind, outcome FROM detection_outcome").fetchall()
         self.assertEqual(rows, [("decision", "recorded")])
@@ -132,10 +136,14 @@ class EveryOutcomeIsAnnounced(unittest.IsolatedAsyncioTestCase):
                 name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
                 if name not in ("detection_outcome", "record_detection_outcome", "_reported"):
                     continue
-                for argument in node.args:
-                    if isinstance(argument, ast.Constant) and isinstance(argument.value, str) \
-                            and argument.value not in ("decision", "lesson"):
-                        found.add(argument.value)
+                def outcomes(value):
+                    if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                        return {value.value}
+                    if isinstance(value, ast.IfExp):
+                        return outcomes(value.body) | outcomes(value.orelse)
+                    return set()
+                if len(node.args) >= 3:
+                    found.update(outcomes(node.args[2]))
             return found
 
         per_module = {module.name: reached_in(module) for module in MODULES}
@@ -158,13 +166,13 @@ class EveryOutcomeIsAnnounced(unittest.IsolatedAsyncioTestCase):
 
     async def test_an_unknown_outcome_is_not_guessed_into_a_category(self):
         h = hook()
-        await h.detection_outcome("s1", "decision", "something_new_nobody_mapped")
+        await self.announce(h, "s1", "decision", "something_new_nobody_mapped")
         self.assertEqual(h.coordinator.hooks.emitted, [])
 
     async def test_a_host_without_a_hook_bus_still_detects(self):
         h = hook()
         h.coordinator.hooks = None
-        await h.detection_outcome("s1", "decision", "recorded")
+        await self.announce(h, "s1", "decision", "recorded")
         with h.journal.connect() as conn:
             self.assertEqual(len(conn.execute("SELECT 1 FROM detection_outcome").fetchall()), 1)
 
@@ -176,9 +184,60 @@ class EveryOutcomeIsAnnounced(unittest.IsolatedAsyncioTestCase):
             raise RuntimeError("subscriber blew up")
 
         h.coordinator.hooks.emit = explode
-        await h.detection_outcome("s1", "decision", "recorded")
+        await self.announce(h, "s1", "decision", "recorded")
         with h.journal.connect() as conn:
             self.assertEqual(len(conn.execute("SELECT 1 FROM detection_outcome").fetchall()), 1)
+
+    async def test_conditional_negative_and_unavailable_outcomes_are_announced(self):
+        h = hook()
+        await self.announce(h, "s1", "decision", "skip_verdict")
+        await self.announce(h, "s1", "lesson", "unavailable")
+        self.assertEqual([e[0] for e in h.coordinator.hooks.emitted],
+                         ["teamwork:decision_skipped", "teamwork:lesson_failed"])
+
+    async def test_observer_may_acquire_the_publication_lock(self):
+        h = hook()
+        observed = asyncio.Event()
+        async def observer(name, payload):
+            async with h.lock:
+                observed.set()
+        h.coordinator.hooks.emit = observer
+        async def publish():
+            async with h.lock:
+                await h.detection_outcome("s1", "decision", "recorded")
+        await asyncio.wait_for(publish(), 0.5)
+        await asyncio.wait_for(observed.wait(), 0.5)
+        await h.drain_detection_events()
+
+    async def test_observer_exception_does_not_log_private_text(self):
+        h = hook()
+        async def observer(name, payload):
+            raise RuntimeError("synthetic-private-observer-canary")
+        h.coordinator.hooks.emit = observer
+        with self.assertLogs("amplifier_module_hooks_teamwork", level="DEBUG") as logs:
+            await self.announce(h, "s1", "decision", "recorded")
+        self.assertNotIn("synthetic-private-observer-canary", "\n".join(logs.output))
+
+    async def test_slow_observation_is_bounded_and_cleanup_closes_the_queue(self):
+        from unittest.mock import patch
+        import amplifier_module_hooks_teamwork as module
+        h = hook()
+        stopped = asyncio.Event()
+        async def observer(name, payload):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stopped.set()
+        h.coordinator.hooks.emit = observer
+        with patch.object(module, "DETECTION_EVENT_SECONDS", 0.03):
+            for _ in range(module.MAX_DETECTION_EVENTS + 4):
+                await h.detection_outcome("s1", "decision", "recorded")
+            self.assertLessEqual(len(h._detection_event_tasks), module.MAX_DETECTION_EVENTS)
+            await asyncio.wait_for(h.drain_detection_events(), 0.5)
+            await asyncio.wait_for(stopped.wait(), 0.5)
+            await asyncio.gather(*tuple(h._detection_event_tasks), return_exceptions=True)
+            h.queue_detection_event("teamwork:decision_recorded", {})
+            self.assertFalse(h._detection_event_tasks)
 
 
 class TheCatalogueIsDiscoverable(unittest.IsolatedAsyncioTestCase):
@@ -201,6 +260,33 @@ class TheCatalogueIsDiscoverable(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sorted(channels[0][2]()), sorted(detection_events.ALL_EVENTS))
         self.assertTrue(all(n.startswith("teamwork:") for n in channels[0][2]()))
 
+    async def test_real_core_discovers_and_delivers_an_outcome(self):
+        from amplifier_core import AmplifierSession
+        from amplifier_core.models import HookResult
+        session = AmplifierSession({"session": {"orchestrator": "loop-streaming", "context": "context-simple"},
+                                    "providers": [], "tools": [], "hooks": []})
+        await session.initialize()
+        try:
+            with tempfile.TemporaryDirectory(prefix="teamwork-real-events-") as directory:
+                cleanup = await mount(session.coordinator, {
+                    "base_url": "https://team.example.invalid", "project_id": "p",
+                    "token": "synthetic-event-credential", "share_visible_turns": True,
+                    "journal_path": str(Path(directory)/"j.db"), "file_inbound_reports": False})
+                h = cleanup.__self__
+                contributions = await session.coordinator.collect_contributions("observability.events")
+                self.assertIn("teamwork:decision_recorded", [n for names in contributions for n in names])
+                received = []
+                async def observer(event, payload):
+                    received.append(payload)
+                    return HookResult(action="continue")
+                session.coordinator.hooks.register("teamwork:decision_recorded", observer, name="fixture-observer")
+                await h.detection_outcome(h.sid, "decision", "recorded", 2, 0)
+                await asyncio.gather(*tuple(h._detection_event_tasks))
+                self.assertEqual([p["outcome"] for p in received], ["recorded"])
+                await h.drain_detection_events()
+        finally:
+            await session.cleanup()
+
     async def test_a_host_without_a_contributor_registry_still_mounts(self):
         directory = Path(tempfile.mkdtemp(prefix="teamwork-events-bare-"))
         connection = directory / "connection.json"
@@ -212,7 +298,6 @@ class TheCatalogueIsDiscoverable(unittest.IsolatedAsyncioTestCase):
             register_contributor = None
 
         coordinator = Bare()
-        del coordinator.__class__.register_contributor
         await mount(coordinator, {"connection_file": str(connection),
                                   "share_visible_turns": True,
                                   "journal_path": str(directory / "j.sqlite3"),
