@@ -189,11 +189,11 @@ overrides:
   hooks-teamwork:
     config:
       share_visible_turns: true
-      base_url: https://amplifier-teamwork-web.livelysea-7d934004.westus2.azurecontainerapps.io
+      base_url: https://teamwork.amplifier.ms
       token: ${TEAMWORK_HARNESS_TOKEN}
   tool-teamwork:
     config:
-      base_url: https://amplifier-teamwork-web.livelysea-7d934004.westus2.azurecontainerapps.io
+      base_url: https://teamwork.amplifier.ms
       token: ${TEAMWORK_HARNESS_TOKEN}
 ```
 
@@ -342,6 +342,19 @@ claim suppressed; the detector prefers that possibility over duplicating knowled
 
 To turn it off, remove the key or set it to `false`, then start a new session; a running
 session keeps the configuration it started with.
+
+### Detecting and recording are separate
+
+The detector emits a validated verdict. A separate Recorder publishes it and keeps
+its words in the local journal. For an explicitly enabled detector, set
+`record_detected: false` to observe without the built-in Recorder publishing.
+The default `true` preserves existing opted-in behavior; both detectors remain
+off by default. This does not enable sharing or detection by itself.
+
+The `teamwork.decisions` capability recalls bounded entries for the current
+binding. Its `outcome` distinguishes confirmed publication, uncertain acceptance,
+and older unverified entries. Recall is explicit and never injected automatically.
+See [events and local recall](docs/EVENTS.md) for payloads, limits, and privacy.
 
 ### Automatic lesson detection (`detect_lessons`) -- off unless you ask
 
@@ -568,7 +581,7 @@ your consent, whichever way it was resolved.
 
 The script asks for the member code without saving it, enrolls a separate project-scoped harness credential, writes a private connection file, and writes the overlay. Existing output files are not overwritten. Keep the connection file, SQLite journal, and overlay outside the repository and out of source control.
 
-By default enrollment uses the Amplifier Online web origin (`https://amplifier-teamwork-web.livelysea-7d934004.westus2.azurecontainerapps.io`). You may explicitly select a trusted custom HTTPS service URL, but that does **not** establish that the service is Teamwork-compatible. Deceptive URLs containing userinfo, a query, or a fragment are rejected. HTTP is for literal loopback test hosts only (`localhost`, `127.0.0.1`, or `::1`), never a production service.
+By default enrollment uses this project's own domain (`https://teamwork.amplifier.ms`), which is also the origin the service publishes at `/api/config`. You may explicitly select a trusted custom HTTPS service URL, but that does **not** establish that the service is Teamwork-compatible. Deceptive URLs containing userinfo, a query, or a fragment are rejected. HTTP is for literal loopback test hosts only (`localhost`, `127.0.0.1`, or `::1`), never a production service.
 
 #### `--origin`, and why you almost certainly do not need it
 
