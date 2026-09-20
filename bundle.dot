@@ -8,12 +8,12 @@ digraph teamwork_standalone {
     nodesep=0.6
     ranksep=0.7
     bgcolor="white"
-    source_hash="b66cdc2e0fc6b68744eeab3f682b39f7d01c18b2244c017688c97c7a67b27a98"
+    source_hash="f2d3c350fecac006cb5fa7d58ec6ee845b34854a8b48cc9ebcaff0dac97c03a5"
 
     node [fontname="Helvetica", fontsize=11, style="filled,rounded"]
     edge [fontname="Helvetica", fontsize=9]
 
-    root_teamwork_standalone [label="teamwork-standalone v0.4.0\n0 tools · 0 agents\n~71 tok aggregate", shape=box, fillcolor="#80cbc4", style="filled,rounded,bold", penwidth=2]
+    root_teamwork_standalone [label="teamwork-standalone v0.4.0\n0 tools · 0 agents\n~73 tok aggregate", shape=box, fillcolor="#80cbc4", style="filled,rounded,bold", penwidth=2]
 
     subgraph cluster_behaviors {
         label="Behaviors"

@@ -76,6 +76,14 @@ amplifier bundle update 'git+https://github.com/michaeljabbour/amplifier-bundle-
 
 A session that is already running keeps the tool set it started with, so `teamwork_connect` appears only in sessions started after the update.
 
+The installed native behavior is named `teamwork`; its short update command is
+`amplifier bundle update teamwork -y`. The optional root bundle is named
+`teamwork-standalone` and can be checked with
+`amplifier bundle update teamwork-standalone --check` when registered. Both can
+coexist: the standalone root resolves its included behavior through its own
+`teamwork-standalone` namespace. Installing the standalone root is not required
+for native Teamwork connections.
+
 ## Connect in Amplifier
 
 1. Start a normal new Amplifier session with your existing bundle/provider, in a checkout with a `github.com` `origin` remote if you have one.
