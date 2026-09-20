@@ -2361,7 +2361,9 @@ class AskTool(WorkTools):
 
     @property
     def description(self):
-        return ("Ask a named teammate a question on the shared project. Returns the question's id "
+        return ("Ask a named teammate a question on their shared project board, not a specific agent session. "
+                "For a fact held by an exact session, use teamwork_send with to_agent_id instead. "
+                "Returns the question's id "
                 "and does NOT wait: asking and waiting are separate, so this session can carry on "
                 "with something else and, if and when it needs the answer before continuing, hold "
                 "for it with teamwork_wait. Only a question addressed to someone is created -- the "
@@ -2863,7 +2865,21 @@ class RecordInsightTool:
                                "description": "Self-reported."},
                 "limitations": {"type": "string", "description": "What this does NOT establish."},
                 "evidence": {
-                    "type": "array", "minItems": 1, "items": {"type": "object"},
+                    "type": "array", "minItems": 1,
+                    "items": {"anyOf": [
+                        {"type": "object", "properties": {
+                            "kind": {"const": "artifact"}, "uri": {"type": "string", "pattern": "^https?://"},
+                            "label": {"type": "string"}}, "required": ["kind", "uri"]},
+                        {"type": "object", "properties": {
+                            "kind": {"const": "external"}, "uri": {"type": "string", "description": "Observed non-HTTP locator; preserve it exactly."},
+                            "label": {"type": "string"}}, "required": ["kind", "uri"]},
+                        {"type": "object", "properties": {
+                            "kind": {"const": "record"},
+                            "record_type": {"type": "string", "enum": ["work", "request", "idea", "insight"]},
+                            "record_id": {"type": "string", "description": "Existing Teamwork record ID, never an incident label."},
+                            "version": {"type": "integer", "minimum": 1},
+                            "label": {"type": "string"}}, "required": ["kind", "record_type", "record_id", "version"]},
+                    ]},
                     "description": (
                         "At least one of: {kind: artifact, uri: <http(s) URL>, label} "
                         "| {kind: external, uri: <non-http locator, e.g. worktracker://queue/id>, label} "

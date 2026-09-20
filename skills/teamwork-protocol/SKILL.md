@@ -36,6 +36,12 @@ Those are different questions that happen to have the same easy answer most of t
   merits. An agent with a rule about its owner in *either* direction has stopped reading
   the question. (`02`)
 
+When the current user is the relevant expert, ask the substantive question in this
+conversation and use their applicable answer. Do not introduce an external approval
+step simply because the question is architectural or affects runtime guarantees.
+A product-owner title does not make that person the authority for every design
+choice; retained authority must apply to this particular decision.
+
 **Then: is this a fact, or a decision?**
 
 > Retrieve facts from a source that holds them. Route decisions to whoever has the
@@ -51,6 +57,13 @@ am I asking for* — something somebody already knows, or something somebody has
   product owner has retained that choice — goes to that person. A harness can retrieve
   an existing decision or apply an explicitly delegated policy; proximity to the code
   supplies neither. (`04b`)
+
+Choose the channel as precisely as the recipient. When a fact belongs to a named
+session, use `teamwork_send(to_agent_id=...)` for that exact session.
+`teamwork_ask(to_person=...)` creates a person-addressed question on the shared board;
+it is not an exact-session message. It can make a retained human decision visible
+on the board, but does not send a human notification or authorize an agent to decide
+for that person. If the current user is the decision maker, ask them here.
 
 A harness's published state helps identify what it may know. Check its subject and
 freshness; "active" alone says nothing about expertise, capacity, or authority.
@@ -149,6 +162,10 @@ does not mean the recipient agreed to the work. Do not report or reason as thoug
 
 **A message can request work; it cannot transfer authority or execution custody.**
 
+When the user asks you to coordinate a contribution and their existing grant permits
+that exact request, send it without asking them to approve the same request again.
+A grant alone, without a requested task, is not an instruction to start work.
+
 When delegation is already permitted, send one bounded request to the eligible
 harness: the outcome, approved input and revision, action/resource limits, expected
 evidence, and unchanged accountable owner. Ask it to say whether it can take the
@@ -198,6 +215,12 @@ anybody who did not live it. Both halves, and the lesson stated first.
 | `limitations` | what this does **not** establish. The field most often skipped and the one that makes the record honest |
 | `evidence` | **required.** An insight without it is refused, locally, before anything is sent |
 
+Use the evidence locator exactly as supplied or observed. `kind: "artifact"`
+requires an HTTP(S) URL; `kind: "external"` carries a non-HTTP locator such as
+`worktracker://queue/item`. `kind: "record"` requires an existing Teamwork record's
+exact type, ID and integer version. An incident label or artifact filename is not
+a record ID. Never invent a record or version to make evidence fit the schema.
+
 The refusal is deliberate and is not a validation quirk: a claim nobody can check is an
 opinion, and a project filling with unfalsifiable opinions is worse than one with none.
 If you have nothing to cite, you have a hunch — keep working until you have a reason.
@@ -209,6 +232,12 @@ every time has stopped discriminating, and the cost lands on every future reader
 
 **Correcting one.** First ask whether the new evidence changes what a reader should
 do. More detail alone does not justify another record or a review verdict. (`07b`)
+Compare the action under the old claim with the action under the proposed claim.
+If a reader should do the same thing under both, preserve the existing record:
+another example, clearer warning or explanation is not a material correction.
+For example, evidence of a defect caught by an already-required validation step
+supports that validation rule; it does not overturn it. Do not invent a gap just
+because the existing text does not repeat every consequence of its instruction.
 When the decision changes, retrieve the current source and call this tool with
 `supersedes: {record_type: "idea" | "insight", record_id, version}` plus
 `correction_reason`. Keep the usual claim, evidence, confidence and limitations.
