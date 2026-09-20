@@ -264,6 +264,14 @@ class SyncError(Exception):
     def __init__(self, status=0, body=None): self.status, self.body = status, body
 
 
+def retryable_card_error(error):
+    """Try a fresh current observation at a later boundary, never replay a heartbeat."""
+    detail = error.body.get("error") if isinstance(error.body, dict) else None
+    return (not error.status or error.status in (408, 425, 429) or error.status >= 500
+            or (error.status == 404 and isinstance(detail, dict)
+                and detail.get("code") == "session_not_found"))
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         raise urllib.error.HTTPError(req.full_url, code, "Redirect refused", headers, fp)
@@ -746,8 +754,9 @@ class TeamworkHook:
         at its first failure, so a server that does not know this record kind would
         wedge every later publish behind a record nobody needs. Liveness is also
         worthless replayed: a heartbeat delivered forty minutes late is a lie, not a
-        late truth. So this is sent directly, and a failure disables it for the rest
-        of the session rather than accumulating.
+        late truth. So this is sent directly. A definite unsupported or forbidden response
+        disables it; transient failures allow a fresh observation at the next
+        lifecycle boundary, without accumulating old heartbeats.
         """
         with self._card_lock:
             if self.agent_status == "unavailable" or not self.entered:
@@ -807,7 +816,7 @@ class TeamworkHook:
                 if not current():
                     return
                 # Never fatal: sharing does not depend on being addressable.
-                self.agent_status = "unavailable"
+                self.agent_status = "pending" if retryable_card_error(error) else "unavailable"
             logger.info("Teamwork agent registration unavailable (HTTP %s; 0 means transport failure); "
                         "sharing is unaffected", error.status)
             return
@@ -870,7 +879,7 @@ class TeamworkHook:
             with self._card_lock:
                 if not current():
                     return
-                self.presence_status = "unavailable"
+                self.presence_status = "pending" if retryable_card_error(error) else "unavailable"
             logger.info("Teamwork presence unavailable (HTTP %s; 0 means transport failure); "
                         "sharing is unaffected", error.status)
             return
@@ -2672,15 +2681,32 @@ class SendTool:
         from amplifier_core.models import ToolResult
         body = input.get("body")
         recipient = {k: input[k] for k in ("to_agent_id", "to_node_label", "to_person") if input.get(k)}
-        if not body or len(recipient) != 1:
+        if not isinstance(body, str) or not body.strip() or len(recipient) != 1 or not all(isinstance(v, str) for v in recipient.values()):
             return ToolResult(success=False, error={"message": "body and exactly one of to_agent_id, to_node_label, to_person are required"})
+        # Capture attribution and redact before yielding: a concurrent project
+        # change must not relabel an uncertain attempt or use its credential.
+        client = self.hook.client
+        project_id = self.hook.connection["project_id"]
+        body = self.hook.clean(body)
         mid = uid()
+
+        def unknown_outcome():
+            return ToolResult(success=False, error={
+                "outcome": "unknown", "attempted_message_id": mid,
+                "project_id": project_id,
+                "message": "Message outcome unknown. The service may have accepted it. "
+                           "Check attempted_message_id in the original project's message status "
+                           "before retrying; a new send creates another message.",
+            })
+
         try:
-            await asyncio.to_thread(
-                self.hook.client.request, "publish",
+            response = await asyncio.to_thread(
+                client.request, "publish",
                 {"operations": [{"op": "message.upsert", "id": mid, "expected_version": 0,
                                  "data": {**recipient, "body": body}}]}, uid())
         except SyncError as error:
+            if not error.status or error.status >= 500:
+                return unknown_outcome()
             # Named plainly rather than retried: the model asked to send now.
             candidates = None
             if error.status == 409 and isinstance(error.body, dict):
@@ -2695,6 +2721,12 @@ class SendTool:
                       else "the project service refused the message (HTTP %s)" % error.status
                       if error.status else "the project service could not be reached")
             return ToolResult(success=False, error={"message": "Not sent: " + reason})
+        results = response.get("results") if isinstance(response, dict) else None
+        if not isinstance(results, list) or not any(
+                isinstance(item, dict) and item.get("id") == mid
+                and type(item.get("version")) is int and item["version"] >= 1
+                for item in results):
+            return unknown_outcome()
         return ToolResult(success=True, output={
             "message_id": mid,
             "queued_for": next(iter(recipient.values())),

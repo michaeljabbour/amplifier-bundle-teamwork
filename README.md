@@ -133,6 +133,8 @@ Label and person addresses are resolved against currently-live agents only \u201
 label or name that matches nobody currently live is refused the same way an
 unknown agent id is, and a label or name that matches more than one live agent is
 refused as ambiguous, naming the candidates so the sender can retry by agent id.
+A lost response, server failure, or malformed success response returns an **unknown outcome** with the attempted message ID and original project. It does not claim the message was unsent or automatically resend it: check that ID in the original project before creating another message. Supported credential patterns and the connection credential are redacted before transmission.
+
 A successful send returns a `message_id`; on your session's next turn, the shared
 excerpt includes a bounded "Your recent messages" block showing that id moving
 `queued` \u2192 `delivered` \u2192 `accepted` as the recipient's session retrieves and then
@@ -632,7 +634,7 @@ Ask a short, non-sensitive project prompt and confirm the expected project activ
 
 ## What is shared and retained
 
-The hook responds to visible lifecycle events: `session:start`, `session:resume`, `prompt:submit`, `prompt:complete`, and `session:end`, plus the opted-in decision detector's `tool:pre` boundary. Child/delegated sessions are excluded. An explicitly opted-in resumed session announces its agent card and clears its previous session end timestamp when its first resumed turn starts executing, before the orchestrator processes that prompt. Opening the CLI and waiting at its input prompt does not trigger this registration; the resumed session still needs an explicit sharing overlay or native consent. Existing agent and presence cards may rebase once on the service's exact version-conflict response; ambiguous transport failures are not retried by this recovery path.
+The hook responds to visible lifecycle events: `session:start`, `session:resume`, `prompt:submit`, `prompt:complete`, and `session:end`, plus the opted-in decision detector's `tool:pre` boundary. Child/delegated sessions are excluded. An explicitly opted-in resumed session announces its agent card and clears its previous session end timestamp when its first resumed turn starts executing, before the orchestrator processes that prompt. Opening the CLI and waiting at its input prompt does not trigger this registration; the resumed session still needs an explicit sharing overlay or native consent. Existing agent and presence cards may rebase once on the service's exact version-conflict response; ambiguous transport failures are not immediately replayed or rebased. Temporary transport/server failures leave cards pending so the next lifecycle update can publish a fresh current observation. Unsupported or forbidden responses disable the optional card; stale heartbeats never enter the durable outbox.
 
 Before a visible prompt, it flushes durable pending work, retrieves selected project context, derives a bounded excerpt, and awaits Amplifier context acceptance. Only that successful acceptance can produce a `harness_input_accepted` receipt. A receipt proves the context manager accepted a message; it does not prove provider submission, model attention, comprehension, agreement, or completion.
 
