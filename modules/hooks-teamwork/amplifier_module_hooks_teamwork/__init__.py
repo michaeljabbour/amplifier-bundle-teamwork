@@ -1614,7 +1614,8 @@ class TeamworkHook:
             # Hosts also call module cleanup after validation or failed startup.
             # Mounting alone does not mean a shared session began. In particular,
             # validation's temporary coordinator must never publish a session.
-            if not self.entered:
+            # A restored unfinished turn still needs the normal crash recovery.
+            if not self.entered and not self.state.get("turn"):
                 return
             self.ensure_session()
             status = "abandoned" if self.state.get("turn") else "completed"
