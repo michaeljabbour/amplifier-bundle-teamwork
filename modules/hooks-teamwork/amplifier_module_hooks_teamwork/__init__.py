@@ -1505,14 +1505,17 @@ class TeamworkHook:
             omitted = len(prompt.encode()) > 60000
             self.state["turn"] = {"id": uid(), "prompt": "[Prompt omitted: exceeds sharing size limit]" if omitted else prompt, "omitted": omitted, "injections": [], "hook_run_id": uid(), "boundary": "prepared"}
             self.journal.save(self.sid, self.state)
-            # Reported before the turn rather than after it: "active" is only true
-            # while the turn is running, and a teammate asking "is anyone on this?"
-            # is asking about now.
-            await self.sense("active", "" if omitted else prompt)
             delivery_durable = False
             notice = None
             try:
-                await self.flush(); await self.retrieve()
+                # Native consent can attach this hook after session:start. The
+                # first prompt must publish its queued session before presence:
+                # the service requires that parent to exist. A failed flush
+                # leaves presence unattempted so a later turn can recover.
+                await self.flush()
+                # Still before model execution: this describes the running turn.
+                await self.sense("active", "" if omitted else prompt)
+                await self.retrieve()
                 rendered, sources = self.render()
                 if sources or self.state.get("outbound"):
                     inj = {"id": uid(), "rendered_text": rendered, "content_sha256": sha(rendered)}
