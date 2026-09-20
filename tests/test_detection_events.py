@@ -235,8 +235,36 @@ class EveryOutcomeIsAnnounced(unittest.IsolatedAsyncioTestCase):
             self.assertLessEqual(len(h._detection_event_tasks), module.MAX_DETECTION_EVENTS)
             await asyncio.wait_for(h.drain_detection_events(), 0.5)
             await asyncio.wait_for(stopped.wait(), 0.5)
-            await asyncio.gather(*tuple(h._detection_event_tasks), return_exceptions=True)
             h.queue_detection_event("teamwork:decision_recorded", {})
+            self.assertFalse(h._detection_event_tasks)
+
+    async def test_cancellation_resistant_observer_stays_owned_until_finished(self):
+        from unittest.mock import patch
+        import amplifier_module_hooks_teamwork as module
+        h = hook()
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def observer(name, payload):
+            started.set()
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    pass
+
+        h.coordinator.hooks.emit = observer
+        with patch.object(module, "DETECTION_EVENT_SECONDS", 0.03):
+            h.queue_detection_event("teamwork:decision_recorded", {})
+            await asyncio.wait_for(started.wait(), 0.5)
+            try:
+                await asyncio.wait_for(h.drain_detection_events(), 0.5)
+                self.assertTrue(h._detection_event_tasks)
+                self.assertTrue(h._detection_events_closed)
+            finally:
+                release.set()
+                await asyncio.wait_for(asyncio.gather(*tuple(h._detection_event_tasks),
+                                                     return_exceptions=True), 0.5)
+            await h.drain_detection_events()
             self.assertFalse(h._detection_event_tasks)
 
 
