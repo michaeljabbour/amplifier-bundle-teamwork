@@ -1611,6 +1611,12 @@ class TeamworkHook:
             if self._session_ended or not self.detection_binding_current(binding):
                 return
             self._session_ended = True
+            # Hosts also call module cleanup after validation or failed startup.
+            # Mounting alone does not mean a shared session began. In particular,
+            # validation's temporary coordinator must never publish a session.
+            # A restored unfinished turn still needs the normal crash recovery.
+            if not self.entered and not self.state.get("turn"):
+                return
             self.ensure_session()
             status = "abandoned" if self.state.get("turn") else "completed"
             if self.state.get("turn"): self.finish("", "interrupted")
@@ -1852,6 +1858,15 @@ class TeamworkHook:
             _, pending = await asyncio.wait(tasks, timeout=DETECTION_EVENT_SECONDS)
             for task in pending:
                 task.cancel()
+            if pending:
+                # Give cooperative observers a bounded cancellation window;
+                # retain ownership of any subscriber that ignores cancellation.
+                await asyncio.wait(pending, timeout=DETECTION_EVENT_SECONDS)
+            for task in tasks:
+                if task.done():
+                    self._detection_event_tasks.discard(task)
+                    if not task.cancelled():
+                        task.exception()
 
     async def emit_detection(self, name, payload):
         """Announce on the hook bus, never at the cost of the thing announced.
