@@ -180,6 +180,12 @@ characters. These boundaries belong in the message; they are not new tool fields
 or runtime-enforced grants. Share only approved inputs, never credentials or a
 private transcript to make the other harness resemble this one.
 
+Carry restrictive limits into the request without weakening them. An approved
+input locator does not grant permission to fetch it: “no network” still means no
+network, even when the input is identified by a URL. Require an already-available
+approved copy, or report the missing input. Do not invent exceptions or broaden a
+grant to make the requested work executable.
+
 Report a queued request as a request. Message `accepted` means context
 acknowledgement, not willingness to perform the work, execution, or success. A
 recipient's explicit reply is still separate from result evidence and verification.
