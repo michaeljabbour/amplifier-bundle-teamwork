@@ -1948,18 +1948,25 @@ class WorkTools:
         found, cursor = {}, None
         for _ in range(PAGE_LIMIT):
             if self.hook.sid != sid or self.hook.client is not client:
-                return {}
+                return {}, False
             page = client.request("context", {"session_id": sid, "cursor": cursor,
                                               "selection": {"include": ["people"]},
                                               "page_size": 100, "max_text_bytes": 262144})
+            if self.hook.sid != sid or self.hook.client is not client:
+                return {}, False
             for entry in page.get("items", []):
+                if entry.get("content_omitted"):
+                    return {}, False
                 content = entry.get("content") or {}
                 if entry.get("record_type") == "person" and content.get("id"):
                     found[content["id"]] = content.get("name") or content["id"]
-            cursor = page.get("next_cursor")
-            if not page.get("has_more") or not cursor:
-                break
-        return found
+            next_cursor = page.get("next_cursor")
+            if not page.get("has_more"):
+                return found, not page.get("truncated", False)
+            if not next_cursor or next_cursor == cursor:
+                return {}, False
+            cursor = next_cursor
+        return found, False
 
     def assigned(self, binding=None):
         work, mine, truncated = self.project(binding)
@@ -2170,49 +2177,76 @@ class AskTool(WorkTools):
 
     async def execute(self, input):
         from amplifier_core.models import ToolResult
-        question = (input.get("question") or "").strip()
-        to_person = (input.get("to_person") or "").strip()
+        if not isinstance(input, dict):
+            return ToolResult(success=False, error={"message": "Expected question fields."})
+        for field in self.input_schema["properties"]:
+            if field in input and not isinstance(input[field], str):
+                return ToolResult(success=False, error={"message": field + " must be text."})
+        question = input.get("question", "").strip()
+        to_person = input.get("to_person", "").strip()
         if not question or not to_person:
             return ToolResult(success=False, error={"message":
                 "question and to_person are both required: a question addressed to nobody is a "
                 "shared record, not something anyone can answer or decline."})
         for field, allowed in (("urgency", ("low", "normal", "high")),
                                ("desired_response", ("action", "context", "review"))):
-            if input.get(field) and input[field] not in allowed:
+            if field in input and input[field] not in allowed:
                 return ToolResult(success=False, error={"message":
                     "%s must be one of %s -- the values this project's service accepts. Anything "
                     "else is refused after the fact, so it is refused here." % (field, ", ".join(allowed))})
+        sid, client, connection = self.hook.sid, self.hook.client, self.hook.connection
+        def current():
+            return (self.hook.sid == sid and self.hook.client is client
+                    and self.hook.connection is connection)
+        # Scrub before the first await while the original credential is bound.
+        fields = self.hook.clean_json(input)
         try:
-            people = await asyncio.to_thread(self.people)
+            people, complete = await asyncio.to_thread(self.people, (sid, client))
         except SyncError as error:
             return ToolResult(success=False, error={"message":
                 ("Could not read the project to find who you mean (HTTP %s)" % error.status
                  if error.status else "Could not reach the project service")})
-        matches = [pid for pid, name in people.items() if name.strip().lower() == to_person.lower()]
+        if not current():
+            return ToolResult(success=False, error={"message": "The project changed; nothing was asked. Retry in the intended project."})
+        if not complete:
+            return ToolResult(success=False, error={"message": "The project's people list is incomplete; no recipient was guessed and nothing was asked."})
+        matches = [pid for pid, name in people.items()
+                   if isinstance(name, str) and name.strip().casefold() == to_person.casefold()]
         if not matches:
             return ToolResult(success=False, error={"message":
                 "Nobody in this project is named %r, so nothing was asked. Names come from the "
-                "people in the shared project context." % to_person})
+                "people in the shared project context." % fields["to_person"]})
         if len(matches) > 1:
             # Never guess which of two people a question was meant for: the wrong
             # one gets an obligation, and the right one never hears about it.
             return ToolResult(success=False, error={"message":
                 "More than one person in this project is named %r (%s), so nothing was asked. "
                 "There is no way to tell from here which you meant."
-                % (to_person, ", ".join(sorted(matches)))})
-        data = {"title": question[:1000], "requested_person_id": matches[0]}
+                % (fields["to_person"], ", ".join(sorted(matches)))})
+        data = {"title": fields["question"].strip()[:1000], "requested_person_id": matches[0]}
         for field, key in (("context", "description"), ("urgency", "urgency"),
                            ("desired_response", "desired_response"),
                            ("waiting_consequence", "waiting_consequence")):
-            if input.get(field):
-                data[key] = str(input[field])[:4000]
+            if fields.get(field):
+                data[key] = fields[field][:4000]
         request_id = uid()
-        try:
-            await asyncio.to_thread(
-                self.hook.client.request, "publish",
+        project_id = connection["project_id"]
+        def publish():
+            if not current():
+                return False
+            client.request("publish",
                 {"operations": [{"op": "request.upsert", "id": request_id,
                                  "expected_version": 0, "data": data}]}, uid())
+            return True
+        try:
+            published = await asyncio.to_thread(publish)
+            if not published:
+                return ToolResult(success=False, error={"message": "The project changed; nothing was asked. Retry in the intended project."})
         except SyncError as error:
+            if not error.status or error.status >= 500:
+                return ToolResult(success=False, error={"outcome": "unknown",
+                    "attempted_request_id": request_id, "project_id": project_id,
+                    "message": "The service may have accepted this question. Check the attempted_request_id in the original project before retrying; a new ask would create another question."})
             if error.status == 403:
                 return ToolResult(success=False, error={"message":
                     "Not asked: this project's service did not allow this session to raise a "
@@ -2221,7 +2255,8 @@ class AskTool(WorkTools):
                 ("Not asked: the project service refused it (HTTP %s)" % error.status
                  if error.status else "Not asked: the project service could not be reached")})
         return ToolResult(success=True, output={
-            "request_id": request_id, "asked": people[matches[0]], "question": data["title"],
+            "request_id": request_id, "project_id": project_id,
+            "asked": people[matches[0]], "question": data["title"],
             "note": ("Asked, and nothing is blocked. They see it on the board, and their session "
                      "finds it with teamwork_tasks. Carry on with other work; if you reach a point "
                      "where you cannot continue without the answer, hold for it with teamwork_wait "

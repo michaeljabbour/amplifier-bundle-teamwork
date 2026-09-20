@@ -96,6 +96,9 @@ def stamp(t0):
 
 
 async def run(connection_a, connection_b, work, owned, tasks):
+    recipient = (os.environ.get("TEAMWORK_PERSON_NAME") or "").strip()
+    if not recipient:
+        raise SystemExit("TEAMWORK_PERSON_NAME is required; this live test never guesses a recipient")
     if connection_a["token"] == connection_b["token"]:
         raise SystemExit("A and B are the same credential; that proves nothing about two harnesses")
 
@@ -116,7 +119,6 @@ async def run(connection_a, connection_b, work, owned, tasks):
     # here in the check -- which meant the one step no session could perform was
     # the one the check performed for it, and a green run said nothing about
     # whether asking worked. teamwork_ask is now the only way this gets raised.
-    recipient = os.environ.get("TEAMWORK_PERSON_NAME") or "Diego"
     asked = await AskTool(hook).execute({
         "question": QUESTION_TITLE,
         "to_person": recipient,

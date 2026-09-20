@@ -149,8 +149,12 @@ reading bounded pages and reporting an incomplete list. `teamwork_answer`
 records `act`, `defer`, or `context` with an optional note on an existing assigned
 request. The service enforces recipient permissions and record versions. This
 records an answer; it does not execute the requested work or grant authority.
-Question creation remains a portal/API action; these tools do not create or
-assign new work. A live host is needed to receive arbitrary arrivals while idle;
+`teamwork_ask` creates a question addressed to an exact, unambiguous project
+member name. It returns a request ID immediately; use `teamwork_wait` separately
+when progress depends on the answer. An incomplete roster or a changed project
+refuses the ask. A transport failure may mean the question was accepted: check
+the returned attempted ID before retrying. These tools do not create tasks or
+assign work. A live host is needed to receive arbitrary arrivals while idle;
 `teamwork_wait` only holds an already-running tool call.
 
 ### Inbound messages as queued work

@@ -1803,6 +1803,72 @@ class WorkToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(result.success, field)
             self.assertEqual(hook.client.writes, [])
 
+    async def test_ask_cannot_publish_after_rebind_during_people_lookup(self):
+        hook = self.asking()
+        original = hook.client
+        request = original.request
+        def rebind(endpoint, body, key=None):
+            page = request(endpoint, body, key)
+            hook.rebind("another-project")
+            return page
+        original.request = rebind
+        result = await AskTool(hook).execute({"question": "Ship?", "to_person": "Molly"})
+        self.assertFalse(result.success)
+        self.assertIn("project changed", result.error["message"])
+        self.assertEqual(original.writes, [])
+
+    async def test_ask_refuses_incomplete_people_even_when_one_name_matches(self):
+        for mode in ("missing-cursor", "omitted", "page-cap", "truncated"):
+            hook = self.asking()
+            original = hook.client.request
+            def partial(endpoint, body, key=None):
+                page = original(endpoint, body, key)
+                if mode == "omitted":
+                    page["items"].append({"record_type": "person", "content_omitted": True})
+                elif mode == "truncated":
+                    page["truncated"] = True
+                else:
+                    page["has_more"] = True
+                    page["next_cursor"] = (str(body.get("cursor")) + "next") if mode == "page-cap" else None
+                return page
+            hook.client.request = partial
+            result = await AskTool(hook).execute({"question": "Ship?", "to_person": "Molly"})
+            self.assertFalse(result.success, mode)
+            self.assertEqual(hook.client.writes, [])
+
+    async def test_ask_redacts_credentials_from_all_free_text_before_publish(self):
+        hook = self.asking()
+        credential = hook.connection["token"]
+        result = await AskTool(hook).execute({"question": "Check " + credential, "to_person": "Molly",
+            "context": credential, "waiting_consequence": credential})
+        self.assertTrue(result.success)
+        self.assertNotIn(credential, json.dumps(hook.client.writes))
+        self.assertNotIn(credential, json.dumps(result.output))
+
+    async def test_ask_transport_failure_preserves_attempted_id_and_uncertain_outcome(self):
+        hook = self.asking()
+        original = hook.client.request
+        def timeout_after_commit(endpoint, body, key=None):
+            value = original(endpoint, body, key)
+            if endpoint == "publish":
+                raise SyncError(0)
+            return value
+        hook.client.request = timeout_after_commit
+        result = await AskTool(hook).execute({"question": "Ship?", "to_person": "Molly"})
+        self.assertFalse(result.success)
+        self.assertEqual(result.error["outcome"], "unknown")
+        self.assertEqual(result.error["attempted_request_id"], hook.client.writes[0]["operations"][0]["id"])
+        self.assertEqual(len(hook.client.writes), 1)
+
+    async def test_ask_invalid_types_and_empty_enums_refuse_without_requests(self):
+        hook = self.asking()
+        for value in (None, [], {"question": 3, "to_person": "Molly"},
+                      {"question": "Ship?", "to_person": "Molly", "context": {}},
+                      {"question": "Ship?", "to_person": "Molly", "urgency": ""}):
+            result = await AskTool(hook).execute(value)
+            self.assertFalse(result.success)
+        self.assertEqual(hook.client.writes, [])
+
     async def test_the_mounted_tools_can_move_work_but_never_create_it(self):
         # A session must not invent tasks for anyone, including its own owner:
         # that is a person's decision, made in the portal.
