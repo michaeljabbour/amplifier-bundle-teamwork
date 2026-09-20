@@ -62,8 +62,9 @@ class DeliberateSuppression(unittest.IsolatedAsyncioTestCase):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         client = AcceptedClient(manual_outcome)
+        coordinator = Coordinator()
         hook = TeamworkHook(
-            Coordinator(),
+            coordinator,
             {
                 "base_url": "https://team.example.invalid",
                 "project_id": "fixture",
@@ -74,6 +75,8 @@ class DeliberateSuppression(unittest.IsolatedAsyncioTestCase):
             decision_detection=True,
             lesson_detection=True,
         )
+        from amplifier_module_hooks_teamwork import recording, events as detection_events, RecordInsightTool
+        recording.subscribe(coordinator, hook, RecordInsightTool, detection_events)
         return hook, client
 
     async def test_delayed_automatic_write_does_not_suppress_new_turn_or_other_detector(

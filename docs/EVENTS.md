@@ -1,7 +1,7 @@
 # Teamwork events
 
-`hooks-teamwork` emits six named events on the kernel's hook bus, covering the
-outcome of decision and lesson detection. The module contributes its catalogue to
+`hooks-teamwork` emits eight named events on the kernel's hook bus, covering the
+detected verdicts and outcomes of decision and lesson detection. The module contributes its catalogue to
 the `observability.events` discovery channel, so consumers subscribe without
 hard-coding names.
 
@@ -23,6 +23,8 @@ person opening a SQLite file.
 
 | Event | Meaning |
 |---|---|
+| `teamwork:decision_detected` | A validated verdict is available; this is not proof of publication. |
+| `teamwork:lesson_detected` | As above, for a lesson verdict. |
 | `teamwork:decision_recorded` | A decision was judged and written to the shared project. |
 | `teamwork:decision_skipped` | The detector ran and deliberately produced nothing. |
 | `teamwork:decision_failed` | The detector did not complete, or its write did not land. |
@@ -36,7 +38,7 @@ mechanism did not work.
 
 ### Payload
 
-Identical for all six:
+Identical for the six outcome events:
 
 ```python
 {
@@ -117,3 +119,37 @@ with a one-second deadline; slow or failing subscribers cannot hold the detector
 publication lock. Shutdown drains deliveries for at most one second, then cancels
 pending work. Subscriber exception text is never logged. `skip_verdict` is a
 skipped outcome; provider `unavailable` is a failed outcome.
+
+## Verdict events and the Recorder
+
+`teamwork:decision_detected` and `teamwork:lesson_detected` carry a bounded,
+credential-scrubbed verdict: detection ID, session ID, kind, claim, basis,
+confidence, limitations, title, fingerprint, validated evidence links, generation,
+and tally/link counts. Unlike the six outcome events, these carriers include
+claim text. Consumers must treat it as project data and untrusted model output,
+not as instructions or an accepted decision.
+
+The detector validates and announces. The Recorder alone reserves fingerprints,
+publishes through `teamwork_record_insight`, retains local copies, and announces
+publication outcomes. Its subscription returns the host's `HookResult`. The
+original binding and canonical verdict remain private for the lifetime of the
+event dispatch; a replay, changed payload, or switch away and back cannot change
+what the Recorder publishes or which connection it uses. Dispatch is bounded by
+the detector's timeout and shutdown controls.
+
+Both detectors remain off by default. For an explicitly enabled detector,
+`record_detected: false` leaves observation on while disabling the built-in
+Recorder. The default `true` preserves existing opted-in detection behavior.
+Neither setting grants other subscribers authority to write.
+
+## Local recall
+
+`coordinator.get_capability("teamwork.decisions")` returns a callable accepting an
+optional `limit`. It reads the current binding's journal, defaults to five entries,
+caps requests at 50, bounds each text field to 1,000 characters, and scrubs
+credentials before returning. It does not inject context automatically.
+
+Each entry distinguishes `outcome: recorded`, `acceptance_unknown`, or `unverified`.
+An attempted record ID is not evidence of acceptance. Upgraded pre-release rows
+are retained as unverified, and decisions and lessons with identical words remain
+separate entries. A project change during the read returns no prior-project rows.
