@@ -144,14 +144,14 @@ class ObjectiveLifecycle(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.hook.agent_version, 1)
         self.assertEqual(self.journal.load(self.hook.sid).get('outbox', []), [])
 
-    async def test_ambiguous_or_unrelated_registration_failures_are_never_retried(self):
+    async def test_registration_failure_does_not_retry_within_the_same_call(self):
         errors = [SyncError(0), SyncError(503), SyncError(403), SyncError(422, {'error': 'private text'}),
                   SyncError(422, {'error': {'code': 'invalid_request', 'message': 'Other refusal'}})]
         for error in errors:
             self.hook.entered = True; self.hook.agent_status = 'unregistered'
             with self.subTest(status=error.status), patch.object(self.q, 'status', return_value=self.q.last_status), patch.object(self.client, 'request', side_effect=error) as call:
                 self.hook.register_agent(); self.assertEqual(call.call_count, 1)
-                self.assertEqual(self.hook.agent_status, 'unavailable')
+                self.assertEqual(self.hook.agent_status, 'pending' if error.status in (0, 503) else 'unavailable')
 
     async def test_registration_probe_rebind_cannot_publish_old_topic_with_new_binding(self):
         started, release = threading.Event(), threading.Event()

@@ -86,7 +86,7 @@ class ResumeRegistration(unittest.IsolatedAsyncioTestCase):
         self.assertIn('ended_at', sessions[-1]['data'])
         self.assertIsNone(sessions[-1]['data']['ended_at'])
 
-    async def test_only_exact_definite_conflict_can_retry(self):
+    async def test_only_transient_failures_allow_a_later_registration_attempt(self):
         cases = [(0,None), (503,None), (403,None), (409,None),
                  (409,{'error':{'code':'idempotency_mismatch','current_version':2,'operation_index':0}}),
                  (409,{'error':{'code':'version_conflict','current_version':True,'operation_index':0}}),
@@ -101,8 +101,10 @@ class ResumeRegistration(unittest.IsolatedAsyncioTestCase):
                 hook = self.fresh_hook(); hook.entered = True
                 with patch.object(self.client, 'request', side_effect=SyncError(status, body)) as call:
                     hook.register_agent(); hook.register_agent()
-                self.assertEqual(call.call_count, 1)
-                self.assertEqual(hook.agent_status, 'unavailable')
+                # A later boundary may retry transient failures; this is not an
+                # immediate rebase or replay of an ambiguous old observation.
+                self.assertEqual(call.call_count, 2 if status in (0, 503) else 1)
+                self.assertEqual(hook.agent_status, 'pending' if status in (0, 503) else 'unavailable')
 
     async def test_successful_rebase_retains_payload_and_updates_only_expected_version(self):
         self.hook.entered = True
