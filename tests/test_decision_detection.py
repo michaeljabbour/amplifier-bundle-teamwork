@@ -96,6 +96,7 @@ def add_turn(hook, prompt, response):
     """Drive a completed turn through the same path finish() itself uses,
     without the network calls on_submit/on_complete would otherwise need.
     """
+    hook.ensure_session()
     hook.state["turn_index"] += 1
     hook.state["turn"] = {
         "id": "turn-%d" % hook.state["turn_index"],

@@ -1611,6 +1611,11 @@ class TeamworkHook:
             if self._session_ended or not self.detection_binding_current(binding):
                 return
             self._session_ended = True
+            # Hosts also call module cleanup after validation or failed startup.
+            # Mounting alone does not mean a shared session began. In particular,
+            # validation's temporary coordinator must never publish a session.
+            if not self.entered:
+                return
             self.ensure_session()
             status = "abandoned" if self.state.get("turn") else "completed"
             if self.state.get("turn"): self.finish("", "interrupted")
